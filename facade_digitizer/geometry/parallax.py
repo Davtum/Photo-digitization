@@ -32,6 +32,13 @@ def parallax_offset(
 def correct_for_depth(
     cam: CameraOnPlane, xa: float, ya: float, depth: float
 ) -> tuple[float, float]:
-    """Обратная операция: из наблюдаемого положения в истинное."""
-    k = (cam.cz + depth) / cam.cz
+    """Обратная операция: из наблюдаемого положения в истинное.
+
+    Область определения совпадает с `apparent_position`: функции объявлены взаимно
+    обратными, поэтому охрана здесь та же.
+    """
+    denom = cam.cz + depth
+    if denom <= 0:
+        raise ValueError("точка оказалась за камерой: cz + depth <= 0")
+    k = denom / cam.cz
     return (cam.cx + k * (xa - cam.cx), cam.cy + k * (ya - cam.cy))

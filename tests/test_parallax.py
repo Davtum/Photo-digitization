@@ -82,11 +82,21 @@ def test_apparent_position_rejects_point_behind_camera():
 
 
 def test_correction_matches_independently_computed_value():
-    """Ожидаемое выведено из постановки п. 5.2, а не обратимостью к apparent_position."""
+    """Ожидаемые значения посчитаны вручную по п. 5.2 и заморожены литералами.
+
+    Формула в теле теста повторяла бы формулу реализации и ловила бы только
+    рассогласование копий, а не ошибку в самой формуле.
+    """
     d = 220.0
     observed = (4150.0, 4900.0)
-    k = (CAM.cz + d) / CAM.cz
-    expected = (CAM.cx + k * (observed[0] - CAM.cx), CAM.cy + k * (observed[1] - CAM.cy))
     got = correct_for_depth(CAM, observed[0], observed[1], d)
-    assert got[0] == pytest.approx(expected[0])
-    assert got[1] == pytest.approx(expected[1])
+    assert got[0] == pytest.approx(4170.108, abs=1e-3)
+    assert got[1] == pytest.approx(5069.906, abs=1e-3)
+
+
+def test_correct_for_depth_rejects_point_behind_camera():
+    """Область определения обратной функции обязана совпадать с прямой."""
+    with pytest.raises(ValueError):
+        correct_for_depth(CAM, 5000.0, 3000.0, depth=-CAM.cz)
+    with pytest.raises(ValueError):
+        correct_for_depth(CAM, 5000.0, 3000.0, depth=-CAM.cz - 5000.0)
