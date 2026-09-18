@@ -49,3 +49,11 @@ def test_tan_theta_rejects_point_behind_camera():
         cam.tan_theta(1000.0, 0.0, depth=-10000.0)
     with pytest.raises(ValueError):
         cam.tan_theta(1000.0, 0.0, depth=-15000.0)
+
+
+def test_offset_camera_and_depth_combine_correctly():
+    """Рабочий случай всех последующих модулей: камера смещена И точка заглублена."""
+    cam = CameraOnPlane(cx=3236.0, cy=-2823.0, cz=10000.0)
+    tx, ty = cam.tan_theta(5000.0, 3000.0, depth=150.0)
+    assert tx == pytest.approx((5000.0 - 3236.0) / 10150.0)
+    assert ty == pytest.approx((3000.0 + 2823.0) / 10150.0)
