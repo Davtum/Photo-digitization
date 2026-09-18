@@ -1,8 +1,12 @@
+import itertools
+
 import cv2
 import numpy as np
 import pytest
 
 from facade_digitizer.geometry.vanishing import (
+    CONFIDENCE_THRESHOLD,
+    _hypothesis_pairs,
     detect_segments,
     endpoint_deviation_px,
     estimate_vanishing_points,
@@ -72,6 +76,19 @@ def test_orthogonality_close_to_ninety_on_valid_scene():
     segs = detect_segments(scene.render())
     _, _, conf = estimate_vanishing_points(segs, scene.image_size, K)
     assert conf.orthogonality_deg == pytest.approx(90.0, abs=6.0)
+
+
+THRESHOLD_PREFIX = "доверие ниже порога"
+
+
+def _gate_reasons(conf):
+    """Причины, названные дискретными проверками, без итогового пояснения порога.
+
+    Пояснение «доверие ниже порога» добавляется структурно, когда произведение
+    непрерывных множителей уходит под порог при пройденных проверках. Тесты,
+    проверяющие сами проверки, смотрят на дискретные причины.
+    """
+    return [r for r in conf.reasons if not r.startswith(THRESHOLD_PREFIX)]
 
 
 def _direction(v, K_):
@@ -272,7 +289,7 @@ def test_near_parallel_bundles_get_no_confidence(seed):
 
     assert np.linalg.norm(vh.point[:2]) / abs(vh.point[2]) > 1e4   # точка схода убежала
     assert conf.reasons, "плоскость не определена, а причин отказа нет"
-    assert any("не определена" in r for r in conf.reasons)
+    assert any("неустойчиво" in r for r in conf.reasons)
     assert conf.value == 0.0
 
 
@@ -376,7 +393,7 @@ def test_confidence_falls_when_residual_grows_and_when_angle_leaves_ninety():
     skew = estimate_vanishing_points(
         _bundles_towards(*[_vanishing_of(d) for d in _direction_pair(80.0)]), _FRAME, K)[2]
 
-    assert exact.reasons == [] and noisy.reasons == [] and skew.reasons == []
+    assert _gate_reasons(exact) == _gate_reasons(noisy) == _gate_reasons(skew) == []
     assert exact.coverage == noisy.coverage == skew.coverage == pytest.approx(1.0)
     assert noisy.residual_px > exact.residual_px
     assert noisy.value < exact.value, "рост невязки обязан снижать доверие"
@@ -474,8 +491,11 @@ def test_large_residual_is_refused_relative_to_the_tolerance_in_force():
     assert ok.coverage == bad.coverage == pytest.approx(1.0)
     assert ok.orthogonality_deg == pytest.approx(bad.orthogonality_deg, abs=0.5)
     assert ok.residual_px < 0.75 * 8.0 < bad.residual_px
-    assert ok.reasons == []
-    assert bad.reasons == [f"велика невязка инлайеров: {bad.residual_px:.2f} px"]
+    assert _gate_reasons(ok) == []
+    # Крупная невязка заодно расшатывает и направление, поэтому причин у отказа две;
+    # проверяется, что своя названа. Без проверки величины невязки осталась бы только
+    # причина про неустойчивость, и отказ не назвал бы того, что действительно не так.
+    assert f"велика невязка инлайеров: {bad.residual_px:.2f} px" in _gate_reasons(bad)
     assert bad.value == 0.0
 
 
@@ -527,7 +547,7 @@ def test_confidence_tracks_the_angle_when_nothing_else_changes():
         conf = estimate_vanishing_points(
             _bundles_towards(*[_vanishing_of(d) for d in _direction_pair(angle)]),
             _FRAME, K)[2]
-        assert conf.reasons == []
+        assert _gate_reasons(conf) == []
         assert conf.coverage == pytest.approx(1.0)
         assert conf.residual_px == pytest.approx(0.0, abs=1e-6)
         assert conf.orthogonality_deg == pytest.approx(angle, abs=0.5)
@@ -548,7 +568,7 @@ def test_confidence_tracks_the_residual_when_nothing_else_changes():
     exact = estimate_vanishing_points(_bundles_towards(*vps), _FRAME, K)[2]
     noisy = estimate_vanishing_points(_bundles_towards(*vps, dev, dev), _FRAME, K)[2]
 
-    assert exact.reasons == [] and noisy.reasons == []
+    assert _gate_reasons(exact) == _gate_reasons(noisy) == []
     assert exact.coverage == noisy.coverage == pytest.approx(1.0)
     assert exact.support_h == noisy.support_h
     assert exact.orthogonality_deg == pytest.approx(noisy.orthogonality_deg, abs=0.5)
@@ -590,7 +610,7 @@ def test_one_ill_conditioned_bundle_is_enough_to_refuse():
 
     _, _, conf = estimate_vanishing_points(segs, _FRAME, K)
     assert conf.support_h >= 8 and conf.support_v >= 8
-    assert any("не определена" in r for r in conf.reasons)
+    assert any("неустойчиво" in r for r in conf.reasons)
     assert conf.value == 0.0
 
 
@@ -608,3 +628,261 @@ def test_direction_error_on_synthetic_scenes_stays_below_a_quarter_degree(build)
                                           scene.image_size, K)
     assert _angle_to_truth_deg(vh.point, scene, [1.0, 0.0, 0.0]) < 0.25
     assert _angle_to_truth_deg(vv.point, scene, [0.0, 1.0, 0.0]) < 0.25
+
+
+def test_frontal_view_is_accepted():
+    """Съёмка в упор — наилучший для задачи случай, а не худший.
+
+    При фронтальном ракурсе точка схода уходит в бесконечность: её пиксельное
+    положение не определено по построению, тогда как направление K⁻¹v определено
+    превосходно. Мера устойчивости обязана отвечать на вопрос о направлении, иначе
+    кадр с ошибкой в тысячные доли градуса получает отказ.
+    """
+    scene = make_scene(dx=0.0, dy=0.0)
+    vh, vv, conf = estimate_vanishing_points(detect_segments(scene.render()),
+                                             scene.image_size, K)
+    assert _angle_to_truth_deg(vh.point, scene, [1.0, 0.0, 0.0]) < 0.05
+    assert _angle_to_truth_deg(vv.point, scene, [0.0, 1.0, 0.0]) < 0.05
+    assert conf.reasons == []
+    assert conf.value > 0.9
+
+
+@pytest.mark.parametrize("dx, dy", [(0.0, 0.0), (200.0, -150.0), (700.0, -450.0),
+                                    (1500.0, -1000.0), (3000.0, -2000.0)],
+                         ids=["фронт", "почти фронт", "слегка", "умеренно", "наклонно"])
+def test_near_frontal_views_are_accepted_when_both_families_are_present(dx, dy):
+    """Весь околофронтальный диапазон принимается, когда вертикали есть в кадре.
+
+    Отказы в этом диапазоне на бедной сцене вызваны не фронтальностью, а тем, что
+    вертикальный пучок там состоит из трёх-пяти обломков одного проёма: на
+    обогащённой сцене тот же ракурс даёт 43-48 вертикалей и принимается с доверием
+    выше 0.9. Различитель тот же, что и в задаче B, и говорит он о данных.
+    """
+    scene = make_rich_scene(dx=dx, dy=dy)
+    vh, vv, conf = estimate_vanishing_points(detect_segments(scene.render()),
+                                             scene.image_size, K)
+    assert _angle_to_truth_deg(vh.point, scene, [1.0, 0.0, 0.0]) < 0.25
+    assert _angle_to_truth_deg(vv.point, scene, [0.0, 1.0, 0.0]) < 0.25
+    assert conf.reasons == []
+    assert conf.value > 0.5
+
+
+def test_direction_is_well_determined_where_the_point_itself_is_not():
+    """Положение точки схода и направление на неё — разные по устойчивости величины.
+
+    На фронтальном кадре точка схода стоит в сотнях тысяч пикселей от кадра и
+    сдвигается на порядки от ничтожного шума, а направление при этом определено с
+    точностью до сотых долей градуса. Проверяется обе половины утверждения сразу.
+    """
+    scene = make_scene(dx=0.0, dy=0.0)
+    vh, _, conf = estimate_vanishing_points(detect_segments(scene.render()),
+                                            scene.image_size, K)
+    assert np.linalg.norm(vh.point[:2]) > 1e5 * abs(vh.point[2])   # точка убежала
+    assert _angle_to_truth_deg(vh.point, scene, [1.0, 0.0, 0.0]) < 0.05
+    assert conf.value > 0.5
+
+
+def _confidence_population():
+    """Разнородная выборка входов: годные, пограничные и заведомо негодные."""
+    out = []
+    vps90 = [_vanishing_of(d) for d in _direction_pair(90.0)]
+    for angle in (90.0, 88.0, 85.0, 82.0, 80.0, 78.0, 76.0):
+        out.append((_bundles_towards(*[_vanishing_of(d) for d in _direction_pair(angle)]),
+                    _FRAME, 2.0))
+    for scale in (0.0, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8):
+        dev = tuple(scale * d for d in (0.0, 0.0, 0.7, -0.7, 0.9, -0.9, 1.0, -1.0))
+        out.append((_bundles_towards(*vps90, dev, dev), _FRAME, 2.0))
+    core = _bundles_towards(*vps90)
+    for extra in (0, 4, 8, 16, 24, 40, 60):
+        junk = np.random.default_rng(3).uniform(200.0, 3800.0, size=(extra, 4))
+        out.append((np.vstack([core, junk]) if extra else core, _FRAME, 2.0))
+    for seed in range(6):
+        for jitter in (0.2, 0.6, 1.0, 2.0):
+            segs, size = _near_parallel_bundles(seed, jitter_deg=jitter)
+            out.append((segs, size, 2.0))
+    for width in (4000, 8000, 12000, 16000, 24000):
+        out.append((core, (width, int(width * 0.75)), 2.0))
+    return out
+
+
+def test_low_confidence_always_names_a_reason():
+    """Структурный инвариант контракта: доверие ниже порога обязано быть объяснено.
+
+    Оператора вызывают не молча. Дискретные проверки покрывают не всё: доверие есть
+    произведение непрерывных множителей и может уйти под порог, когда каждая проверка
+    порознь пройдена. Раньше так получалось больше чем в половине случаев.
+    """
+    population = _confidence_population()
+    assert len(population) >= 50
+
+    silent = []
+    for segs, size, tol in population:
+        conf = estimate_vanishing_points(segs, size, K, threshold_px=tol)[2]
+        if conf.value < CONFIDENCE_THRESHOLD and not conf.reasons:
+            silent.append(conf)
+        if conf.value >= CONFIDENCE_THRESHOLD:
+            assert conf.reasons == [], "доверие выше порога не объясняют отказами"
+    assert silent == [], f"{len(silent)} входов дали низкое доверие без единой причины"
+
+
+def test_confidence_falls_when_coverage_falls():
+    """Доля поддержавших отрезков входит в доверие наравне с невязкой и углом.
+
+    Два входа с одним и тем же ядром: во втором к нему добавлены посторонние отрезки,
+    которых ядро не объясняет. Поддержка, невязка, угол и устойчивость у них
+    совпадают — различается только покрытие.
+    """
+    core = _bundles_towards(*[_vanishing_of(d) for d in _direction_pair(90.0)])
+    junk = np.random.default_rng(11).uniform(200.0, 3800.0, size=(16, 4))
+
+    full = estimate_vanishing_points(core, _FRAME, K)[2]
+    diluted = estimate_vanishing_points(np.vstack([core, junk]), _FRAME, K)[2]
+
+    assert full.support_h == diluted.support_h and full.support_v == diluted.support_v
+    assert full.residual_px == pytest.approx(diluted.residual_px, abs=1e-9)
+    assert full.orthogonality_deg == pytest.approx(diluted.orthogonality_deg, abs=1e-6)
+    assert diluted.coverage == pytest.approx(0.5)
+    assert _gate_reasons(diluted) == []
+    assert diluted.value < 0.75 * full.value
+
+
+def test_one_pixel_of_residual_costs_a_third_of_the_confidence():
+    """Чувствительность доверия к невязке задана в пикселях кадра, а не номинально.
+
+    Невязка около пикселя — это уже заметно рыхлая подгонка, и доверие обязано
+    отозваться на неё существенно, а не в третьем знаке. Проверяется величина отклика,
+    а не формула: при прочих равных доверие должно потерять не меньше трети.
+    """
+    vps = [_vanishing_of(d) for d in _direction_pair(90.0)]
+    dev = (0.0, 0.0, 1.2, -1.2, 1.5, -1.5, 1.8, -1.8)
+
+    exact = estimate_vanishing_points(_bundles_towards(*vps), _FRAME, K)[2]
+    noisy = estimate_vanishing_points(_bundles_towards(*vps, dev, dev), _FRAME, K)[2]
+
+    assert noisy.residual_px == pytest.approx(1.125, rel=0.05)
+    assert noisy.value < 0.67 * exact.value
+
+
+def test_hypothesis_pairs_are_exhaustive_below_the_budget():
+    """Ниже бюджета перебор пар исчерпывающий и без повторов — на этом стоит детерминизм.
+
+    Свойство объявлено в докстринге и потому обязано проверяться: подмена перебора
+    выборкой сохранила бы все видимые результаты на простых входах и тихо вернула бы
+    зависимость от seed.
+    """
+    rng = np.random.default_rng(0)
+    for n in (2, 5, 20, 63):
+        pairs = _hypothesis_pairs(n, 2000, rng)
+        assert len(pairs) == n * (n - 1) // 2
+        assert {tuple(sorted(p)) for p in pairs} == set(itertools.combinations(range(n), 2))
+
+    sampled = _hypothesis_pairs(200, 2000, rng)
+    assert len(sampled) == 2000                      # выше бюджета включается выборка
+    assert all(i != j for i, j in sampled)
+
+
+def _ambiguous_bundle():
+    """Вход, где верную гипотезу даёт малая доля пар: семь точных прямых среди тридцати трёх."""
+    rng = np.random.default_rng(5)
+    good = _fan_segments((-9000.0, 1500.0),
+                         [(1500.0 + 260.0 * i, 500.0 + 300.0 * i) for i in range(7)],
+                         700.0, (0.0,) * 7)
+    noise = []
+    for _ in range(33):
+        a = np.radians(rng.uniform(-35.0, 35.0))
+        d = np.array([np.cos(a), np.sin(a)]) * 320.0
+        cx, cy = rng.uniform(600.0, 3400.0), rng.uniform(400.0, 2600.0)
+        noise.append([cx - d[0], cy - d[1], cx + d[0], cy + d[1]])
+    vertical = _fan_segments(_vanishing_of(_direction_pair(90.0)[1]), _MID_V, 900.0, (0.0,) * 8)
+    return np.vstack([good, np.array(noise), vertical])
+
+
+def test_result_does_not_depend_on_seed():
+    """На входе, где верную гипотезу даёт одна пара из ста, ответ обязан быть один.
+
+    Семь точных прямых среди тридцати трёх посторонних: случайная выборка гипотез
+    находит верную не всегда, и ответ начинает зависеть от seed. Полный перебор пар
+    снимает эту зависимость, и именно он здесь и проверяется — поведением, а не
+    заглядыванием в реализацию.
+    """
+    segs = _ambiguous_bundle()
+    results = set()
+    for seed in range(6):
+        conf = estimate_vanishing_points(segs, _FRAME, K, seed=seed)[2]
+        results.add((conf.support_h, conf.support_v, round(conf.residual_px, 9),
+                     round(conf.value, 9)))
+    assert len(results) == 1, f"ответ зависит от seed: {sorted(results)}"
+    only = next(iter(results))
+    assert only[0] == 7                      # найдены ровно семь точных прямых
+    assert only[2] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_tightest_hypothesis_wins_among_equally_supported():
+    """Когда гипотезы собирают одинаковую поддержку, побеждает та, что села плотнее.
+
+    Отклонения заданы построением, поэтому средняя невязка относительно номинальной
+    точки схода известна точно и равна 1.84 px. При равной поддержке подгонка обязана
+    найти не худшую точку, то есть отчитаться строго меньшим числом; без доразрешения
+    ничьей она остановилась бы на первой попавшейся и вернула ровно 1.84.
+    """
+    deviations = (0.0, 0.0, 2.0, -2.0, 2.2, -2.2, 2.4, -2.4, 2.6, -2.6)
+    about_nominal = float(np.mean(np.abs(deviations)))
+    assert about_nominal == pytest.approx(1.84)
+
+    conf = estimate_vanishing_points(_wide_fan_bundles(deviations), (20000, 15000), K,
+                                     threshold_px=8.0)[2]
+    assert conf.support_h == conf.support_v == len(deviations)
+    assert conf.residual_px < about_nominal
+
+
+def test_deviation_is_the_half_length_when_the_point_falls_on_the_midpoint():
+    """Вырожденный случай достижим и обработан: точка схода села на середину отрезка.
+
+    Направление на неё тогда не определено вовсе, и отрезок такую гипотезу не
+    поддерживает — отклонение объявляется равным полудлине, то есть заведомо больше
+    любого разумного допуска. Величина именно полудлина: концы отстоят от середины на
+    неё, а не на полную длину.
+    """
+    segs = _bundles_towards(*[_vanishing_of(d) for d in _direction_pair(90.0)])
+    midpoint = np.array([(segs[0, 0] + segs[0, 2]) / 2.0,
+                         (segs[0, 1] + segs[0, 3]) / 2.0, 1.0])
+    half_length = float(np.hypot(segs[0, 2] - segs[0, 0], segs[0, 3] - segs[0, 1]) / 2.0)
+
+    deviations = endpoint_deviation_px(segs, midpoint)
+    assert half_length == pytest.approx(450.0)
+    assert deviations[0] == pytest.approx(half_length)
+    assert deviations[0] > 2.0                      # заведомо не инлайер
+
+
+def _bundles_with_fan(spread, deviations=(0.0, 0.0, 0.5, -0.5, 0.7, -0.7, 0.9, -0.9)):
+    """Пара пучков с заданным разносом середин: веер шире или уже при том же всём остальном.
+
+    Отклонения заданы построением и потому одинаковы, точки схода те же, поддержка и
+    покрытие те же. Меняется только то, насколько широко пучок расходится, — а от
+    этого и зависит, насколько устойчиво определено направление.
+    """
+    d1, d2 = _direction_pair(90.0)
+    n = len(deviations)
+    mid_h = [(1800.0 + 0.3 * spread * i, 1200.0 + spread * i) for i in range(n)]
+    mid_v = [(1200.0 + spread * i, 1500.0 + 0.3 * spread * i) for i in range(n)]
+    return np.vstack([_fan_segments(_vanishing_of(d1), mid_h, 900.0, deviations),
+                      _fan_segments(_vanishing_of(d2), mid_v, 900.0, deviations)])
+
+
+def test_confidence_tracks_stability_when_nothing_else_changes():
+    """Устойчивость направления входит в доверие наравне с покрытием, невязкой и углом.
+
+    Два входа с одними и теми же точками схода и одними и теми же отклонениями: в
+    первом середины отрезков разнесены на 400 px, во втором на 150. Поддержка,
+    покрытие, невязка и угол совпадают; узкий веер определяет направление хуже, и
+    доверие обязано это учесть.
+    """
+    wide = estimate_vanishing_points(_bundles_with_fan(400.0), _FRAME, K)[2]
+    tight = estimate_vanishing_points(_bundles_with_fan(150.0), _FRAME, K)[2]
+
+    assert wide.reasons == [] and tight.reasons == []
+    assert wide.support_h == tight.support_h and wide.support_v == tight.support_v
+    assert wide.coverage == tight.coverage == pytest.approx(1.0)
+    assert wide.residual_px == pytest.approx(tight.residual_px, abs=0.01)
+    assert wide.orthogonality_deg == pytest.approx(tight.orthogonality_deg, abs=0.1)
+    assert tight.value < 0.9 * wide.value
