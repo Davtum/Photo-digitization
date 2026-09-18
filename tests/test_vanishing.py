@@ -1,8 +1,9 @@
+import cv2
 import numpy as np
 import pytest
 
 from facade_digitizer.geometry.vanishing import detect_segments, estimate_vanishing_points
-from tests.test_synth import K, make_rich_scene, make_scene
+from tests.test_synth import K, SIZE, make_rich_scene, make_scene
 
 
 def test_detects_segments_on_synthetic_facade():
@@ -117,3 +118,96 @@ def test_vanishing_points_agree_with_true_pose(build):
     vh, vv, _ = estimate_vanishing_points(segs, scene.image_size, K)
     assert _angle_to_truth_deg(vh.point, scene, [1.0, 0.0, 0.0]) < 2.0
     assert _angle_to_truth_deg(vv.point, scene, [0.0, 1.0, 0.0]) < 2.0
+
+
+def _single_bundle_image(vp=(-2200.0, 1978.0), size=(1400, 900)):
+    """Кадр, где есть только горизонтальный пучок: вертикальной точке схода не на чем стоять."""
+    w, h = size
+    img = np.full((h, w), 200, dtype=np.uint8)
+    for y in range(120, h - 40, 80):
+        p0 = np.array([float(w - 20), float(y)])
+        d = p0 - np.array(vp, dtype=float)
+        d = d / np.linalg.norm(d)
+        p1 = p0 - d * 1300.0
+        cv2.line(img, tuple(np.round(p0).astype(int)), tuple(np.round(p1).astype(int)), 90, 5)
+    return img
+
+
+def test_confidence_is_zero_when_one_bundle_has_no_support():
+    """Один пучок из двух — не плоскость, каким бы согласованным он ни был.
+
+    Пучок из 45 сходящихся горизонталей даёт покрытие 1.0 и невязку 6 пикселей:
+    по этим числам результат выглядит отличным. Вертикальной точки схода при
+    этом нет вовсе, и доверие обязано быть нулевым, а не высоким, — иначе
+    оператор не будет вызван там, где спецификация (п. 4.2) этого требует.
+    """
+    img = _single_bundle_image()
+    segs = detect_segments(img)
+    _, _, conf = estimate_vanishing_points(segs, (1400, 900), K)
+    assert conf.support_v < 2
+    assert conf.reasons
+    assert conf.value == 0.0
+
+
+def test_thin_support_is_not_trusted_even_on_exact_geometry():
+    """Восемь точных прямых из истинной позы: невязка 1e-13, покрытие 1.0 — и всё же отказ.
+
+    Точки схода тут восстановлены идеально, ортогональность ровно 90°, но четыре
+    прямые на пучок — слишком тонкая опора, чтобы на реальном снимке отличить
+    верную плоскость от случайно согласованной. Проверка суммарного числа
+    поддерживающих отрезков — единственное, что удерживает этот случай от
+    доверия 1.00.
+    """
+    scene = make_scene()
+    rows = []
+    for y in (2000.0, 6000.0, 10000.0, 14000.0):
+        p = scene.project(np.array([[1000.0, y], [19000.0, y]]))
+        rows.append([p[0, 0], p[0, 1], p[1, 0], p[1, 1]])
+    for x in (2000.0, 7000.0, 12000.0, 18000.0):
+        p = scene.project(np.array([[x, 1000.0], [x, 14000.0]]))
+        rows.append([p[0, 0], p[0, 1], p[1, 0], p[1, 1]])
+    segs = np.array(rows)
+
+    _, _, conf = estimate_vanishing_points(segs, SIZE, K)
+    assert conf.support_h >= 2 and conf.support_v >= 2
+    assert conf.coverage == pytest.approx(1.0)
+    assert conf.orthogonality_deg == pytest.approx(90.0, abs=1.0)
+    assert any("мало поддерживающих" in r for r in conf.reasons)
+    assert conf.value == 0.0
+
+
+def test_confidence_is_not_bare_coverage():
+    """Доверие — не доля поддержавших отрезков, а величина со своей шкалой.
+
+    У признанного годным результата есть базовый уровень 0.3, к которому
+    покрытие добавляет остальное. Порог передачи оператору откалиброван по этой
+    шкале, поэтому подмена доверия голым покрытием сдвигает порог.
+    """
+    scene = make_scene()
+    segs = detect_segments(scene.render())
+    _, _, conf = estimate_vanishing_points(segs, scene.image_size, K)
+    assert conf.reasons == []
+    assert conf.coverage < 1.0
+    assert conf.value > conf.coverage
+    assert conf.value == pytest.approx(0.3 + 0.7 * conf.coverage)
+
+
+def test_residual_is_measured_not_a_constant():
+    """Невязка измеряется по инлайерам, а не подставляется как threshold * размер кадра.
+
+    В редакции 1 здесь стояла константа 105.6 при любой сцене. Признак подмены —
+    равенство невязки этой константе и её независимость от качества входа.
+    """
+    scene = make_scene()
+    conf = estimate_vanishing_points(detect_segments(scene.render()), scene.image_size, K)[2]
+    assert 0.0 < conf.residual_px < 0.02 * max(scene.image_size) / 2.0
+
+    exact = []
+    for y in (1000.0, 4000.0, 7000.0, 10000.0, 13000.0):
+        p = scene.project(np.array([[500.0, y], [19500.0, y]]))
+        exact.append([p[0, 0], p[0, 1], p[1, 0], p[1, 1]])
+    for x in (1000.0, 5000.0, 9000.0, 13000.0, 17000.0, 19000.0):
+        p = scene.project(np.array([[x, 500.0], [x, 14500.0]]))
+        exact.append([p[0, 0], p[0, 1], p[1, 0], p[1, 1]])
+    conf_exact = estimate_vanishing_points(np.array(exact), SIZE, K)[2]
+    assert conf_exact.residual_px < conf.residual_px
