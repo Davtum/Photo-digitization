@@ -105,17 +105,44 @@ def test_correct_for_depth_rejects_point_behind_camera():
         correct_for_depth(CAM, 5000.0, 3000.0, depth=-CAM.cz - 5000.0)
 
 
+# Опорная геометрия для проверок чувствительности: камера 10 м над плоскостью,
+# заглубление 150 мм, компонента угла визирования 30°. Сценарий строится ПРЯМОЙ
+# моделью (w = d · tg θ_⊥, |u| = tg θ_⊥ · (C_z + d)), а не формулой оценки.
+X_EDGE, Y_EDGE = 5000.0, 3000.0
+CZ_BASE, DEPTH_BASE = 10000.0, 150.0
+TAN_BASE = math.tan(math.radians(30.0))
+U_BASE = TAN_BASE * (CZ_BASE + DEPTH_BASE)
+W_BASE = DEPTH_BASE * TAN_BASE
+
+
+def _depth_from(width_mm, u_mm, cz_mm):
+    """Глубина по РЕАЛИЗАЦИИ `reveal_depth` при независимых w, |u|, C_z.
+
+    Порог θ_min снят намеренно: функция используется для численного
+    дифференцирования, где важна гладкость, а не пригодность грани.
+    """
+    cam = CameraOnPlane(cx=X_EDGE - u_mm, cy=Y_EDGE, cz=cz_mm)
+    return reveal_depth(
+        cam, X_EDGE, Y_EDGE, width_mm, edge_normal=(1.0, 0.0), theta_min_deg=0.0
+    )
+
+
 def test_reveal_depth_recovers_known_depth():
-    """Прямая проверка: породить ширину откоса из известной глубины и вернуть её."""
+    """Прямая проверка: породить ширину откоса из известной глубины и вернуть её.
+
+    Порог снят: у этой позы θ_⊥ = 9.86°, грань для реального измерения непригодна,
+    но арифметику восстановления она проверяет.
+    """
     cam = CameraOnPlane(cx=3236.0, cy=-2823.0, cz=10000.0)
     x_edge, y_edge, d_true = 5000.0, 3000.0, 150.0
     dx, _ = parallax_offset(cam, x_edge, y_edge, depth=d_true)
     w = abs(dx)  # ширина ВЕРТИКАЛЬНОГО откоса — только X-компонента
-    got = reveal_depth(cam, x_edge, y_edge, w, edge_normal=(1.0, 0.0))
+    got = reveal_depth(cam, x_edge, y_edge, w, edge_normal=(1.0, 0.0), theta_min_deg=0.0)
     assert got == pytest.approx(d_true, rel=1e-9)
 
 
 def test_horizontal_reveal_uses_y_component():
+    """Горизонтальная грань: θ_⊥ = 29.7°, порог по умолчанию не мешает."""
     cam = CameraOnPlane(cx=3236.0, cy=-2823.0, cz=10000.0)
     x_edge, y_edge, d_true = 5000.0, 3000.0, 220.0
     _, dy = parallax_offset(cam, x_edge, y_edge, depth=d_true)
@@ -132,19 +159,50 @@ def test_reveal_depth_is_invariant_to_edge_normal_length():
     cam = CameraOnPlane(cx=3236.0, cy=-2823.0, cz=10000.0)
     x_edge, y_edge, d_true = 5000.0, 3000.0, 150.0
     dx, _ = parallax_offset(cam, x_edge, y_edge, depth=d_true)
-    got = reveal_depth(cam, x_edge, y_edge, abs(dx), edge_normal=(3.0, 0.0))
+    got = reveal_depth(
+        cam, x_edge, y_edge, abs(dx), edge_normal=(3.0, 0.0), theta_min_deg=0.0
+    )
     assert got == pytest.approx(d_true, rel=1e-9)
 
 
+def test_reveal_depth_ignores_edge_normal_orientation():
+    """Знак нормали безразличен: проекция берётся по модулю.
+
+    Без `abs` нормаль, направленная к опорной точке, даёт отрицательную проекцию
+    и вырожденную геометрию вместо глубины.
+    """
+    outward = _depth_from(W_BASE, U_BASE, CZ_BASE)
+    cam = CameraOnPlane(cx=X_EDGE - U_BASE, cy=Y_EDGE, cz=CZ_BASE)
+    inward = reveal_depth(cam, X_EDGE, Y_EDGE, W_BASE, edge_normal=(-1.0, 0.0))
+    assert outward == pytest.approx(DEPTH_BASE, rel=1e-9)
+    assert inward == pytest.approx(outward, rel=1e-12)
+
+
 def test_reveal_depth_rejects_zero_normal():
-    """Нулевая нормаль не задаёт направления ребра."""
+    """Нулевая нормаль не задаёт направления ребра.
+
+    Сообщение проверяется: при подмене охраны на `norm = 1.0` срабатывает другая
+    охрана, и вызывающий код получает диагноз «вырожденная геометрия» вместо
+    указания на неверную нормаль.
+    """
     cam = CameraOnPlane(cx=3236.0, cy=-2823.0, cz=10000.0)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="нормаль"):
         reveal_depth(cam, 5000.0, 3000.0, 26.0, edge_normal=(0.0, 0.0))
 
 
+def test_reveal_depth_rejects_nonpositive_width():
+    """Неположительная ширина — не измерение, а сбой детектора.
+
+    Без охраны нулевая ширина даёт глубину 0, отрицательная — отрицательную
+    глубину, и то и другое молча.
+    """
+    for bad_width in (0.0, -10.0):
+        with pytest.raises(ValueError, match="положительной"):
+            _depth_from(bad_width, U_BASE, CZ_BASE)
+
+
 @pytest.mark.parametrize("theta_x_deg,theta_y_deg,ratio", [
-    (10.0, 30.0, 3.45), (5.0, 25.0, 5.43), (15.0, 15.0, 1.41), (10.0, 0.0, 1.00),
+    (10.0, 30.0, 3.4236), (5.0, 25.0, 5.4229), (15.0, 15.0, 1.4142), (10.0, 0.0, 1.0000),
 ])
 def test_scalar_formula_underestimates(theta_x_deg, theta_y_deg, ratio):
     """Скалярная запись по полному углу занижает глубину. Спецификация, п. 5.4.
@@ -153,6 +211,11 @@ def test_scalar_formula_underestimates(theta_x_deg, theta_y_deg, ratio):
     восстанавливает глубину правильной компонентной формулой и ошибочной скалярной,
     и сравнивает. В редакции 1 плана этот тест считал арифметику над собственными
     входами и проходил при полностью удалённом модуле.
+
+    Коэффициенты заморожены для ТОЧНЫХ углов: hypot(tg θ_x, tg θ_y) / tg θ_x.
+    Прежние 3.45 и 5.43 относились к 9.86°/29.84°, а не к 10°/30°.
+    Порог θ_min снят: ракурсы с θ_x = 5° и 10° ниже порога по построению —
+    в них и состоит проверяемый эффект.
     """
     cz, d_true = 10000.0, 150.0
     x_edge, y_edge = 5000.0, 3000.0
@@ -164,74 +227,156 @@ def test_scalar_formula_underestimates(theta_x_deg, theta_y_deg, ratio):
     dx, dy = parallax_offset(cam, x_edge, y_edge, depth=d_true)
     w = abs(dx)
 
-    correct = reveal_depth(cam, x_edge, y_edge, w, edge_normal=(1.0, 0.0))
+    correct = reveal_depth(
+        cam, x_edge, y_edge, w, edge_normal=(1.0, 0.0), theta_min_deg=0.0
+    )
     assert correct == pytest.approx(d_true, rel=1e-6)
 
     # Скалярная запись: полный угол вместо компоненты.
     tx, ty = cam.tan_theta(x_edge, y_edge, depth=d_true)
     scalar = w / math.hypot(tx, ty)
-    assert correct / scalar == pytest.approx(ratio, rel=0.02)
+    assert correct / scalar == pytest.approx(ratio, rel=1e-3)
 
 
 def test_reveal_depth_rejects_degenerate_geometry():
-    """Ширина откоса не может превышать расстояние до опорной точки."""
+    """Ширина откоса не может превышать расстояние до опорной точки.
+
+    Сообщение проверяется: без этой охраны срабатывает порог θ_min, и диагноз
+    подменяется — убийство мутанта оказалось бы фиктивным.
+    """
     cam = CameraOnPlane(cx=4990.0, cy=3000.0, cz=10000.0)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="вырожденная геометрия"):
         reveal_depth(cam, 5000.0, 3000.0, reveal_width_mm=50.0, edge_normal=(1.0, 0.0))
 
 
+def test_reveal_depth_rejects_shallow_angle():
+    """Порог θ_⊥ ≥ 15°: при малом угле глубина уходит в бесконечность. П. 5.4.
+
+    При |u| = 1000 и w = 999.9999 замкнутая форма даёт 1.0e11 мм — сто километров
+    заглубления без всякого признака неисправности. Порог обязан это отсечь.
+    """
+    cam = CameraOnPlane(cx=X_EDGE - 1000.0, cy=Y_EDGE, cz=CZ_BASE)
+    with pytest.raises(ValueError, match="ниже порога"):
+        reveal_depth(cam, X_EDGE, Y_EDGE, 999.9999, edge_normal=(1.0, 0.0))
+
+    # Порог перекрываем — и тогда виден масштаб бедствия.
+    unguarded = _depth_from(999.9999, 1000.0, CZ_BASE)
+    assert unguarded > 1e10
+
+    # Штатная геометрия (θ_⊥ = 30°) порогом по умолчанию не отсекается.
+    cam_ok = CameraOnPlane(cx=X_EDGE - U_BASE, cy=Y_EDGE, cz=CZ_BASE)
+    got = reveal_depth(cam_ok, X_EDGE, Y_EDGE, W_BASE, edge_normal=(1.0, 0.0))
+    assert got == pytest.approx(DEPTH_BASE, rel=1e-9)
+
+
+def test_reveal_depth_threshold_boundary_is_enforced():
+    """Порог отсекает ровно то, что ниже него, и пропускает то, что выше."""
+    cam = CameraOnPlane(cx=X_EDGE - U_BASE, cy=Y_EDGE, cz=CZ_BASE)
+    with pytest.raises(ValueError, match="ниже порога"):
+        reveal_depth(
+            cam, X_EDGE, Y_EDGE, W_BASE, edge_normal=(1.0, 0.0), theta_min_deg=30.5
+        )
+    got = reveal_depth(
+        cam, X_EDGE, Y_EDGE, W_BASE, edge_normal=(1.0, 0.0), theta_min_deg=29.5
+    )
+    assert got == pytest.approx(DEPTH_BASE, rel=1e-9)
+
+
+def test_width_sigma_matches_numeric_sensitivity():
+    """Вклад ширины сверяется с РЕАЛИЗАЦИЕЙ `reveal_depth`, а не с формулой. П. 6.2.
+
+    Прежний тест повторял формулу кода и ловил только рассогласование копий.
+    Здесь ширина варьируется как независимый аргумент, глубина пересчитывается
+    `reveal_depth`, и центральная разность сравнивается с ∂d/∂w из σ.
+
+    Литерал 1.75803 — число независимого рецензента; малоугловое приближение
+    ctg 30° = 1.73205 занижает его ровно в 1 + d/C_z = 1.015.
+    """
+    h = 1e-4
+    numeric = (
+        _depth_from(W_BASE + h, U_BASE, CZ_BASE) - _depth_from(W_BASE - h, U_BASE, CZ_BASE)
+    ) / (2.0 * h)
+
+    analytic = reveal_depth_sigma(W_BASE, U_BASE, CZ_BASE, 1.0, 0.0, 0.0)
+    assert analytic == pytest.approx(numeric, rel=1e-6)
+    assert analytic == pytest.approx(1.75803, rel=1e-5)
+    assert analytic > 1.0 / math.tan(math.radians(30.0))
+
+
+def test_u_sigma_matches_numeric_sensitivity():
+    """Вклад позы через проекцию |u| сверяется с реализацией. П. 6.2."""
+    h = 1e-2
+    numeric = abs(
+        _depth_from(W_BASE, U_BASE + h, CZ_BASE) - _depth_from(W_BASE, U_BASE - h, CZ_BASE)
+    ) / (2.0 * h)
+
+    analytic = reveal_depth_sigma(W_BASE, U_BASE, CZ_BASE, 0.0, 1.0, 0.0)
+    assert analytic == pytest.approx(numeric, rel=1e-6)
+
+
+def test_cz_sigma_matches_numeric_sensitivity():
+    """Вклад высоты камеры сверяется с реализацией. П. 6.2."""
+    h = 1e-2
+    numeric = abs(
+        _depth_from(W_BASE, U_BASE, CZ_BASE + h) - _depth_from(W_BASE, U_BASE, CZ_BASE - h)
+    ) / (2.0 * h)
+
+    analytic = reveal_depth_sigma(W_BASE, U_BASE, CZ_BASE, 0.0, 0.0, 1.0)
+    assert analytic == pytest.approx(numeric, rel=1e-6)
+    assert analytic == pytest.approx(DEPTH_BASE / CZ_BASE, rel=1e-9)
+
+
+def test_sigma_combines_by_rss_not_linear_sum():
+    """Независимые источники складываются квадратично. Спецификация, п. 6.2.
+
+    На опорной геометрии при σ_w = 5 мм и σ_u = 175 мм вклады равны 8.7902 и
+    4.5466 мм: RSS даёт 9.8964 мм, линейная сумма — 13.3368 мм, завышение на 35 %.
+    """
+    from_width = reveal_depth_sigma(W_BASE, U_BASE, CZ_BASE, 5.0, 0.0, 0.0)
+    from_u = reveal_depth_sigma(W_BASE, U_BASE, CZ_BASE, 0.0, 175.0, 0.0)
+    both = reveal_depth_sigma(W_BASE, U_BASE, CZ_BASE, 5.0, 175.0, 0.0)
+
+    assert from_width == pytest.approx(8.7902, rel=1e-4)
+    assert from_u == pytest.approx(4.5466, rel=1e-4)
+    assert both == pytest.approx(9.8964, rel=1e-4)
+    assert both == pytest.approx(math.hypot(from_width, from_u), rel=1e-12)
+    assert both < from_width + from_u
+    assert (from_width + from_u) / both == pytest.approx(1.3476, rel=1e-3)
+
+
 def test_sigma_grows_as_angle_shrinks():
-    """σ_d складывается из ошибки ширины и ошибки позы. Спецификация, п. 6.2."""
-    sigma_theta = math.radians(1.0)
-    wide = reveal_depth_sigma(150.0, 5.0, math.tan(math.radians(30.0)), sigma_theta)
-    narrow = reveal_depth_sigma(150.0, 5.0, math.tan(math.radians(5.0)), sigma_theta)
+    """σ_d резко растёт при малом угле визирования. Спецификация, п. 6.2."""
+    sigma_w, sigma_u = 5.0, 175.0
+
+    def sigma_at(theta_deg):
+        tan = math.tan(math.radians(theta_deg))
+        return reveal_depth_sigma(
+            DEPTH_BASE * tan, tan * (CZ_BASE + DEPTH_BASE), CZ_BASE, sigma_w, sigma_u
+        )
+
+    wide = sigma_at(30.0)
+    narrow = sigma_at(5.0)
     assert narrow > 3 * wide
 
 
-def test_sigma_includes_pose_contribution():
-    """Вклад погрешности позы обязан входить в σ_d наряду с вкладом ширины.
+def test_sigma_rejects_negative_uncertainty():
+    """Отрицательная σ на входе — сбой вызывающего кода, а не данные.
 
-    При σ_θ = 0 остаётся только вклад ширины; при σ_θ > 0 результат строго больше.
-    Без сложения вкладов оба значения совпали бы.
+    Без охраны `hypot` съедает знак и возвращает правдоподобное число.
     """
-    tan_perp = math.tan(math.radians(30.0))
-    without_pose = reveal_depth_sigma(150.0, 5.0, tan_perp, 0.0)
-    with_pose = reveal_depth_sigma(150.0, 5.0, tan_perp, math.radians(1.0))
-    assert without_pose == pytest.approx(5.0 / tan_perp, rel=1e-12)
-    assert with_pose > without_pose
+    for bad in ((-1.0, 0.0, 0.0), (0.0, -1.0, 0.0), (0.0, 0.0, -1.0)):
+        with pytest.raises(ValueError, match="отрицательными"):
+            reveal_depth_sigma(W_BASE, U_BASE, CZ_BASE, *bad)
 
 
-def test_pose_sigma_matches_numeric_sensitivity_of_reveal_depth():
-    """Вклад позы согласован с самой оценкой глубины. Спецификация, п. 6.2.
-
-    Оба слагаемых σ — производные одного соотношения d = w · ctg θ_n по разным
-    переменным, поэтому θ в них обязан быть одним и тем же: компонентой вдоль
-    нормали к ребру. Проверка численная: при фиксированной измеренной ширине
-    поза поворачивается так, что компонента угла меняется на ±δ, глубина
-    пересчитывается РЕАЛИЗАЦИЕЙ `reveal_depth`, и центральная разность
-    сравнивается с вкладом позы из `reveal_depth_sigma`.
-    """
-    cz, d_true = 10000.0, 150.0
-    x_edge, y_edge = 5000.0, 3000.0
-    theta = math.radians(30.0)
-    tan_perp = math.tan(theta)
-    w = d_true * tan_perp  # ширина откоса, измеренная поперёк вертикального ребра
-
-    def depth_at(theta_value):
-        """Глубина по реализации при позе с компонентой угла theta_value."""
-        depth = w / math.tan(theta_value)
-        u = math.tan(theta_value) * (cz + depth)
-        cam = CameraOnPlane(cx=x_edge - u, cy=y_edge, cz=cz)
-        return reveal_depth(cam, x_edge, y_edge, w, edge_normal=(1.0, 0.0))
-
-    assert depth_at(theta) == pytest.approx(d_true, rel=1e-9)
-
-    delta = 1e-5
-    numeric = abs(depth_at(theta + delta) - depth_at(theta - delta)) / (2.0 * delta)
-
-    sigma_theta = math.radians(0.5)
-    from_pose = reveal_depth_sigma(d_true, 0.0, tan_perp, sigma_theta)
-    assert from_pose == pytest.approx(numeric * sigma_theta, rel=1e-6)
+def test_sigma_rejects_degenerate_inputs():
+    """Производные не определены при вырожденной геометрии и неверных входах."""
+    with pytest.raises(ValueError, match="вырожденная геометрия"):
+        reveal_depth_sigma(W_BASE, W_BASE, CZ_BASE, 5.0, 175.0)
+    with pytest.raises(ValueError, match="положительной"):
+        reveal_depth_sigma(0.0, U_BASE, CZ_BASE, 5.0, 175.0)
+    with pytest.raises(ValueError, match="высота камеры"):
+        reveal_depth_sigma(W_BASE, U_BASE, 0.0, 5.0, 175.0)
 
 
 def test_visible_reveal_side_is_far_side():
@@ -245,3 +390,16 @@ def test_visible_reveal_side_is_far_side():
     vertical2, horizontal2 = visible_reveal_side(cam2, 3500.0, 5000.0, 3000.0, 5000.0)
     assert vertical2 == "left"
     assert horizontal2 == "bottom"
+
+
+def test_visible_reveal_side_splits_at_opening_midpoint():
+    """Граница — середина проёма, а не его край. Спецификация, п. 5.5.
+
+    Опорная точка внутри диапазона проёма: cx = 4000 левее середины 4250, но правее
+    левого края 3500; cy = 3500 ниже середины 4000, но выше нижнего края 3000.
+    Сравнение с краем вместо середины дало бы обе грани наоборот.
+    """
+    cam = CameraOnPlane(cx=4000.0, cy=3500.0, cz=10000.0)
+    vertical, horizontal = visible_reveal_side(cam, 3500.0, 5000.0, 3000.0, 5000.0)
+    assert vertical == "right"
+    assert horizontal == "top"
