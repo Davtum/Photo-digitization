@@ -186,7 +186,7 @@ def test_reveal_depth_rejects_zero_normal():
     указания на неверную нормаль.
     """
     cam = CameraOnPlane(cx=3236.0, cy=-2823.0, cz=10000.0)
-    with pytest.raises(ValueError, match="нормаль"):
+    with pytest.raises(ValueError, match="нормаль к ребру откоса не может быть нулевой"):
         reveal_depth(cam, 5000.0, 3000.0, 26.0, edge_normal=(0.0, 0.0))
 
 
@@ -197,7 +197,7 @@ def test_reveal_depth_rejects_nonpositive_width():
     глубину, и то и другое молча.
     """
     for bad_width in (0.0, -10.0):
-        with pytest.raises(ValueError, match="положительной"):
+        with pytest.raises(ValueError, match="ширина откоса должна быть строго положительной"):
             _depth_from(bad_width, U_BASE, CZ_BASE)
 
 
@@ -245,7 +245,7 @@ def test_reveal_depth_rejects_degenerate_geometry():
     подменяется — убийство мутанта оказалось бы фиктивным.
     """
     cam = CameraOnPlane(cx=4990.0, cy=3000.0, cz=10000.0)
-    with pytest.raises(ValueError, match="вырожденная геометрия"):
+    with pytest.raises(ValueError, match="не меньше расстояния до опорной точки"):
         reveal_depth(cam, 5000.0, 3000.0, reveal_width_mm=50.0, edge_normal=(1.0, 0.0))
 
 
@@ -270,7 +270,12 @@ def test_reveal_depth_rejects_shallow_angle():
 
 
 def test_reveal_depth_threshold_boundary_is_enforced():
-    """Порог отсекает ровно то, что ниже него, и пропускает то, что выше."""
+    """Порог отсекает ровно то, что ниже него, и пропускает то, что выше.
+
+    Сравнение строгое: грань РОВНО на пороге принимается. Порог берётся тем самым
+    значением угла, которое вычисляет сама реализация по возвращённой ею глубине,
+    поэтому равенство точное, а не приблизительное.
+    """
     cam = CameraOnPlane(cx=X_EDGE - U_BASE, cy=Y_EDGE, cz=CZ_BASE)
     with pytest.raises(ValueError, match="ниже порога"):
         reveal_depth(
@@ -280,6 +285,35 @@ def test_reveal_depth_threshold_boundary_is_enforced():
         cam, X_EDGE, Y_EDGE, W_BASE, edge_normal=(1.0, 0.0), theta_min_deg=29.5
     )
     assert got == pytest.approx(DEPTH_BASE, rel=1e-9)
+
+    theta_exact = math.degrees(math.atan(abs(X_EDGE - cam.cx) / (cam.cz + got)))
+    on_threshold = reveal_depth(
+        cam, X_EDGE, Y_EDGE, W_BASE, edge_normal=(1.0, 0.0), theta_min_deg=theta_exact
+    )
+    assert on_threshold == pytest.approx(got, rel=1e-12)
+
+
+def test_threshold_uses_angle_at_inner_edge():
+    """Порог считается по ВНУТРЕННЕМУ ребру, а не по плоскости стены. П. 5.4.
+
+    Угол на внутреннем ребре arctg(|u| / (C_z + d)) = 30.00°, а на плоскости стены
+    arctg(|u| / C_z) = 30.37°: те же полтора процента по тангенсу и того же
+    происхождения, что и занижение в бюджете погрешности. Порог 30.2° лежит между
+    ними, поэтому различает две версии: по внутреннему ребру грань отвергается,
+    по плоскости стены — принималась бы. Прежний тест с 29.5° и 30.5° обе версии
+    пропускал.
+    """
+    cam = CameraOnPlane(cx=X_EDGE - U_BASE, cy=Y_EDGE, cz=CZ_BASE)
+
+    at_edge = math.degrees(math.atan(U_BASE / (CZ_BASE + DEPTH_BASE)))
+    at_wall = math.degrees(math.atan(U_BASE / CZ_BASE))
+    assert at_edge == pytest.approx(30.0, abs=1e-9)
+    assert at_wall == pytest.approx(30.3708, abs=1e-4)
+
+    with pytest.raises(ValueError, match="ниже порога"):
+        reveal_depth(
+            cam, X_EDGE, Y_EDGE, W_BASE, edge_normal=(1.0, 0.0), theta_min_deg=30.2
+        )
 
 
 def test_width_sigma_matches_numeric_sensitivity():
@@ -371,9 +405,9 @@ def test_sigma_rejects_negative_uncertainty():
 
 def test_sigma_rejects_degenerate_inputs():
     """Производные не определены при вырожденной геометрии и неверных входах."""
-    with pytest.raises(ValueError, match="вырожденная геометрия"):
+    with pytest.raises(ValueError, match="не меньше проекции"):
         reveal_depth_sigma(W_BASE, W_BASE, CZ_BASE, 5.0, 175.0)
-    with pytest.raises(ValueError, match="положительной"):
+    with pytest.raises(ValueError, match="ширина откоса должна быть строго положительной"):
         reveal_depth_sigma(0.0, U_BASE, CZ_BASE, 5.0, 175.0)
     with pytest.raises(ValueError, match="высота камеры"):
         reveal_depth_sigma(W_BASE, U_BASE, 0.0, 5.0, 175.0)
