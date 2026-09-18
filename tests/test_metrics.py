@@ -56,12 +56,48 @@ def test_coverage_can_be_gamed_by_inflating_sigma():
 
 
 def test_interval_score_penalises_both_width_and_miss():
-    truth = np.array([0.0])
-    tight_correct = interval_score(np.array([0.0]), truth, np.array([10.0]))
-    wide_correct = interval_score(np.array([0.0]), truth, np.array([100.0]))
-    tight_miss = interval_score(np.array([500.0]), truth, np.array([10.0]))
-    assert tight_correct < wide_correct
-    assert tight_correct < tight_miss
+    """IS = (u−l) + (2/α)(l−y)·1{y<l} + (2/α)(y−u)·1{y>u}. Спецификация, п. 12.3."""
+    from scipy.stats import norm
+
+    alpha, sigma = 0.05, 10.0
+    z = norm.ppf(1.0 - alpha / 2.0)
+
+    # Попадание: штрафа нет, остаётся только ширина.
+    hit = interval_score(np.array([0.0]), np.array([0.0]), np.array([sigma]), alpha)
+    assert hit == pytest.approx(2.0 * z * sigma)
+
+    # Промах: ширина плюс штраф (2/alpha) * (y - u).
+    y = 500.0
+    miss = interval_score(np.array([0.0]), np.array([y]), np.array([sigma]), alpha)
+    expected = 2.0 * z * sigma + (2.0 / alpha) * (y - z * sigma)
+    assert miss == pytest.approx(expected)
+    assert miss > 100 * hit
+
+    # Ширина наказывается отдельно, при одинаковом попадании.
+    wide = interval_score(np.array([0.0]), np.array([0.0]), np.array([100.0]), alpha)
+    assert wide > hit
+
+
+def test_mean_sharpness_is_the_mean_not_an_extremum():
+    sigmas = np.array([1.0, 2.0, 30.0])      # mean 11, median 2, min 1, max 30
+    assert mean_sharpness(sigmas) == pytest.approx(11.0)
+
+
+def test_coverage_widens_with_k():
+    rng = np.random.default_rng(7)
+    truth = np.zeros(20000)
+    measured = rng.normal(0.0, 10.0, 20000)
+    sigmas = np.full(20000, 10.0)
+    assert coverage(measured, truth, sigmas, k=1.0) == pytest.approx(0.683, abs=0.02)
+    assert coverage(measured, truth, sigmas, k=2.0) == pytest.approx(0.954, abs=0.01)
+
+
+def test_rmse_differs_from_mean_absolute_error():
+    truth = np.zeros(4)
+    measured = np.array([1.0, 1.0, 1.0, 9.0])   # MAE 3.0, RMSE sqrt(84/4) = sqrt(21)
+    st = error_stats(measured, truth)
+    assert st.rmse == pytest.approx(4.582576, rel=1e-5)
+    assert st.rmse > 1.5 * float(np.mean(np.abs(measured - truth)))
 
 
 def test_mismatched_lengths_are_rejected():
