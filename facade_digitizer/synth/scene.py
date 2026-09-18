@@ -27,11 +27,24 @@ class Opening:
 
 
 def look_at(center: np.ndarray, target: np.ndarray) -> np.ndarray:
-    """Матрица поворота мир -> камера. Камера смотрит вдоль +Z, ось Y направлена вниз."""
+    """Матрица поворота мир -> камера. Камера смотрит вдоль +Z, ось Y направлена вниз.
+
+    Оба вырожденных случая отвергаются явно: без этого нормировка нулевого вектора
+    даёт nan, сцена отрисовывается и тесты проходят, а матрица поворота — мусор.
+    """
     f = target - center
-    f = f / np.linalg.norm(f)
+    norm_f = np.linalg.norm(f)
+    if norm_f == 0:
+        raise ValueError("центр камеры совпадает с точкой наведения")
+    f = f / norm_f
     r = np.cross(f, WORLD_UP)
-    r = r / np.linalg.norm(r)
+    norm_r = np.linalg.norm(r)
+    if norm_r < 1e-9:
+        raise ValueError(
+            "направление взгляда коллинеарно мировой вертикали: "
+            "ориентация камеры не определена"
+        )
+    r = r / norm_r
     d = np.cross(f, r)
     return np.array([r, d, f])
 

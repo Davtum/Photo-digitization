@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 import pytest
 
-from facade_digitizer.synth.scene import Opening, SyntheticScene
+from facade_digitizer.synth.scene import Opening, SyntheticScene, look_at
 
 K = np.array([[3600.0, 0, 2640.0], [0, 3600.0, 1978.0], [0, 0, 1.0]])
 SIZE = (5280, 3956)
@@ -75,3 +75,26 @@ def test_point_behind_camera_is_rejected():
     sc = make_scene()
     with pytest.raises(ValueError):
         sc.project(np.array([[0.0, 0.0]]), depth=-20000.0)
+
+
+def test_look_at_rejects_gaze_collinear_with_world_up():
+    """Взгляд строго вдоль мировой вертикали не задаёт ориентацию камеры.
+
+    Без охраны np.cross(f, WORLD_UP) — нулевой вектор, нормировка даёт nan,
+    матрица поворота молча становится мусором, а сцена всё равно рендерится.
+    """
+    with pytest.raises(ValueError, match="коллинеарно"):
+        look_at(np.array([0.0, 0.0, 0.0]), np.array([0.0, 5000.0, 0.0]))
+
+
+def test_look_at_rejects_degenerate_gaze_direction():
+    """Центр камеры, совпавший с точкой наведения, не задаёт направления взгляда."""
+    with pytest.raises(ValueError, match="совпадает"):
+        look_at(np.array([1.0, 2.0, 3.0]), np.array([1.0, 2.0, 3.0]))
+
+
+def test_look_at_returns_finite_rotation_for_valid_gaze():
+    """Охрана не должна отвергать рабочие ракурсы: матрица конечна и ортонормальна."""
+    R = look_at(np.array([13000.0, 5500.0, 12000.0]), np.array([10000.0, 7500.0, 0.0]))
+    assert np.all(np.isfinite(R))
+    assert R @ R.T == pytest.approx(np.eye(3), abs=1e-9)
