@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 
 from facade_digitizer.geometry.vanishing import detect_segments, estimate_vanishing_points
-from tests.test_synth import K, make_scene
+from tests.test_synth import K, make_rich_scene, make_scene
 
 
 def test_detects_segments_on_synthetic_facade():
@@ -67,3 +67,53 @@ def test_orthogonality_close_to_ninety_on_valid_scene():
     segs = detect_segments(scene.render())
     _, _, conf = estimate_vanishing_points(segs, scene.image_size, K)
     assert conf.orthogonality_deg == pytest.approx(90.0, abs=6.0)
+
+
+def _direction(v, K_):
+    """Направление в системе камеры, отвечающее точке схода."""
+    d = np.linalg.inv(K_) @ np.asarray(v, dtype=float)
+    return d / np.linalg.norm(d)
+
+
+def _angle_to_truth_deg(v, scene, d_world):
+    """Угол между оценённым направлением и истинным, взятым из позы сцены.
+
+    Истинная точка схода направления d считается точно: K · (R_wc · d).
+    """
+    truth = scene.K @ (scene.R_wc @ np.asarray(d_world, dtype=float))
+    cos = abs(float(_direction(v, scene.K) @ _direction(truth, scene.K)))
+    return float(np.degrees(np.arccos(min(1.0, cos))))
+
+
+@pytest.mark.parametrize("build", [make_scene, make_rich_scene],
+                         ids=["бедная", "обогащённая"])
+def test_confidence_holds_on_poor_and_rich_scene(build):
+    """Контракт доверия обязан держаться и на бедной сцене, и на обогащённой.
+
+    Различитель: вертикальный пучок бедной сцены — четыре прямые, три из которых
+    короткие и сгрудились на одном проёме; обогащённая даёт ему разнесённые
+    вертикали. Если оценщик проходит только на богатой — дело в данных.
+    """
+    scene = build()
+    segs = detect_segments(scene.render())
+    _, _, conf = estimate_vanishing_points(segs, scene.image_size, K)
+    assert conf.value > 0.5
+    assert conf.support_h >= 2 and conf.support_v >= 2
+    assert conf.orthogonality_deg == pytest.approx(90.0, abs=6.0)
+    assert conf.reasons == []
+
+
+@pytest.mark.parametrize("build", [make_scene, make_rich_scene],
+                         ids=["бедная", "обогащённая"])
+def test_vanishing_points_agree_with_true_pose(build):
+    """Оценка сверяется с точной истиной K · (R_wc · d), а не сама с собой.
+
+    Без этой сверки метрика доверия может уверенно подтверждать неверную
+    плоскость: согласованный пучок обломков одной прямой даёт и поддержку,
+    и малую невязку, и ортогональность.
+    """
+    scene = build()
+    segs = detect_segments(scene.render())
+    vh, vv, _ = estimate_vanishing_points(segs, scene.image_size, K)
+    assert _angle_to_truth_deg(vh.point, scene, [1.0, 0.0, 0.0]) < 2.0
+    assert _angle_to_truth_deg(vv.point, scene, [0.0, 1.0, 0.0]) < 2.0

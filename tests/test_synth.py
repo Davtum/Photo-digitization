@@ -98,3 +98,39 @@ def test_look_at_returns_finite_rotation_for_valid_gaze():
     R = look_at(np.array([13000.0, 5500.0, 12000.0]), np.array([10000.0, 7500.0, 0.0]))
     assert np.all(np.isfinite(R))
     assert R @ R.T == pytest.approx(np.eye(3), abs=1e-9)
+
+
+def make_rich_scene(dx=3000.0, dy=-2000.0, dist=12000.0, depth=150.0,
+                    vertical_band_step_mm=4000.0):
+    """Обогащённая сцена: к межэтажным членениям добавлены вертикальные.
+
+    Служит различителем при отладке оценщика точек схода: если оценка плоха на
+    бедной сцене и хороша на обогащённой — дело в данных, а не в алгоритме.
+    """
+    ops = [Opening(x=4000.0, y=3000.0, width=1460.0, height=1900.0, depth=depth)]
+    return SyntheticScene.looking_at_centre(20000.0, 15000.0, ops, dist, dx, dy, K, SIZE,
+                                            vertical_band_step_mm=vertical_band_step_mm)
+
+
+def count_vertical_segments(img, min_len_px=40.0):
+    """Отрезки, отнесённые к вертикальному пучку тем же правилом, что и в оценщике."""
+    lines = cv2.createLineSegmentDetector().detect(img)[0]
+    if lines is None:
+        return 0
+    seg = lines.reshape(-1, 4)
+    seg = seg[np.hypot(seg[:, 2] - seg[:, 0], seg[:, 3] - seg[:, 1]) >= min_len_px]
+    ang = np.degrees(np.arctan2(seg[:, 3] - seg[:, 1], seg[:, 2] - seg[:, 0])) % 180.0
+    return int(np.count_nonzero((ang >= 45.0) & (ang <= 135.0)))
+
+
+def test_vertical_bands_are_off_by_default():
+    """Умолчание не меняется сознательно: бедная сцена остаётся основной."""
+    assert make_scene().vertical_band_step_mm == 0.0
+    assert np.array_equal(make_scene().render(), make_rich_scene(vertical_band_step_mm=0.0).render())
+
+
+def test_vertical_bands_add_vertical_segments():
+    """Вертикальный пучок бедной сцены — 4 прямые; обогащённая даёт заметно больше."""
+    n_poor = count_vertical_segments(make_scene().render())
+    n_rich = count_vertical_segments(make_rich_scene().render())
+    assert n_rich > 2 * n_poor

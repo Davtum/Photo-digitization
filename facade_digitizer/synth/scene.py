@@ -59,16 +59,17 @@ class SyntheticScene:
     K: np.ndarray
     image_size: tuple
     floor_band_step_mm: float = 3000.0
+    vertical_band_step_mm: float = 0.0
     _c: dict = field(default_factory=dict, repr=False)
 
     @classmethod
     def looking_at_centre(cls, width_mm, height_mm, openings, distance_mm,
                           offset_x_mm, offset_y_mm, K, image_size,
-                          floor_band_step_mm=3000.0):
+                          floor_band_step_mm=3000.0, vertical_band_step_mm=0.0):
         target = np.array([width_mm / 2.0, height_mm / 2.0, 0.0])
         centre = target + np.array([offset_x_mm, offset_y_mm, distance_mm])
         return cls(width_mm, height_mm, openings, centre, look_at(centre, target),
-                   K, image_size, floor_band_step_mm)
+                   K, image_size, floor_band_step_mm, vertical_band_step_mm)
 
     def camera_on_plane(self) -> CameraOnPlane:
         """Истинная поза: опорная точка и расстояние до плоскости."""
@@ -101,6 +102,17 @@ class SyntheticScene:
                 cv2.line(img, tuple(np.round(pts[0]).astype(int)),
                          tuple(np.round(pts[1]).astype(int)), 115, 6)
                 y += self.floor_band_step_mm
+        # Вертикальные членения (лопатки, простенки). По умолчанию выключены:
+        # бедная сцена остаётся основной и нагружает оценщик реалистично.
+        # Включённые, они дают вертикальному пучку длинные разнесённые прямые
+        # вместо трёх коротких обломков на одном проёме.
+        if self.vertical_band_step_mm > 0:
+            x = self.vertical_band_step_mm
+            while x < self.width_mm:
+                pts = self.project(np.array([[x, 0.0], [x, self.height_mm]]))
+                cv2.line(img, tuple(np.round(pts[0]).astype(int)),
+                         tuple(np.round(pts[1]).astype(int)), 115, 6)
+                x += self.vertical_band_step_mm
 
         for op in self.openings:
             cv2.fillPoly(img, [np.round(self.project(op.corners_mm())).astype(np.int32)], 90)
