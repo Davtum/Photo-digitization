@@ -8,6 +8,11 @@ from facade_digitizer.metrics import (
     mean_sharpness,
 )
 
+# Квантили нормального распределения заданы константами, а не вызовом scipy: ожидаемое
+# значение в тесте не должно вычисляться тем же кодом, что и проверяемая величина.
+Z_975 = 1.959963984540054   # norm.ppf(0.975), alpha = 0.05
+Z_900 = 1.2815515655446004  # norm.ppf(0.900), alpha = 0.20
+
 
 def test_error_stats_on_known_arrays():
     truth = np.array([1000.0, 2000.0, 3000.0, 4000.0])
@@ -57,10 +62,8 @@ def test_coverage_can_be_gamed_by_inflating_sigma():
 
 def test_interval_score_penalises_both_width_and_miss():
     """IS = (u−l) + (2/α)(l−y)·1{y<l} + (2/α)(y−u)·1{y>u}. Спецификация, п. 12.3."""
-    from scipy.stats import norm
-
     alpha, sigma = 0.05, 10.0
-    z = norm.ppf(1.0 - alpha / 2.0)
+    z = Z_975
 
     # Попадание: штрафа нет, остаётся только ширина.
     hit = interval_score(np.array([0.0]), np.array([0.0]), np.array([sigma]), alpha)
@@ -76,6 +79,35 @@ def test_interval_score_penalises_both_width_and_miss():
     # Ширина наказывается отдельно, при одинаковом попадании.
     wide = interval_score(np.array([0.0]), np.array([0.0]), np.array([100.0]), alpha)
     assert wide > hit
+
+
+def test_interval_score_penalises_underestimate_too():
+    """Штраф считается двумя ветками; выше проверена только верхняя."""
+    alpha, sigma = 0.05, 10.0
+    z = Z_975
+    y = -500.0
+    got = interval_score(np.array([0.0]), np.array([y]), np.array([sigma]), alpha)
+    expected = 2.0 * z * sigma + (2.0 / alpha) * (-z * sigma - y)
+    assert got == pytest.approx(expected)
+
+
+def test_interval_score_respects_alpha():
+    """Ширина интервала и вес штрафа заданы alpha, а не зашиты на 0.05."""
+    alpha, sigma = 0.2, 10.0
+    z = Z_900
+
+    hit = interval_score(np.array([0.0]), np.array([0.0]), np.array([sigma]), alpha)
+    assert hit == pytest.approx(2.0 * z * sigma)
+
+    y = 100.0
+    miss = interval_score(np.array([0.0]), np.array([y]), np.array([sigma]), alpha)
+    assert miss == pytest.approx(2.0 * z * sigma + (2.0 / alpha) * (y - z * sigma))
+
+    # При том же промахе более узкий номинальный интервал (alpha=0.2) даёт другой счёт,
+    # чем стандартный (alpha=0.05) — значит alpha действительно участвует.
+    assert miss != pytest.approx(
+        interval_score(np.array([0.0]), np.array([y]), np.array([sigma]), 0.05)
+    )
 
 
 def test_mean_sharpness_is_the_mean_not_an_extremum():
@@ -98,6 +130,29 @@ def test_rmse_differs_from_mean_absolute_error():
     st = error_stats(measured, truth)
     assert st.rmse == pytest.approx(4.582576, rel=1e-5)
     assert st.rmse > 1.5 * float(np.mean(np.abs(measured - truth)))
+
+
+def test_p95_has_exact_analytic_value():
+    """На 0..100 с шагом 1 линейная интерполяция numpy даёт ровно 95.0."""
+    truth = np.zeros(101)
+    measured = np.arange(101.0)   # |ошибки| = 0..100, индекс 0.95*(101-1) = 95
+    st = error_stats(measured, truth)
+    assert st.p95 == pytest.approx(95.0)
+
+
+def test_single_sample_reports_zero_spread_not_nan():
+    """При n=1 дисперсия по ddof=1 не определена; модуль обязан вернуть 0.0, а не nan."""
+    st = error_stats(np.array([5.0]), np.array([0.0]))
+    assert st.n == 1
+    assert st.bias == pytest.approx(5.0)
+    assert st.rmse == pytest.approx(5.0)
+    assert st.sigma == 0.0
+    assert not np.isnan(st.sigma)
+
+
+def test_empty_sample_is_rejected():
+    with pytest.raises(ValueError):
+        error_stats(np.array([]), np.array([]))
 
 
 def test_mismatched_lengths_are_rejected():
