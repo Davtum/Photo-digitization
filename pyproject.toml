@@ -1,0 +1,30 @@
+[project]
+name = "facade-digitizer"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "opencv-python>=4.8.0",
+    "pydantic>=2.6",
+    "piexif>=1.1.3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.4"]
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["facade_digitizer*"]
+
+[project.scripts]
+facade-digitize = "facade_digitizer.pipeline.run:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
