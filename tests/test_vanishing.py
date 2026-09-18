@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 
 from facade_digitizer.geometry.vanishing import detect_segments, estimate_vanishing_points
-from tests.test_synth import K, SIZE, make_rich_scene, make_scene
+from tests.test_synth import SIZE, K, make_rich_scene, make_scene
 
 
 def test_detects_segments_on_synthetic_facade():
@@ -50,7 +50,7 @@ def test_rejects_multichannel_image():
 def test_vanishing_points_are_found_on_tilted_facade():
     scene = make_scene()
     segs = detect_segments(scene.render())
-    vh, vv, conf = estimate_vanishing_points(segs, scene.image_size, K)
+    _, _, conf = estimate_vanishing_points(segs, scene.image_size, K)
     assert conf.value > 0.5
     assert conf.support_h >= 2 and conf.support_v >= 2
 
