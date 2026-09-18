@@ -112,15 +112,30 @@ def make_rich_scene(dx=3000.0, dy=-2000.0, dist=12000.0, depth=150.0,
                                             vertical_band_step_mm=vertical_band_step_mm)
 
 
-def count_vertical_segments(img, min_len_px=40.0):
-    """Отрезки, отнесённые к вертикальному пучку тем же правилом, что и в оценщике."""
-    lines = cv2.createLineSegmentDetector().detect(img)[0]
+def count_segments_along(scene, world_direction, tolerance_deg=25.0, min_len_px=40.0):
+    """Отрезки, сонаправленные с заданным направлением фасада в кадре этой сцены.
+
+    Эталон берётся из геометрии самой сцены: направление в кадре считается как
+    проекция отрезка мировой прямой, идущей вдоль `world_direction`. Правило
+    классификации оценщика здесь сознательно не повторяется — тест, переписывающий
+    правило из кода, подтверждает только то, что его удалось переписать, и
+    переживает любой сдвиг этого правила.
+    """
+    lines = cv2.createLineSegmentDetector().detect(scene.render())[0]
     if lines is None:
         return 0
     seg = lines.reshape(-1, 4)
     seg = seg[np.hypot(seg[:, 2] - seg[:, 0], seg[:, 3] - seg[:, 1]) >= min_len_px]
+
+    centre = np.array([scene.width_mm / 2.0, scene.height_mm / 2.0])
+    step = np.asarray(world_direction, dtype=float) * 1000.0
+    ends = scene.project(np.vstack([centre - step, centre + step]))
+    reference = np.degrees(np.arctan2(*(ends[1] - ends[0])[::-1])) % 180.0
+
     ang = np.degrees(np.arctan2(seg[:, 3] - seg[:, 1], seg[:, 2] - seg[:, 0])) % 180.0
-    return int(np.count_nonzero((ang >= 45.0) & (ang <= 135.0)))
+    delta = np.abs(ang - reference)
+    delta = np.minimum(delta, 180.0 - delta)
+    return int(np.count_nonzero(delta <= tolerance_deg))
 
 
 def test_vertical_bands_are_off_by_default():
@@ -129,8 +144,22 @@ def test_vertical_bands_are_off_by_default():
     assert np.array_equal(make_scene().render(), make_rich_scene(vertical_band_step_mm=0.0).render())
 
 
-def test_vertical_bands_add_vertical_segments():
-    """Вертикальный пучок бедной сцены — 4 прямые; обогащённая даёт заметно больше."""
-    n_poor = count_vertical_segments(make_scene().render())
-    n_rich = count_vertical_segments(make_rich_scene().render())
+def test_vertical_bands_add_segments_along_the_facade_vertical():
+    """Вертикальных прямых в бедной сцене единицы; обогащённая даёт заметно больше.
+
+    Считаются отрезки, сонаправленные с мировой вертикалью фасада (0, 1) в её
+    проекции на кадр, а не попавшие в вертикальный пучок по правилу оценщика.
+    """
+    n_poor = count_segments_along(make_scene(), (0.0, 1.0))
+    n_rich = count_segments_along(make_rich_scene(), (0.0, 1.0))
     assert n_rich > 2 * n_poor
+
+
+def test_vertical_bands_do_not_disturb_the_horizontal_family():
+    """Обогащение добавляет вертикали, а не переписывает горизонтали.
+
+    Без этой проверки рост вертикалей можно получить, просто испортив сцену.
+    """
+    n_poor = count_segments_along(make_scene(), (1.0, 0.0))
+    n_rich = count_segments_along(make_rich_scene(), (1.0, 0.0))
+    assert n_rich >= n_poor

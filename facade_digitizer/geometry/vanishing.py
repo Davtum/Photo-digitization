@@ -58,58 +58,189 @@ def _segment_lines(segs: np.ndarray) -> np.ndarray:
     return np.cross(p1, p2)
 
 
-def _fit_vanishing_point(lines: np.ndarray, threshold: float, rng):
-    """RANSAC по парам прямых. Возвращает точку и маску поддержки."""
-    best_point, best_mask = None, np.zeros(len(lines), dtype=bool)
-    if len(lines) < 2:
-        return np.array([0.0, 0.0, 1.0]), best_mask, float("inf")
+def _midpoints(segs: np.ndarray) -> np.ndarray:
+    """Середины отрезков в однородных координатах."""
+    return np.column_stack([(segs[:, 0] + segs[:, 2]) / 2.0,
+                            (segs[:, 1] + segs[:, 3]) / 2.0,
+                            np.ones(len(segs))])
 
-    for _ in range(200):
-        i, j = rng.choice(len(lines), size=2, replace=False)
+
+def endpoint_deviation_px(segs: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """Отклонение концов отрезков от направления на точку схода, в пикселях.
+
+    Для отрезка длиной L, чьё направление отклонилось от направления «середина —
+    точка схода» на угол alpha, величина равна (L/2)·sin(alpha). Это настоящие
+    пиксели кадра, и они не зависят от удалённости точки схода: у почти
+    параллельного пучка, чья точка схода уходит на 1e5 px и дальше, мера остаётся
+    конечной и малой ровно тогда, когда отрезки действительно сонаправлены.
+
+    В прежней редакции критерием была нормированная на ‖v‖ дистанция прямой до
+    точки схода: фактический допуск в пикселях равнялся threshold·‖v‖ и рос без
+    границ вместе с удалением точки схода, так что на почти параллельном пучке
+    инлайерами становились все отрезки подряд.
+    """
+    mid = _midpoints(segs)
+    rays = np.cross(mid, np.asarray(v, dtype=float))   # прямая «середина — точка схода»
+    norms = np.linalg.norm(rays[:, :2], axis=1)
+    ends = np.column_stack([segs[:, 0], segs[:, 1], np.ones(len(segs))])
+    dev = np.abs(np.einsum("ij,ij->i", ends, rays)) / np.maximum(norms, 1e-12)
+    half_len = np.hypot(segs[:, 2] - segs[:, 0], segs[:, 3] - segs[:, 1]) / 2.0
+    # Вырожденный случай: точка схода села на середину отрезка — направление на неё
+    # не определено, и отрезок такую гипотезу не поддерживает.
+    return np.where(norms > 1e-9, dev, half_len)
+
+
+def _hypothesis_pairs(n: int, max_hypotheses: int, rng) -> np.ndarray:
+    """Пары прямых-гипотез: полный перебор, пока он дешевле выборки.
+
+    При n <= 63 все n(n-1)/2 пар укладываются в бюджет, перебор исчерпывающий, и
+    результат перестаёт зависеть от seed. Выборка включается только там, где полный
+    перебор действительно дорог. Прежние 200 случайных пар недосэмплировали уже
+    27 прямых (351 пара).
+    """
+    if n * (n - 1) // 2 <= max_hypotheses:
+        return np.column_stack(np.triu_indices(n, k=1))
+    i = rng.integers(0, n, size=max_hypotheses)
+    j = (i + 1 + rng.integers(0, n - 1, size=max_hypotheses)) % n
+    return np.column_stack([i, j])
+
+
+def _fit_vanishing_point(segs: np.ndarray, threshold_px: float, rng,
+                         max_hypotheses: int = 2000):
+    """RANSAC по парам прямых с пиксельным критерием инлайера.
+
+    Возвращает точку схода, маску поддержки и среднее отклонение инлайеров в пикселях.
+    """
+    empty = np.zeros(len(segs), dtype=bool)
+    if len(segs) < 2:
+        return np.array([0.0, 0.0, 1.0]), empty, float("inf")
+
+    lines = _segment_lines(segs)
+    best_point, best_mask, best_resid = None, empty, float("inf")
+    for i, j in _hypothesis_pairs(len(segs), max_hypotheses, rng):
         v = np.cross(lines[i], lines[j])
-        norm = np.linalg.norm(v[:2])
-        if norm < 1e-9:
+        if np.linalg.norm(v) < 1e-12:
             continue
-        dist = np.abs(lines @ v) / (np.linalg.norm(lines[:, :2], axis=1) * np.linalg.norm(v) + 1e-12)
-        mask = dist < threshold
-        if mask.sum() > best_mask.sum():
-            best_point, best_mask = v, mask
+        dev = endpoint_deviation_px(segs, v)
+        mask = dev < threshold_px
+        resid = float(dev[mask].mean()) if mask.any() else float("inf")
+        if mask.sum() > best_mask.sum() or (mask.sum() == best_mask.sum()
+                                            and resid < best_resid):
+            best_point, best_mask, best_resid = v, mask, resid
 
-    if best_point is None:
-        return np.array([0.0, 0.0, 1.0]), best_mask, float("inf")
+    if best_point is None or not best_mask.any():
+        return np.array([0.0, 0.0, 1.0]), empty, float("inf")
 
-    v = best_point
-    dist = np.abs(lines @ v) / (np.linalg.norm(lines[:, :2], axis=1) * np.linalg.norm(v) + 1e-12)
-    resid = float(dist[best_mask].mean()) if best_mask.any() else float("inf")
-    return best_point, best_mask, resid
+    # Уточнения по МНК здесь намеренно нет. Оно напрашивается — гипотезу строили две
+    # прямые, а поддержал десяток, — но МНК по прямым минимизирует алгебраическую
+    # невязку, а не отклонение концов в пикселях, и на деле проигрывает: под охраной
+    # «принимать, только если не хуже по тому же правилу» оно не принимается ни на
+    # одном из проверенных входов, а без охраны на одной сцене улучшает точность
+    # втрое, на другой во столько же ухудшает. Ветка, которая никогда не срабатывает,
+    # — тот же мёртвый код, что уже был удалён из метрики дважды.
+    dev = endpoint_deviation_px(segs, best_point)
+    return best_point, best_mask, float(dev[best_mask].mean())
+
+
+def _split_bundles(segments: np.ndarray):
+    """Разделение на горизонтальный и вертикальный пучки по ближайшей оси кадра.
+
+    Правило «отрезок принадлежит той оси, на которую он больше проецируется»
+    записано прямым сравнением проекций, без порога в градусах: пороговой
+    константы здесь нет, а значит её нечего молча сдвинуть.
+    """
+    dx = np.abs(segments[:, 2] - segments[:, 0])
+    dy = np.abs(segments[:, 3] - segments[:, 1])
+    is_vert = dy > dx
+    return segments[~is_vert], segments[is_vert]
+
+
+def bundle_conditioning(segs: np.ndarray, residual_px: float) -> float:
+    """Обусловленность точки схода: веер направлений пучка против углового шума.
+
+    Точка схода определена тем хуже, чем ближе пучок к параллельному: у идеально
+    параллельных прямых она уходит на бесконечность, и тогда её положение задаётся
+    уже не геометрией, а шумом детектора. Веер — угловой разброс направлений
+    инлайеров; шум — угол, на который отрезок длиной L отклоняет невязка в
+    `residual_px` пикселей, то есть asin(residual/(L/2)). Отношение и есть запас
+    обусловленности: у наклонного фасада оно измеряется сотнями, у пучка почти
+    параллельных прямых с дрожанием детектора — единицами.
+
+    Ровно эту величину не ловила ни одна прежняя проверка: у входа из двух пучков
+    почти параллельных прямых поддержка, покрытие, невязка и ортогональность все
+    выглядели благополучно.
+    """
+    if len(segs) < 2:
+        return 0.0
+    ang = np.sort(np.degrees(np.arctan2(segs[:, 3] - segs[:, 1],
+                                        segs[:, 2] - segs[:, 0])) % 180.0)
+    # Направления живут на окружности с периодом 180°: веер — это 180° минус
+    # наибольший пустой промежуток, иначе пучок вокруг 0° насчитал бы почти 180°.
+    gaps = np.diff(np.concatenate([ang, [ang[0] + 180.0]]))
+    fan = 180.0 - float(gaps.max())
+    half_len = np.hypot(segs[:, 2] - segs[:, 0], segs[:, 3] - segs[:, 1]) / 2.0
+    noise = float(np.degrees(np.arcsin(
+        np.clip(residual_px / np.maximum(half_len, 1e-9), 0.0, 1.0))).mean())
+    if noise < 1e-9:
+        return float("inf") if fan > 0.0 else 0.0
+    return fan / noise
+
+
+def _support_spread(segs: np.ndarray, image_size: tuple[int, int]) -> float:
+    """Доля кадра, которую охватывают середины поддержавших отрезков.
+
+    Пучок, сгрудившийся в одном углу, не свидетельствует о плоскости всего кадра,
+    даже если внутри себя он идеально согласован.
+    """
+    if len(segs) == 0:
+        return 0.0
+    mid = _midpoints(segs)[:, :2]
+    span = mid.max(axis=0) - mid.min(axis=0)
+    rel = span / np.maximum(np.asarray(image_size, dtype=float), 1.0)
+    return float(np.hypot(*rel) / math.sqrt(2.0))
+
+
+MIN_SEGMENTS = 8
+INLIER_PX = 2.0
+# Доля допуска, выше которой средняя невязка инлайеров сама становится причиной
+# отказа. Именно доля, а не абсолютные пиксели: инлайер по определению лежит ближе
+# threshold_px, так что абсолютный порог выше допуска был бы недостижим — ровно тот
+# мёртвый код, что уже был найден в проверке неопределённой невязки.
+RESIDUAL_MAX_FRACTION = 0.75
+RESIDUAL_REF_PX = 1.5
+ORTHOGONALITY_MAX_DEG = 15.0
+MIN_COVERAGE = 0.2
+MIN_SUPPORT_TOTAL = 10
+MIN_SPREAD = 0.2
+MIN_CONDITIONING = 15.0
 
 
 def estimate_vanishing_points(
     segments: np.ndarray,
     image_size: tuple[int, int],
     K: np.ndarray,
-    threshold: float = 0.02,
+    threshold_px: float = INLIER_PX,
     seed: int = 0,
 ) -> tuple[VanishingPoint, VanishingPoint, PlaneConfidence]:
-    """Две ортогональные точки схода плюс мера доверия к плоскости."""
+    """Две ортогональные точки схода плюс мера доверия к плоскости.
+
+    Доверие — часть контракта, а не диагностика: ниже порога система обязана не
+    гадать, а передать управление оператору (спецификация, п. 4.2). Поэтому `value`
+    зависит не только от того, какая доля отрезков поддержала гипотезу, но и от
+    невязки инлайеров в пикселях, и от отклонения восстановленных направлений от
+    прямого угла.
+    """
     reasons: list[str] = []
-    if len(segments) < 8:
+    if len(segments) < MIN_SEGMENTS:
         reasons.append("слишком мало отрезков")
         empty = VanishingPoint(np.array([1.0, 0.0, 0.0]), 0, float("inf"))
         return empty, empty, PlaneConfidence(0.0, 0, 0, float("inf"), 0.0, 0.0, reasons)
 
-    angles = np.degrees(np.arctan2(segments[:, 3] - segments[:, 1],
-                                   segments[:, 2] - segments[:, 0])) % 180.0
-    horiz = segments[(angles < 45.0) | (angles > 135.0)]
-    vert = segments[(angles >= 45.0) & (angles <= 135.0)]
+    horiz, vert = _split_bundles(segments)
 
     rng = np.random.default_rng(seed)
-    vh_pt, vh_mask, vh_res = (_fit_vanishing_point(_segment_lines(horiz), threshold, rng)
-                              if len(horiz) >= 2 else
-                              (np.array([1.0, 0.0, 0.0]), np.zeros(0, dtype=bool), float("inf")))
-    vv_pt, vv_mask, vv_res = (_fit_vanishing_point(_segment_lines(vert), threshold, rng)
-                              if len(vert) >= 2 else
-                              (np.array([0.0, 1.0, 0.0]), np.zeros(0, dtype=bool), float("inf")))
+    vh_pt, vh_mask, vh_res = _fit_vanishing_point(horiz, threshold_px, rng)
+    vv_pt, vv_mask, vv_res = _fit_vanishing_point(vert, threshold_px, rng)
 
     Kinv = np.linalg.inv(K)
     dh, dv = Kinv @ vh_pt, Kinv @ vv_pt
@@ -118,28 +249,49 @@ def estimate_vanishing_points(
 
     support_h, support_v = int(vh_mask.sum()), int(vv_mask.sum())
     coverage = (support_h + support_v) / max(len(segments), 1)
-    # Настоящая невязка: средняя нормированная дистанция инлайеров, переведённая
-    # в пиксели через размер кадра. В редакции 1 здесь стояла константа
-    # threshold * max(image_size), не зависевшая ни от сцены, ни от качества подгонки.
+    # Невязка в настоящих пикселях кадра: среднее отклонение концов инлайеров от
+    # направления на точку схода. В прежней редакции здесь стояла безразмерная
+    # величина, умноженная на max(image_size), — произвольный множитель, а не
+    # перевод в пиксели; расхождение с истинной дистанцией достигало 34 раз.
     finite = [r for r in (vh_res, vv_res) if np.isfinite(r)]
-    residual = float(np.mean(finite) * max(image_size)) if finite else float("inf")
+    residual = float(np.mean(finite)) if finite else float("inf")
+    supporting = (np.vstack([horiz[vh_mask], vert[vv_mask]])
+                  if support_h + support_v else np.empty((0, 4)))
+    spread = _support_spread(supporting, image_size)
+    cond_h = bundle_conditioning(horiz[vh_mask], vh_res)
+    cond_v = bundle_conditioning(vert[vv_mask], vv_res)
+    conditioning = min(cond_h, cond_v)
 
     if support_h < 2 or support_v < 2:
         reasons.append("недостаточная поддержка одной из точек схода")
-    if abs(orthogonality - 90.0) > 15.0:
+    if abs(orthogonality - 90.0) > ORTHOGONALITY_MAX_DEG:
         reasons.append(f"направления не ортогональны: {orthogonality:.1f}°")
-    if coverage < 0.2:
-        reasons.append("отрезки покрывают малую долю кадра")
+    if coverage < MIN_COVERAGE:
+        reasons.append("малая доля отрезков поддержала точки схода")
     # Проверки на неопределённую невязку здесь нет намеренно: она недостижима.
     # residual бесконечна только когда бесконечны обе невязки пучков, а каждая из
     # них бесконечна только при нулевой поддержке своего пучка — то есть этот
     # случай уже перехвачен проверкой support_h < 2 or support_v < 2 выше.
-    # Недостижимая ветка создаёт видимость защиты и остаётся вечным выжившим
-    # мутантом, на который нельзя написать тест.
-    if support_h + support_v < 10:
+    if residual > RESIDUAL_MAX_FRACTION * threshold_px:
+        reasons.append(f"велика невязка инлайеров: {residual:.2f} px")
+    if spread < MIN_SPREAD:
+        reasons.append("поддержавшие отрезки занимают малую долю кадра")
+    if conditioning < MIN_CONDITIONING:
+        reasons.append(
+            f"пучок почти параллелен, точка схода не определена: "
+            f"запас обусловленности {conditioning:.1f}")
+    if support_h + support_v < MIN_SUPPORT_TOTAL:
         reasons.append(f"мало поддерживающих отрезков: {support_h + support_v}")
 
-    value = 0.0 if reasons else min(1.0, 0.3 + 0.7 * coverage)
+    # Доверие падает от каждой из трёх причин порознь: от нехватки поддержки, от
+    # роста невязки и от ухода угла между направлениями от прямого. Прежняя редакция
+    # была аффинной функцией одного лишь покрытия, из-за чего пучок почти
+    # параллельных прямых с дрожанием в 1° получал доверие до 1.00 при пустых
+    # причинах и разбросе направления в 6° по seed.
+    q_coverage = min(1.0, 0.3 + 0.7 * coverage)
+    q_residual = 1.0 / (1.0 + residual / RESIDUAL_REF_PX)
+    q_orthogonality = max(0.0, 1.0 - abs(orthogonality - 90.0) / ORTHOGONALITY_MAX_DEG)
+    value = 0.0 if reasons else q_coverage * q_residual * q_orthogonality
 
     return (
         VanishingPoint(vh_pt, support_h, residual),

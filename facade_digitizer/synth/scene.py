@@ -60,16 +60,19 @@ class SyntheticScene:
     image_size: tuple
     floor_band_step_mm: float = 3000.0
     vertical_band_step_mm: float = 0.0
+    band_thickness_px: int = 6
     _c: dict = field(default_factory=dict, repr=False)
 
     @classmethod
     def looking_at_centre(cls, width_mm, height_mm, openings, distance_mm,
                           offset_x_mm, offset_y_mm, K, image_size,
-                          floor_band_step_mm=3000.0, vertical_band_step_mm=0.0):
+                          floor_band_step_mm=3000.0, vertical_band_step_mm=0.0,
+                          band_thickness_px=6):
         target = np.array([width_mm / 2.0, height_mm / 2.0, 0.0])
         centre = target + np.array([offset_x_mm, offset_y_mm, distance_mm])
         return cls(width_mm, height_mm, openings, centre, look_at(centre, target),
-                   K, image_size, floor_band_step_mm, vertical_band_step_mm)
+                   K, image_size, floor_band_step_mm, vertical_band_step_mm,
+                   band_thickness_px)
 
     def camera_on_plane(self) -> CameraOnPlane:
         """Истинная поза: опорная точка и расстояние до плоскости."""
@@ -92,6 +95,10 @@ class SyntheticScene:
             [0.0, 0.0], [self.width_mm, 0.0],
             [self.width_mm, self.height_mm], [0.0, self.height_mm]]))
         cv2.fillPoly(img, [np.round(wall).astype(np.int32)], 150)
+        # Толщина членений — параметр: полоса в 6 пикселей даёт детектору две
+        # кромки вместо одной оси, и оценка точки схода получает систематический
+        # сдвиг порядка 370 px. Умолчание оставлено прежним, чтобы не менять уже
+        # снятые на нём измерения; для чистых замеров ставится 1.
         # Межэтажные членения: без них на голой стене детектор отрезков находит
         # 8-10 штук, чего не хватает для устойчивой оценки точек схода. Реальные
         # фасады такие горизонтали имеют почти всегда.
@@ -100,7 +107,8 @@ class SyntheticScene:
             while y < self.height_mm:
                 pts = self.project(np.array([[0.0, y], [self.width_mm, y]]))
                 cv2.line(img, tuple(np.round(pts[0]).astype(int)),
-                         tuple(np.round(pts[1]).astype(int)), 115, 6)
+                         tuple(np.round(pts[1]).astype(int)), 115,
+                         self.band_thickness_px)
                 y += self.floor_band_step_mm
         # Вертикальные членения (лопатки, простенки). По умолчанию выключены:
         # бедная сцена остаётся основной и нагружает оценщик реалистично.
@@ -111,7 +119,8 @@ class SyntheticScene:
             while x < self.width_mm:
                 pts = self.project(np.array([[x, 0.0], [x, self.height_mm]]))
                 cv2.line(img, tuple(np.round(pts[0]).astype(int)),
-                         tuple(np.round(pts[1]).astype(int)), 115, 6)
+                         tuple(np.round(pts[1]).astype(int)), 115,
+                         self.band_thickness_px)
                 x += self.vertical_band_step_mm
 
         for op in self.openings:
