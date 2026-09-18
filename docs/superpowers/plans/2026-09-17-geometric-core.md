@@ -676,7 +676,7 @@ git commit -m "Ядро параллакса: смещение со знаком
 - Потребляет: `CameraOnPlane`, функции задачи 3
 - Предоставляет:
   `reveal_depth(cam, edge_x, edge_y, reveal_width_mm, edge_normal) -> float`,
-  `reveal_depth_sigma(depth, reveal_width_mm, sigma_width_mm, tan_perp, sigma_theta_rad) -> float`,
+  `reveal_depth_sigma(depth_mm, sigma_width_mm, tan_perp, sigma_theta_rad) -> float`,
   `visible_reveal_side(cam, x_left, x_right, y_bottom, y_top) -> tuple[str, str]`
 
 **Замечание исполнителю: здесь план точнее спецификации.** Спецификация (п. 5.4) предписывает
@@ -761,8 +761,8 @@ def test_reveal_depth_rejects_degenerate_geometry():
 def test_sigma_grows_as_angle_shrinks():
     """σ_d складывается из ошибки ширины и ошибки позы. Спецификация, п. 6.2."""
     sigma_theta = math.radians(1.0)
-    wide = reveal_depth_sigma(150.0, 86.6, 5.0, math.tan(math.radians(30.0)), sigma_theta)
-    narrow = reveal_depth_sigma(150.0, 13.1, 5.0, math.tan(math.radians(5.0)), sigma_theta)
+    wide = reveal_depth_sigma(150.0, 5.0, math.tan(math.radians(30.0)), sigma_theta)
+    narrow = reveal_depth_sigma(150.0, 5.0, math.tan(math.radians(5.0)), sigma_theta)
     assert narrow > 3 * wide
 
 
@@ -828,7 +828,6 @@ def reveal_depth(
 
 def reveal_depth_sigma(
     depth_mm: float,
-    reveal_width_mm: float,
     sigma_width_mm: float,
     tan_perp: float,
     sigma_theta_rad: float,
