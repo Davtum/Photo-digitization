@@ -183,8 +183,8 @@ def test_reveal_depth_rejects_degenerate_geometry():
 def test_sigma_grows_as_angle_shrinks():
     """σ_d складывается из ошибки ширины и ошибки позы. Спецификация, п. 6.2."""
     sigma_theta = math.radians(1.0)
-    wide = reveal_depth_sigma(150.0, 86.6, 5.0, math.tan(math.radians(30.0)), sigma_theta)
-    narrow = reveal_depth_sigma(150.0, 13.1, 5.0, math.tan(math.radians(5.0)), sigma_theta)
+    wide = reveal_depth_sigma(150.0, 5.0, math.tan(math.radians(30.0)), sigma_theta)
+    narrow = reveal_depth_sigma(150.0, 5.0, math.tan(math.radians(5.0)), sigma_theta)
     assert narrow > 3 * wide
 
 
@@ -195,10 +195,43 @@ def test_sigma_includes_pose_contribution():
     Без сложения вкладов оба значения совпали бы.
     """
     tan_perp = math.tan(math.radians(30.0))
-    without_pose = reveal_depth_sigma(150.0, 86.6, 5.0, tan_perp, 0.0)
-    with_pose = reveal_depth_sigma(150.0, 86.6, 5.0, tan_perp, math.radians(1.0))
+    without_pose = reveal_depth_sigma(150.0, 5.0, tan_perp, 0.0)
+    with_pose = reveal_depth_sigma(150.0, 5.0, tan_perp, math.radians(1.0))
     assert without_pose == pytest.approx(5.0 / tan_perp, rel=1e-12)
     assert with_pose > without_pose
+
+
+def test_pose_sigma_matches_numeric_sensitivity_of_reveal_depth():
+    """Вклад позы согласован с самой оценкой глубины. Спецификация, п. 6.2.
+
+    Оба слагаемых σ — производные одного соотношения d = w · ctg θ_n по разным
+    переменным, поэтому θ в них обязан быть одним и тем же: компонентой вдоль
+    нормали к ребру. Проверка численная: при фиксированной измеренной ширине
+    поза поворачивается так, что компонента угла меняется на ±δ, глубина
+    пересчитывается РЕАЛИЗАЦИЕЙ `reveal_depth`, и центральная разность
+    сравнивается с вкладом позы из `reveal_depth_sigma`.
+    """
+    cz, d_true = 10000.0, 150.0
+    x_edge, y_edge = 5000.0, 3000.0
+    theta = math.radians(30.0)
+    tan_perp = math.tan(theta)
+    w = d_true * tan_perp  # ширина откоса, измеренная поперёк вертикального ребра
+
+    def depth_at(theta_value):
+        """Глубина по реализации при позе с компонентой угла theta_value."""
+        depth = w / math.tan(theta_value)
+        u = math.tan(theta_value) * (cz + depth)
+        cam = CameraOnPlane(cx=x_edge - u, cy=y_edge, cz=cz)
+        return reveal_depth(cam, x_edge, y_edge, w, edge_normal=(1.0, 0.0))
+
+    assert depth_at(theta) == pytest.approx(d_true, rel=1e-9)
+
+    delta = 1e-5
+    numeric = abs(depth_at(theta + delta) - depth_at(theta - delta)) / (2.0 * delta)
+
+    sigma_theta = math.radians(0.5)
+    from_pose = reveal_depth_sigma(d_true, 0.0, tan_perp, sigma_theta)
+    assert from_pose == pytest.approx(numeric * sigma_theta, rel=1e-6)
 
 
 def test_visible_reveal_side_is_far_side():
