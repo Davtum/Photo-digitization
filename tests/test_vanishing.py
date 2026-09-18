@@ -8,6 +8,7 @@ from facade_digitizer.geometry.vanishing import (
     CONFIDENCE_THRESHOLD,
     _hypothesis_pairs,
     detect_segments,
+    direction_instability_deg,
     endpoint_deviation_px,
     estimate_vanishing_points,
 )
@@ -593,24 +594,24 @@ def _near_parallel_horizontals(n=12, jitter_deg=1.0, x=2000.0, half=210.0, seed=
 
 
 def test_one_ill_conditioned_bundle_is_enough_to_refuse():
-    """Сходящийся вертикальный пучок не выкупает почти параллельный горизонтальный.
+    """Безупречный вертикальный пучок не выкупает расшатанный горизонтальный.
 
-    Дополнительно проверяется склейка направлений через 0°: углы пучка лежат и у
-    179.9°, и у 0.03°, то есть отстоят на десятые доли градуса, а не на 180. Наивный
-    размах max - min насчитал бы здесь веер почти в 180° и объявил бы безнадёжно
-    параллельный пучок превосходно обусловленным.
+    Вертикали здесь сходятся точно, неустойчивость их направления равна нулю. Но оси
+    фасада восстанавливаются парой, и негодной одной из них достаточно, чтобы
+    плоскость была не определена. Поэтому неустойчивость берётся как худшая из двух,
+    а не как лучшая и не как средняя.
     """
     segs = np.vstack([
-        _near_parallel_horizontals(),
+        _near_parallel_horizontals(jitter_deg=2.0),
         _fan_segments(_vanishing_of(_direction_pair(90.0)[1]), _MID_V, 900.0, (0.0,) * 8),
     ])
-    angles = np.degrees(np.arctan2(segs[:12, 3] - segs[:12, 1],
-                                   segs[:12, 2] - segs[:12, 0])) % 180.0
-    assert angles.min() < 1.0 and angles.max() > 179.0     # пучок лежит по обе стороны 0°
+    horizontal, vertical = segs[:12], segs[12:]
+    assert direction_instability_deg(vertical, K) == pytest.approx(0.0, abs=1e-9)
+    assert direction_instability_deg(horizontal, K) > 0.6
 
     _, _, conf = estimate_vanishing_points(segs, _FRAME, K)
-    assert conf.support_h >= 8 and conf.support_v >= 8
-    assert any("неустойчиво" in r for r in conf.reasons)
+    assert conf.support_h >= 6 and conf.support_v == 8
+    assert any("неустойчиво" in r for r in _gate_reasons(conf))
     assert conf.value == 0.0
 
 
@@ -654,9 +655,10 @@ def test_near_frontal_views_are_accepted_when_both_families_are_present(dx, dy):
     """Весь околофронтальный диапазон принимается, когда вертикали есть в кадре.
 
     Отказы в этом диапазоне на бедной сцене вызваны не фронтальностью, а тем, что
-    вертикальный пучок там состоит из трёх-пяти обломков одного проёма: на
-    обогащённой сцене тот же ракурс даёт 43-48 вертикалей и принимается с доверием
-    выше 0.9. Различитель тот же, что и в задаче B, и говорит он о данных.
+    вертикальный пучок там состоит из трёх-пяти обломков одного проёма: измерено, что
+    на бедной сцене отказ наступает при dx от 400 до 600 мм, а на обогащённой те же
+    ракурсы дают полсотни вертикалей и принимаются с доверием не ниже 0.88.
+    Различитель тот же, что и в работе B, и говорит он о данных, а не об оценщике.
     """
     scene = make_rich_scene(dx=dx, dy=dy)
     vh, vv, conf = estimate_vanishing_points(detect_segments(scene.render()),
@@ -886,3 +888,113 @@ def test_confidence_tracks_stability_when_nothing_else_changes():
     assert wide.residual_px == pytest.approx(tight.residual_px, abs=0.01)
     assert wide.orthogonality_deg == pytest.approx(tight.orthogonality_deg, abs=0.1)
     assert tight.value < 0.9 * wide.value
+
+
+def test_confidence_threshold_is_the_contract_value():
+    """Порог передачи оператору закреплён числом, а не ссылкой на саму константу.
+
+    Тест, импортирующий ту величину, которую призван закрепить, подтверждает лишь
+    собственную непротиворечивость: подмена 0.5 на 0.05 прошла бы незамеченной.
+    """
+    assert CONFIDENCE_THRESHOLD == 0.5
+
+
+def test_below_the_contract_threshold_a_reason_appears_and_above_it_does_not():
+    """Граница инварианта проверяется числом 0.5, взятым из контракта, а не из кода.
+
+    Два входа по разные стороны порога: у первого доверие 0.33 и причина названа, у
+    второго 0.67 и список причин пуст.
+    """
+    low = estimate_vanishing_points(
+        _bundles_towards(*[_vanishing_of(d) for d in _direction_pair(80.0)]), _FRAME, K)[2]
+    high = estimate_vanishing_points(
+        _bundles_towards(*[_vanishing_of(d) for d in _direction_pair(85.0)]), _FRAME, K)[2]
+
+    assert low.value < 0.5 and low.reasons
+    assert high.value > 0.5 and high.reasons == []
+
+
+def _stability_dominated_input():
+    """Вход, где под порог доверие уводит именно неустойчивость, а отсечка не сработала.
+
+    Область узкая: отсечка по неустойчивости стоит раньше, чем множитель успевает
+    стать наименьшим, поэтому все четыре величины подобраны совместно — покрытие 0.71,
+    невязка 0.45 px, угол 86.4°, неустойчивость 0.52° при пороге отсечки 0.60.
+    """
+    spread, scale = 160.0, 0.8
+    dev = tuple(scale * x for x in (0.0, 0.0, 0.5, -0.5, 0.7, -0.7, 0.9, -0.9))
+    d1, d2 = _direction_pair(86.0)
+    n = len(dev)
+    mid_h = [(700.0 + 0.3 * spread * i, 400.0 + spread * i) for i in range(n)]
+    mid_v = [(400.0 + spread * i, 700.0 + 0.3 * spread * i) for i in range(n)]
+    core = np.vstack([_fan_segments(_vanishing_of(d1), mid_h, 500.0, dev),
+                      _fan_segments(_vanishing_of(d2), mid_v, 500.0, dev)])
+    junk = np.random.default_rng(4).uniform(150.0, 1850.0, size=(8, 4))
+    return np.vstack([core, junk]), (2000, 1500)
+
+
+@pytest.mark.parametrize("case", ["угол", "невязка", "покрытие", "устойчивость"])
+def test_reason_names_the_factor_that_actually_dropped(case):
+    """Причина называет просевший множитель, а не первый попавшийся из списка.
+
+    Оператору сообщают, чего именно не хватило. Четыре входа, в каждом под порог
+    доверие уводит свой множитель; проверяется, что назван именно он.
+    """
+    vps90 = [_vanishing_of(d) for d in _direction_pair(90.0)]
+    if case == "угол":
+        segs, frame = _bundles_towards(
+            *[_vanishing_of(d) for d in _direction_pair(80.0)]), _FRAME
+        expected = "не ортогональны"
+    elif case == "невязка":
+        dev = (0.0, 0.0, 1.3, -1.3, 1.5, -1.5, 1.7, -1.7)
+        segs, frame = _bundles_towards(*vps90, dev, dev), _FRAME
+        expected = "велика невязка"
+    elif case == "покрытие":
+        junk = np.random.default_rng(3).uniform(200.0, 3800.0, size=(45, 4))
+        segs, frame = np.vstack([_bundles_towards(*vps90), junk]), _FRAME
+        expected = "малая доля отрезков"
+    else:
+        segs, frame = _stability_dominated_input()
+        expected = "неустойчиво"
+
+    conf = estimate_vanishing_points(segs, frame, K)[2]
+    assert conf.value < CONFIDENCE_THRESHOLD
+    assert _gate_reasons(conf) == [], "должен сработать инвариант, а не дискретная проверка"
+    assert len(conf.reasons) == 1
+    assert expected in conf.reasons[0]
+
+
+def test_instability_is_infinite_when_the_direction_is_not_determined_at_all():
+    """Обе охраны меры достижимы и возвращают бесконечность, а не число.
+
+    Одна прямая направления не задаёт вовсе; шесть копий одной прямой не задают его
+    тоже, сколько бы их ни было — матрица связей вырождена, и второе снизу
+    сингулярное число обращается в ноль.
+    """
+    segs = _bundles_towards(*[_vanishing_of(d) for d in _direction_pair(90.0)])
+    # Именно бесконечность, а не «что угодно нечисловое»: снятая охрана даёт 0/0, то
+    # есть nan, который тоже не конечен, но при сравнении с порогом ведёт себя как
+    # «меньше», и вырожденный пучок молча проходит отсечку.
+    assert direction_instability_deg(segs[:1], K) == float("inf")
+    assert direction_instability_deg(np.empty((0, 4)), K) == float("inf")
+
+    six_copies = np.repeat(segs[:1], 6, axis=0)
+    assert len(six_copies) == 6
+    assert direction_instability_deg(six_copies, K) == float("inf")
+
+
+def test_degenerate_bundle_is_reported_in_words_not_as_infinity():
+    """Оператору не показывают «±inf°»: вырожденный пучок называется словами.
+
+    Бесконечность в сообщении — не диагностика, а сбой форматирования: она не
+    говорит, что именно случилось и что с этим делать.
+    """
+    good = _fan_segments(_vanishing_of(_direction_pair(90.0)[1]), _MID_V, 900.0, (0.0,) * 8)
+    horizontal = _fan_segments((-9000.0, 1500.0), [(1500.0, 800.0)], 900.0, (0.0,))
+    segs = np.vstack([np.repeat(horizontal, 6, axis=0), good])
+
+    conf = estimate_vanishing_points(segs, _FRAME, K)[2]
+    joined = " | ".join(conf.reasons)
+    assert "inf" not in joined.lower()
+    assert "вырожден" in joined
+    assert conf.value == 0.0
