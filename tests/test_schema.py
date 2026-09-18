@@ -32,6 +32,13 @@ def test_roundtrip_preserves_values():
     assert again.elements[0].size_mm.width == 1460
 
 
+def test_serialised_json_uses_spec_field_name():
+    """Раздел 10 спецификации требует ключ "class"; class — ключевое слово Python."""
+    payload = FacadeModel.model_validate(_minimal_payload()).model_dump_json()
+    assert '"class"' in payload
+    assert "class_name" not in payload
+
+
 def _minimal_payload() -> dict:
     return {
         "schema_version": "1.1",

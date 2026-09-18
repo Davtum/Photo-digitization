@@ -90,7 +90,10 @@ class FacadeRecord(Strict):
 
 
 class Element(Strict):
-    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    # serialize_by_alias — чтобы model_dump_json() без аргументов давал ключ "class",
+    # как требует раздел 10 спецификации; populate_by_name — чтобы вход принимался
+    # и по алиасу "class", и по имени поля class_name.
+    model_config = ConfigDict(extra="forbid", populate_by_name=True, serialize_by_alias=True)
 
     id: str
     # В JSON поле называется "class" (так в спецификации, раздел 10),
