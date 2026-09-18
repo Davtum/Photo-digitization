@@ -14,7 +14,10 @@ def apparent_position(
     cam: CameraOnPlane, x: float, y: float, depth: float
 ) -> tuple[float, float]:
     """Где точка (x, y, −depth) окажется после ректификации."""
-    k = cam.cz / (cam.cz + depth)
+    denom = cam.cz + depth
+    if denom <= 0:
+        raise ValueError("точка оказалась за камерой: cz + depth <= 0")
+    k = cam.cz / denom
     return (cam.cx + k * (x - cam.cx), cam.cy + k * (y - cam.cy))
 
 

@@ -71,3 +71,22 @@ def test_table_5_2_of_spec(depth, theta_deg, expected_mm):
     )
     dx, dy = parallax_offset(cam, x_edge, y_edge, depth=depth)
     assert math.hypot(dx, dy) == pytest.approx(expected_mm, abs=0.1)
+
+
+def test_apparent_position_rejects_point_behind_camera():
+    """Охрана согласована с camera.tan_theta: без неё деление на ноль либо неверный знак."""
+    with pytest.raises(ValueError):
+        apparent_position(CAM, 5000.0, 3000.0, depth=-CAM.cz)
+    with pytest.raises(ValueError):
+        apparent_position(CAM, 5000.0, 3000.0, depth=-CAM.cz - 5000.0)
+
+
+def test_correction_matches_independently_computed_value():
+    """Ожидаемое выведено из постановки п. 5.2, а не обратимостью к apparent_position."""
+    d = 220.0
+    observed = (4150.0, 4900.0)
+    k = (CAM.cz + d) / CAM.cz
+    expected = (CAM.cx + k * (observed[0] - CAM.cx), CAM.cy + k * (observed[1] - CAM.cy))
+    got = correct_for_depth(CAM, observed[0], observed[1], d)
+    assert got[0] == pytest.approx(expected[0])
+    assert got[1] == pytest.approx(expected[1])
