@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 import pytest
 
+from facade_digitizer.geometry.homography import camera_pose
 from facade_digitizer.pipeline.plane import estimate_plane, estimate_plane_manual
 from tests.test_homography import CORNERS, apply
 from tests.test_synth import SIZE, K, make_rich_scene, make_scene
@@ -62,6 +63,61 @@ def test_manual_with_sizes_produces_those_sizes():
     assert not res.needs_operator
     r = apply(res.H, pts)
     assert np.linalg.norm(r[1] - r[0]) == pytest.approx(1460.0, rel=1e-6)
+
+
+def _direction_angle_deg(a, b):
+    """Угол между направлениями K⁻¹a и K⁻¹b, без учёта знака точки схода."""
+    Kinv = np.linalg.inv(K)
+    da = Kinv @ np.asarray(a, dtype=float)
+    db = Kinv @ np.asarray(b, dtype=float)
+    da = da / np.linalg.norm(da)
+    db = db / np.linalg.norm(db)
+    return float(np.degrees(np.arccos(min(1.0, abs(float(da @ db))))))
+
+
+def test_plane_result_labels_which_bundle_each_vanishing_point_came_from():
+    """`vh` — точка схода ГОРИЗОНТАЛЬНОГО пучка, `vv` — вертикального.
+
+    Различитель написан здесь потому, что через `camera_pose` перестановка этих
+    двух полей НЕ наблюдаема, и это свойство постановки, а не недосмотр: опорная
+    точка есть образ точки схода нормали, нормаль есть векторное произведение двух
+    направлений, ортогонализация Грама — Шмидта сохраняет их линейную ОБОЛОЧКУ, а
+    перестановка меняет у нормали только знак — знак же исчезает при делении на
+    третью компоненту. Измерено на реальном детекторе: сдвиг опорной точки от
+    перестановки равен 0.000000 мм на всех проверенных ракурсах, включая тот, где
+    восстановленные направления расходятся с прямым углом на 0.33°.
+
+    Наблюдаема перестановка по тому, с каким направлением фасада согласуется каждое
+    поле. Эталон берётся из истины сцены, а не из кода оценщика.
+    """
+    sc = make_rich_scene()
+    res = estimate_plane(sc.render(), K)
+    true_h = K @ (sc.R_wc @ np.array([1.0, 0.0, 0.0]))
+    true_v = K @ (sc.R_wc @ np.array([0.0, 1.0, 0.0]))
+
+    assert _direction_angle_deg(res.vh, true_h) < 1.0
+    assert _direction_angle_deg(res.vv, true_v) < 1.0
+    # И не согласуется с чужим направлением: без этой пары перестановка прошла бы,
+    # если бы оценщик выдал оба поля близкими к одной и той же оси.
+    assert _direction_angle_deg(res.vh, true_v) > 80.0
+    assert _direction_angle_deg(res.vv, true_h) > 80.0
+
+
+def test_manual_plane_cannot_be_turned_into_a_pose_silently():
+    """Сборка конвейера (задача 15) зовёт `camera_pose` на ОБОИХ путях п. 4.2.
+
+    На ручном пути `PlaneResult` не несёт ни точек схода, ни калибровки, а
+    ректифицированная система имеет произвольные начало и масштаб. Прежняя редакция
+    `camera_pose` этого не замечала: она читала только `mm_per_rect_unit` и
+    `origin_rect` и выдавала позу, в которой расстояние до плоскости равнялось
+    миллиметру. Здесь закреплено, что вместо этого будет названный отказ.
+    """
+    pts = np.array([[100.0, 100.0], [900.0, 120.0], [880.0, 700.0], [120.0, 690.0]])
+    res = estimate_plane_manual(pts, size_mm=(1460.0, 1900.0))
+    assert res.vh is None and res.vv is None
+
+    with pytest.raises(ValueError, match="поза не восстановима без точек схода"):
+        camera_pose(res.H, res.vh, res.vv, K, 1.0, (0.0, 0.0))
 
 
 def test_manual_confidence_is_not_borrowed_from_the_automatic_path():

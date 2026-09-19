@@ -31,10 +31,16 @@ CENTRE_NOT_FINITE = "образ центра кадра неконечен"
 FOOT_NOT_CONSISTENT = "образ точки схода нормали вырожден"
 TOO_MANY_DISAMBIGUATIONS = "доопределение должно быть ровно одно"
 
+# Отказы восстановления позы. Два разных события, и подстроки их различают:
+# «входа нет вовсе» и «вход есть, но гомография построена не той конструкцией».
+POSE_NEEDS_VPS = "поза не восстановима без точек схода и калибровки"
+POSE_UNIT_NOT_DISTANCE = "ректифицированная единица не равна расстоянию до плоскости"
+
 REFUSAL_PATTERNS = (FOUR_POINT_UNDERDETERMINED, CALIBRATED_NEEDS_K,
                     CENTRE_NOT_IN_FRONT, GRADIENT_DEGENERATE,
                     CENTRE_NOT_FINITE, FOOT_NOT_CONSISTENT,
-                    TOO_MANY_DISAMBIGUATIONS)
+                    TOO_MANY_DISAMBIGUATIONS,
+                    POSE_NEEDS_VPS, POSE_UNIT_NOT_DISTANCE)
 
 # Допуски для ТОЧНЫХ точек схода. Истинная невязка на этих ракурсах — единицы ULP
 # (до 3.6e-12 мм по опорной точке) и 3e-16 относительно по расстоянию. Прежние
@@ -171,7 +177,7 @@ def test_four_point_calibrated_variant_needs_K():
 
 
 def refusal_messages():
-    """Все семь сообщений отказа, каждое — вместе со своим вызовом.
+    """Все девять сообщений отказа, каждое — вместе со своим вызовом.
 
     Вызовы перечислены здесь, а не в отдельных тестах, чтобы взаимная
     исключительность подстрок проверялась на ПОЛНОМ наборе: прежде сличались
@@ -198,6 +204,12 @@ def refusal_messages():
             broken_gradient, SIZE)
         yield FOOT_NOT_CONSISTENT, lambda: foot_point_in_rectified(
             np.zeros((3, 3)), vh, vv, K)
+        yield POSE_NEEDS_VPS, lambda: camera_pose(
+            homography_from_four_points(pts, size_mm=(1460.0, 1900.0)),
+            None, None, None, 1.0, (0.0, 0.0))
+        yield POSE_UNIT_NOT_DISTANCE, lambda: camera_pose(
+            homography_from_four_points(pts, size_mm=(1460.0, 1900.0)),
+            vh, vv, K, 1.0, (0.0, 0.0))
 
     out = {}
     for pattern, call in calls():
@@ -213,7 +225,7 @@ def test_refusal_patterns_are_literal_and_mutually_exclusive():
     Вертикальная черта в `match=` читается как альтернатива и делает проверку
     почти всегда успешной; любой другой метасимвол размывает подстроку так же.
     Сверх литеральности проверяется главное: КАЖДАЯ подстрока подходит ровно к
-    ОДНОМУ сообщению из семи. Иначе `match=` ловил бы соседний отказ.
+    ОДНОМУ сообщению из девяти. Иначе `match=` ловил бы соседний отказ.
     """
     # `re.escape` здесь не годится: он экранирует и пробел, который вне класса
     # символов ничего не значит. Перечисляются те метасимволы, которые
@@ -816,3 +828,115 @@ def test_half_turn_record_carries_the_provenance_a_consumer_reads():
     # Причина и способ разрешения не должны быть взаимозаменяемы по содержанию.
     assert "горизонтальной плоскости" not in half_turn.reason
     assert "не определяется" not in half_turn.resolver
+
+
+# --- Опорная точка ВЫЧИСЛЯЕТСЯ: четыре аргумента `camera_pose` живые ------------
+#
+# Прежняя редакция брала опорной точкой начало ректифицированных координат и не
+# читала ни `H`, ни `vh`, ни `vv`, ни `K`. Проверено исполнением: вызов с
+# `H = full((3,3), nan)`, `vh = None`, `vv = "мусор"`, `K = None` возвращал ТОТ ЖЕ
+# результат, что и вызов с настоящими аргументами. Тесты ниже написаны так, чтобы
+# каждый из четырёх аргументов, удалённый из тела, ронял хотя бы один из них.
+
+
+def test_camera_pose_reads_the_vanishing_points_it_is_given():
+    """Чужие точки схода при той же гомографии обязаны дать ДРУГУЮ опорную точку.
+
+    Различитель ровно того дефекта, который позволял `vh` и `vv` не входить в тело:
+    опорная точка есть образ точки схода НОРМАЛИ, а нормаль определяется этими двумя
+    направлениями. Взяв их от другого ракурса, получаем другую нормаль и другой
+    образ. Тест, сверяющий только верный вызов с истиной сцены, этого не ловит:
+    начало ректифицированных координат совпадает с опорной точкой тождественно.
+    """
+    sc = make_scene(3000.0, -2000.0, 12000.0)
+    other = make_scene(-3000.0, 2000.0, 9000.0)
+    vh, vv = exact_vps(sc)
+    H = homography_from_vanishing_points(vh, vv, K, SIZE)
+    r = apply(H, sc.project(CORNERS))
+    mmu = 20000.0 / np.linalg.norm(r[1] - r[0])
+    origin = tuple(r[0])
+
+    right, _ = camera_pose(H, vh, vv, K, mmu, origin)
+    wrong, _ = camera_pose(H, *exact_vps(other), K, mmu, origin)
+    truth = sc.camera_on_plane()
+
+    assert right.cx == pytest.approx(truth.cx, abs=EXACT_FOOT_ABS_MM, rel=0)
+    assert right.cy == pytest.approx(truth.cy, abs=EXACT_FOOT_ABS_MM, rel=0)
+    # Измерено: подстановка точек схода другого ракурса уводит опорную точку на
+    # тысячи миллиметров. Граница взята на три порядка ниже измеренного сдвига и
+    # на много порядков выше невязки верного вызова.
+    assert np.hypot(wrong.cx - right.cx, wrong.cy - right.cy) > 1000.0
+
+
+def _pose_arguments(sc):
+    """Полный набор годных аргументов `camera_pose` для сцены."""
+    vh, vv = exact_vps(sc)
+    H = homography_from_vanishing_points(vh, vv, K, SIZE)
+    r = apply(H, sc.project(CORNERS))
+    mmu = 20000.0 / np.linalg.norm(r[1] - r[0])
+    return {"H": H, "vh": vh, "vv": vv, "K": K,
+            "mm_per_rect_unit": mmu, "origin_rect": tuple(r[0])}
+
+
+@pytest.mark.parametrize("name,value,pattern", [
+    ("H", np.full((3, 3), np.nan), POSE_UNIT_NOT_DISTANCE),
+    ("H", np.zeros((3, 3)), POSE_UNIT_NOT_DISTANCE),
+    ("vh", None, POSE_NEEDS_VPS),
+    ("vv", None, POSE_NEEDS_VPS),
+    ("K", None, POSE_NEEDS_VPS),
+    ("vh", np.zeros(3), FOOT_NOT_CONSISTENT),
+    ("vv", np.zeros(3), FOOT_NOT_CONSISTENT),
+])
+def test_camera_pose_refuses_a_degenerate_argument_by_name(name, value, pattern):
+    """Негодный аргумент отвергается, а не игнорируется.
+
+    Прежняя редакция на КАЖДОЙ из этих подстановок возвращала правильную позу:
+    аргументы в тело не входили. Причина отказа названа порознь — «входа нет вовсе»
+    и «вход есть, но гомография построена не той конструкцией» суть разные события.
+    """
+    args = _pose_arguments(make_scene())
+    args[name] = value
+    with np.errstate(all="ignore"), pytest.raises(ValueError, match=pattern):
+        camera_pose(**args)
+
+
+def test_camera_pose_on_a_manual_homography_refuses_instead_of_inventing_a_distance():
+    """Ручной путь п. 4.2 без калибровки: отказ, а не правдоподобное число.
+
+    `homography_from_four_points` с `size_mm` ставит ректифицированную единицу равной
+    миллиметру, а не расстоянию до плоскости. Опорная точка при этом восстанавливается
+    верно (образ точки схода нормали есть сдвиг начала, и он вычисляется), но `cz`
+    равнялось бы `mm_per_rect_unit`, то есть 1.0 мм вместо 12000 мм — величина, от
+    истинной отличающаяся в десять тысяч раз и ничем себя не выдающая.
+    """
+    sc = make_scene()
+    image_pts = sc.project(CORNERS)
+    vh, vv = exact_vps(sc)
+
+    for kwargs in ({"size_mm": (20000.0, 15000.0)}, {"aspect_ratio": 20000.0 / 15000.0}):
+        H = homography_from_four_points(image_pts, **kwargs)
+        r = apply(H, image_pts)
+        mmu = 20000.0 / float(np.linalg.norm(r[1] - r[0]))
+        with pytest.raises(ValueError, match=POSE_UNIT_NOT_DISTANCE):
+            camera_pose(H, vh, vv, K, mmu, tuple(r[0]))
+
+
+def test_camera_pose_on_the_calibrated_manual_path_is_not_refused():
+    """Охрана не должна отвергать ручной путь, который на самом деле согласован.
+
+    `assume_calibrated=True` строит ТУ ЖЕ гомографию из точек схода, восстановленных
+    по четырём точкам оператора. Отказ здесь означал бы, что проверка согласованности
+    ловит не рассогласование, а сам факт ручного ввода.
+    """
+    sc = make_scene()
+    image_pts = sc.project(CORNERS)
+    H = homography_from_four_points(image_pts, assume_calibrated=True,
+                                    K=K, image_size=SIZE)
+    r = apply(H, image_pts)
+    mmu = 20000.0 / float(np.linalg.norm(r[1] - r[0]))
+
+    got, _ = camera_pose(H, *exact_vps(sc), K, mmu, tuple(r[0]))
+    truth = sc.camera_on_plane()
+    assert got.cx == pytest.approx(truth.cx, abs=1e-6, rel=0)
+    assert got.cy == pytest.approx(truth.cy, abs=1e-6, rel=0)
+    assert got.cz == pytest.approx(truth.cz, rel=1e-9, abs=0)
