@@ -212,3 +212,43 @@ def test_refusal_messages_do_not_overlap(img):
     for key in REFUSALS:
         hits = [k for k, message in messages.items() if key in message]
         assert hits == [key], f"подстрока {key!r} подходит и к чужим отказам: {hits}"
+
+
+class _KindlessDtype:
+    """Тип отсчётов, у которого вид пуст, а всё остальное — как у настоящего."""
+
+    kind = ""
+
+    def __init__(self, real):
+        self._real = real
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+class FrameWithoutKind(np.ndarray):
+    """Кадр, ведущий себя как настоящий везде, кроме вида отсчётов.
+
+    Нужен, чтобы дойти ДО самой проверки вида. Список или массив объектов до неё не
+    добирается: испорченная проверка пропускает их, и отказ приходит от последующего
+    крушения (AttributeError на .ndim или TypeError в np.isfinite), то есть механизм,
+    ради которого проверка написана, остаётся неизолированным.
+    """
+
+    @property
+    def dtype(self):
+        return _KindlessDtype(np.ndarray.dtype.__get__(self))
+
+
+def test_frame_with_empty_dtype_kind_is_rejected_by_the_kind_check(img):
+    """Проверка вида должна сработать сама, а не через крушение ниже по коду.
+
+    У этого кадра вид отсчётов пуст, но cv2 и numpy работают с ним как с обычным
+    uint8-кадром: если проверять принадлежность вида по строке "uif", пустая строка
+    окажется её подстрокой, кадр пройдёт шлюз и получит вердикт «годен».
+    """
+    stub = img.view(FrameWithoutKind)
+    assert stub.dtype.kind == ""
+    assert sharpness(stub) == pytest.approx(sharpness(img), rel=1e-9)   # ведёт себя как кадр
+    with pytest.raises(ValueError, match="изображение"):
+        assess(stub, 3.1, 4.6, 22.0)
