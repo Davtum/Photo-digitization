@@ -134,9 +134,9 @@ def test_camera_pose_recovered_against_known_truth(dx, dy, dist):
     got, half_turn = camera_pose(H, vh, vv, K, mmu, tuple(r[0]))
     truth = sc.camera_on_plane()
     assert half_turn.resolved is False
-    assert got.cx == pytest.approx(truth.cx, abs=EXACT_FOOT_ABS_MM)
-    assert got.cy == pytest.approx(truth.cy, abs=EXACT_FOOT_ABS_MM)
-    assert got.cz == pytest.approx(truth.cz, rel=EXACT_DISTANCE_REL)
+    assert got.cx == pytest.approx(truth.cx, abs=EXACT_FOOT_ABS_MM, rel=0)
+    assert got.cy == pytest.approx(truth.cy, abs=EXACT_FOOT_ABS_MM, rel=0)
+    assert got.cz == pytest.approx(truth.cz, rel=EXACT_DISTANCE_REL, abs=0)
 
 
 def test_four_point_requires_disambiguation():
@@ -170,12 +170,50 @@ def test_four_point_calibrated_variant_needs_K():
     assert not re.search(FOUR_POINT_UNDERDETERMINED, str(excinfo.value))
 
 
+def refusal_messages():
+    """Все семь сообщений отказа, каждое — вместе со своим вызовом.
+
+    Вызовы перечислены здесь, а не в отдельных тестах, чтобы взаимная
+    исключительность подстрок проверялась на ПОЛНОМ наборе: прежде сличались
+    только два сообщения ручного варианта, а три новых проверялись лишь на
+    отсутствие метасимволов.
+    """
+    pts = np.array([[100.0, 100.0], [900.0, 120.0], [880.0, 700.0], [120.0, 690.0]])
+    broken_gradient = np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0]])
+    flat = make_scene(-20000.0, 0.0, 0.0)
+    ordinary = make_scene()
+    vh, vv = exact_vps(ordinary)
+
+    def calls():
+        yield FOUR_POINT_UNDERDETERMINED, lambda: homography_from_four_points(pts)
+        yield CALIBRATED_NEEDS_K, lambda: homography_from_four_points(
+            pts, assume_calibrated=True)
+        yield TOO_MANY_DISAMBIGUATIONS, lambda: homography_from_four_points(
+            pts, aspect_ratio=2.0, size_mm=(1460.0, 1900.0))
+        yield CENTRE_NOT_IN_FRONT, lambda: homography_from_vanishing_points(
+            *exact_vps(flat), K, SIZE)
+        yield CENTRE_NOT_FINITE, lambda: homography_from_vanishing_points(
+            np.zeros(3), vv, K, SIZE)
+        yield GRADIENT_DEGENERATE, lambda: _rectified_x_grows_with_image_x(
+            broken_gradient, SIZE)
+        yield FOOT_NOT_CONSISTENT, lambda: foot_point_in_rectified(
+            np.zeros((3, 3)), vh, vv, K)
+
+    out = {}
+    for pattern, call in calls():
+        with np.errstate(all="ignore"), pytest.raises(ValueError) as excinfo:
+            call()
+        out[pattern] = str(excinfo.value)
+    return out
+
+
 def test_refusal_patterns_are_literal_and_mutually_exclusive():
-    """Охрана самих охран.
+    """Охрана самих охран, на полном наборе подстрок.
 
     Вертикальная черта в `match=` читается как альтернатива и делает проверку
     почти всегда успешной; любой другой метасимвол размывает подстроку так же.
-    Обе подстроки обязаны быть литеральными и обязаны различать свои сообщения.
+    Сверх литеральности проверяется главное: КАЖДАЯ подстрока подходит ровно к
+    ОДНОМУ сообщению из семи. Иначе `match=` ловил бы соседний отказ.
     """
     # `re.escape` здесь не годится: он экранирует и пробел, который вне класса
     # символов ничего не значит. Перечисляются те метасимволы, которые
@@ -185,18 +223,13 @@ def test_refusal_patterns_are_literal_and_mutually_exclusive():
         assert "|" not in pattern
         assert not (set(pattern) & metacharacters)
 
-    pts = np.array([[100.0, 100.0], [900.0, 120.0], [880.0, 700.0], [120.0, 690.0]])
-    messages = {}
-    for key, call in (("underdetermined", {}),
-                      ("calibrated", {"assume_calibrated": True})):
-        with pytest.raises(ValueError) as excinfo:
-            homography_from_four_points(pts, **call)
-        messages[key] = str(excinfo.value)
-    assert messages["underdetermined"] != messages["calibrated"]
-    assert re.search(FOUR_POINT_UNDERDETERMINED, messages["underdetermined"])
-    assert not re.search(FOUR_POINT_UNDERDETERMINED, messages["calibrated"])
-    assert re.search(CALIBRATED_NEEDS_K, messages["calibrated"])
-    assert not re.search(CALIBRATED_NEEDS_K, messages["underdetermined"])
+    messages = refusal_messages()
+    assert set(messages) == set(REFUSAL_PATTERNS)
+    assert len(set(messages.values())) == len(REFUSAL_PATTERNS)
+
+    for pattern in REFUSAL_PATTERNS:
+        matched = [own for own, text in messages.items() if re.search(pattern, text)]
+        assert matched == [pattern], f"подстрока {pattern!r} подошла к {matched}"
 
 
 # --- Различители, добавленные по итогам мутационной проверки ---------------------
@@ -318,9 +351,9 @@ def test_orientation_survives_a_grazing_view_that_defeats_a_fixed_pixel_probe():
     assert r[3, 1] < r[0, 1]      # Y вниз
 
     truth = sc.camera_on_plane()
-    assert got.cx == pytest.approx(truth.cx, abs=EXACT_FOOT_ABS_MM)
-    assert got.cy == pytest.approx(truth.cy, abs=EXACT_FOOT_ABS_MM)
-    assert got.cz == pytest.approx(truth.cz, rel=EXACT_DISTANCE_REL)
+    assert got.cx == pytest.approx(truth.cx, abs=EXACT_FOOT_ABS_MM, rel=0)
+    assert got.cy == pytest.approx(truth.cy, abs=EXACT_FOOT_ABS_MM, rel=0)
+    assert got.cz == pytest.approx(truth.cz, rel=EXACT_DISTANCE_REL, abs=0)
 
 
 def test_grazing_view_really_is_the_hard_case():
@@ -366,35 +399,98 @@ def test_camera_lying_in_the_facade_plane_is_refused():
     assert not re.search(GRADIENT_DEGENERATE, str(excinfo.value))
 
 
-@pytest.mark.parametrize("dist_mm", [200.0, 5.0, 2.0, 0.1, 0.001, 1e-11])
-def test_analytic_criterion_works_arbitrarily_close_to_the_plane(dist_mm):
-    """Аналитический признак почти не имеет нижней границы по расстоянию.
+# Две РАЗНЫЕ границы, которые прежде были слиты в одну формулировку.
+#
+# Признак знака и точность позы портятся в совершенно разных местах. Признак —
+# это выбор из двух вариантов, ему нужен лишь УСТОЙЧИВЫЙ ЗНАК производной, и он
+# держится почти до самой плоскости. Точность позы упирается в обусловленность:
+# ректифицированная единица равна расстоянию до плоскости, и при расстоянии в
+# доли микрона координаты опорной точки тонут в округлении. Измерено (сцена
+# dx=-20000, точные точки схода):
+#
+#   расстояние   невязка опоры    признак знака
+#   200 мм       1.7e-10 мм       верен
+#   1e-3 мм      6.2e-05 мм       верен
+#   1e-4 мм      4.2e-04 мм       верен     <- ниже точность уже не держится
+#   1e-5 мм      2.1e-03 мм       верен
+#   1e-7 мм      4.2e-01 мм       верен
+#   1e-10 мм     6.3e+02 мм       верен     <- полметра промаха, знак всё ещё верен
+#   1e-11 мм     0.0    мм        верен     <- совпадение, а не точность
+#   1e-13 мм     отказ
+#
+# Про 1e-11: там невязка опоры обращается в ноль по чистому совпадению взаимных
+# сокращений (относительная невязка расстояния при этом 8.0e-4, то есть точности
+# нет). В тесты точности это значение не берётся.
+POSE_ACCURATE_DISTANCES_MM = [200.0, 5.0, 2.0, 0.1, 1e-3, 1e-4]
+POSE_INACCURATE_DISTANCES_MM = [1e-5, 1e-6, 1e-7, 1e-8, 1e-9, 1e-10]
+SIGN_CRITERION_DISTANCES_MM = POSE_ACCURATE_DISTANCES_MM + POSE_INACCURATE_DISTANCES_MM + [1e-11]
 
-    Лестница проб её имела на 2 мм: линия схода (около 0.36 px от главной точки)
-    оказывалась ближе наименьшей пробы (0.42 px), и доопределение отказывало.
-    Производная берётся в самом центре и такой границы не знает. Граница всё же
-    есть, но лежит на одиннадцать порядков ниже: 1e-11 мм ещё работает, 1e-12 мм
-    уже отвергается (соседний тест). Формулировка «отказ только при расстоянии
-    ровно нуль» была бы шире измеренного.
+
+@pytest.mark.parametrize("dist_mm", SIGN_CRITERION_DISTANCES_MM)
+def test_sign_criterion_has_almost_no_lower_bound_on_distance(dist_mm):
+    """ПРИЗНАК ЗНАКА почти не имеет нижней границы по расстоянию до плоскости.
+
+    Утверждается ровно одно: доопределение не отказывает и выбирает ВЕРНУЮ из
+    двух ориентаций. Про точность позы здесь не утверждается ничего — она
+    теряется гораздо раньше, и для неё есть отдельный тест.
+
+    Лестница проб отказывала уже на 2 мм: линия схода (около 0.36 px от главной
+    точки) оказывалась ближе наименьшей пробы (0.42 px). Производная берётся в
+    самом центре и такой границы не знает.
     """
     sc = make_scene(-20000.0, 0.0, dist_mm)
-    r, got = recover(sc, *exact_vps(sc))
+    r, _ = recover(sc, *exact_vps(sc))
     assert np.all(np.isfinite(r))
-    assert r[1, 0] > r[0, 0]
-    assert r[3, 1] < r[0, 1]
+    assert r[1, 0] > r[0, 0]      # X вправо
+    assert r[3, 1] < r[0, 1]      # Y вниз
+
+
+@pytest.mark.parametrize("dist_mm", POSE_ACCURATE_DISTANCES_MM)
+def test_pose_stays_accurate_down_to_a_tenth_of_a_micron(dist_mm):
+    """ТОЧНОСТЬ ПОЗЫ держится примерно до 1e-4 мм от плоскости.
+
+    Допуски заданы обеими составляющими явно. `pytest.approx(x, rel=R)` без
+    `abs=` подпирается умолчательным абсолютным порогом 1e-12, и на малых
+    величинах побеждает именно он: при `x = 1e-11` объявленный `rel=1e-7`
+    превращался в фактические 10 процентов относительно. Ровно тот класс, за
+    которым мы охотимся: допуск написан, выглядит строгим, стережёт другое число.
+    """
+    sc = make_scene(-20000.0, 0.0, dist_mm)
+    _, got = recover(sc, *exact_vps(sc))
     truth = sc.camera_on_plane()
-    assert got.cx == pytest.approx(truth.cx, abs=NEAR_PLANE_FOOT_ABS_MM)
-    assert got.cy == pytest.approx(truth.cy, abs=NEAR_PLANE_FOOT_ABS_MM)
-    assert got.cz == pytest.approx(truth.cz, rel=NEAR_PLANE_DISTANCE_REL)
+    assert got.cx == pytest.approx(truth.cx, abs=NEAR_PLANE_FOOT_ABS_MM, rel=0)
+    assert got.cy == pytest.approx(truth.cy, abs=NEAR_PLANE_FOOT_ABS_MM, rel=0)
+    assert got.cz == pytest.approx(truth.cz, rel=NEAR_PLANE_DISTANCE_REL, abs=0)
 
 
-@pytest.mark.parametrize("dist_mm", [1e-12, 1e-13, 0.0])
-def test_refusal_boundary_near_the_plane_is_where_it_was_measured(dist_mm):
-    """Граница отказа названа измеренным числом, а не «ровно нулём».
+@pytest.mark.parametrize("dist_mm", POSE_INACCURATE_DISTANCES_MM)
+def test_pose_accuracy_is_lost_below_the_limit(dist_mm):
+    """Ниже границы точность ТЕРЯЕТСЯ — и это закреплено, а не умолчано.
 
-    При таком расстоянии знаменатель гомографии в центре кадра перестаёт быть
-    положительным, и доопределение отвергается явно. Соседний тест показывает,
-    что 1e-11 мм ещё работает: граница закреплена с обеих сторон.
+    Без этого теста параметризация могла бы снова перепрыгнуть через область, где
+    метод портится, и утверждение «работает до 1e-11 мм» читалось бы как
+    утверждение о точности. Невязка здесь доходит до полуметра при верном знаке.
+
+    Тест падает и в том случае, если точность вдруг УЛУЧШИТСЯ: это тоже повод
+    пересмотреть границу, а не молча её унаследовать.
+    """
+    sc = make_scene(-20000.0, 0.0, dist_mm)
+    _, got = recover(sc, *exact_vps(sc))
+    truth = sc.camera_on_plane()
+    foot_error_mm = float(np.hypot(got.cx - truth.cx, got.cy - truth.cy))
+    assert np.isfinite(foot_error_mm)
+    assert foot_error_mm > NEAR_PLANE_FOOT_ABS_MM
+
+
+@pytest.mark.parametrize("dist_mm", [1e-13, 0.0])
+def test_refusal_boundary_near_the_plane(dist_mm):
+    """Отказ при расстоянии ниже примерно 1e-12 мм.
+
+    Значение ровно 1e-12 мм сюда НЕ внесено намеренно: там исход решается
+    порядком сложения величин, различающихся на шестнадцать порядков, то есть
+    держится на шуме округления и может перевернуться от смены версии numpy без
+    единой правки кода. Закрепляются только устойчивые значения; 1e-11 мм с
+    другой стороны границы закреплено тестом признака знака.
     """
     sc = make_scene(-20000.0, 0.0, dist_mm)
     with pytest.raises(ValueError, match=CENTRE_NOT_IN_FRONT):
@@ -456,9 +552,9 @@ def test_orientation_is_correct_for_any_roll_within_the_rule(roll_deg):
 
     assert np.all(np.isfinite(r))
     truth = sc.camera_on_plane()
-    assert got.cx == pytest.approx(truth.cx, abs=EXACT_FOOT_ABS_MM)
-    assert got.cy == pytest.approx(truth.cy, abs=EXACT_FOOT_ABS_MM)
-    assert got.cz == pytest.approx(truth.cz, rel=EXACT_DISTANCE_REL)
+    assert got.cx == pytest.approx(truth.cx, abs=EXACT_FOOT_ABS_MM, rel=0)
+    assert got.cy == pytest.approx(truth.cy, abs=EXACT_FOOT_ABS_MM, rel=0)
+    assert got.cz == pytest.approx(truth.cz, rel=EXACT_DISTANCE_REL, abs=0)
 
 
 def test_quarter_turn_roll_is_exactly_where_the_fallback_takes_over():
@@ -529,10 +625,10 @@ def test_roll_outside_the_rule_turns_the_result_by_half_a_circle(roll_deg):
 
     assert np.all(np.isfinite(r))
     # Поворот на 180 градусов вокруг начала фасада: обе координаты меняют знак.
-    assert got.cx == pytest.approx(-truth.cx, abs=EXACT_FOOT_ABS_MM)
-    assert got.cy == pytest.approx(-truth.cy, abs=EXACT_FOOT_ABS_MM)
+    assert got.cx == pytest.approx(-truth.cx, abs=EXACT_FOOT_ABS_MM, rel=0)
+    assert got.cy == pytest.approx(-truth.cy, abs=EXACT_FOOT_ABS_MM, rel=0)
     # Расстояние до плоскости поворотом не затрагивается и остаётся верным.
-    assert got.cz == pytest.approx(truth.cz, rel=EXACT_DISTANCE_REL)
+    assert got.cz == pytest.approx(truth.cz, rel=EXACT_DISTANCE_REL, abs=0)
 
 
 # --- Успешная ветка assume_calibrated и незакрытые охраны ------------------------
@@ -679,3 +775,44 @@ def test_foot_point_third_component_is_unit_for_a_matching_homography():
         d2 = d2 / np.linalg.norm(d2)
         third = (H @ (K @ np.cross(d1, d2)))[2]
         assert abs(third) == pytest.approx(1.0, rel=1e-12)
+
+
+def test_half_turn_record_carries_the_provenance_a_consumer_reads():
+    """Содержание записи о двузначности, а не только флаг `resolved`.
+
+    Признак вводился ради того, чтобы потребитель прочитал ПРОИСХОЖДЕНИЕ. Пока
+    проверялся один `resolved is False`, перестановка `reason` и `resolver`
+    местами и обнуление текста допущения проходили незамеченными: поля были, а
+    содержания в них не спрашивали.
+
+    Подстроки здесь написаны независимо, а не импортированы из модуля: сверка
+    константы с самой собой подтвердила бы только равенство её себе.
+    """
+    sc = make_scene()
+    vh, vv = exact_vps(sc)
+    H = homography_from_vanishing_points(vh, vv, K, SIZE)
+    r = apply(H, sc.project(CORNERS))
+    mmu = 20000.0 / np.linalg.norm(r[1] - r[0])
+    _, half_turn = camera_pose(H, vh, vv, K, mmu, tuple(r[0]))
+
+    assert half_turn.resolved is False
+
+    # Допущение: чем заменено разрешение двузначности.
+    assert "не перевёрнут" in half_turn.assumption
+    assert "x изображения" in half_turn.assumption
+
+    # Причина: почему здесь не разрешается. Названы именно точки схода плоскости.
+    assert "не определяется" in half_turn.reason
+    assert "точками схода плоскости фасада" in half_turn.reason
+
+    # Чем разрешается: геометрический признак внутри кадра, не EXIF.
+    assert "горизонтальной плоскости" in half_turn.resolver
+    assert "отрезков" in half_turn.resolver
+
+    # Три поля обязаны быть разными: перестановка местами ловится именно этим.
+    texts = (half_turn.assumption, half_turn.reason, half_turn.resolver)
+    assert len(set(texts)) == 3
+    assert all(len(t) > 20 for t in texts)
+    # Причина и способ разрешения не должны быть взаимозаменяемы по содержанию.
+    assert "горизонтальной плоскости" not in half_turn.reason
+    assert "не определяется" not in half_turn.resolver
