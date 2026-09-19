@@ -2,7 +2,13 @@ import cv2
 import numpy as np
 import pytest
 
-from facade_digitizer.pipeline.quality import Thresholds, assess, sharpness, usable_fraction
+from facade_digitizer.pipeline.quality import (
+    THETA_MAX_DEG,
+    Thresholds,
+    assess,
+    sharpness,
+    usable_fraction,
+)
 from facade_digitizer.schema import QualityReport
 from tests.test_synth import make_scene as scene
 
@@ -52,10 +58,19 @@ def test_coarse_gsd_is_rejected():
     assert any("разрешение" in r for r in report.reasons)
 
 
-def test_steep_angle_is_degraded():
+def test_steep_angle_is_recorded_but_does_not_decide():
+    """Крутой P95 углового поля записывается и вердикта не решает. П. 4.1.
+
+    Прежде здесь стоял обратный тест: P95 = 44° давал `degraded`. Порог снят, потому
+    что угол визирования в точке кадра равен `arctg(r / f)` и определяется
+    объективом: при f = 3600 P95 по кадру равен 38.5° на ЛЮБОЙ сцене, включая
+    фронтальную, так что порог отбраковывал бы всю рабочую аппаратуру. Проверка
+    перевёрнута и оставлена — она и есть охрана от возвращения порога по недосмотру.
+    """
     report = assess(scene().render(), 3.1, 4.6, 44.0)
-    assert report.verdict == "degraded"
-    assert any("угол" in r for r in report.reasons)
+    assert report.verdict == "ok"
+    assert report.reasons == []
+    assert report.theta_field_deg_p95 == 44.0
 
 
 def test_small_usable_fraction_is_flagged():
@@ -66,15 +81,24 @@ def test_small_usable_fraction_is_flagged():
 
 def test_thresholds_are_injectable():
     blurred = cv2.GaussianBlur(scene().render(), (31, 31), 12.0)
-    strict = Thresholds(sharpness_min=1.0, gsd_max_mm_px=5.0, theta_p95_max_deg=30.0)
-    lenient = Thresholds(sharpness_min=0.0, gsd_max_mm_px=5.0, theta_p95_max_deg=30.0)
+    strict = Thresholds(sharpness_min=1.0, gsd_max_mm_px=5.0)
+    lenient = Thresholds(sharpness_min=0.0, gsd_max_mm_px=5.0)
     assert assess(blurred, 3.1, 4.6, 22.0, thresholds=strict).verdict == "degraded"
     assert assess(blurred, 3.1, 4.6, 22.0, thresholds=lenient).verdict == "ok"
 
 
 def test_usable_fraction_counts_angles():
+    """Доля узлов в пределах углового порога, в том числе при пороге по умолчанию.
+
+    Умолчание проверяется отдельно и намеренно: обе прежние проверки передавали
+    порог явно, отчего значение по умолчанию не читал никто, и подмена его на 90°
+    проходила молча. Умолчание — не украшение сигнатуры: по нему считает угловое
+    условие п. 2.2, и оно обязано совпадать с THETA_MAX_DEG.
+    """
     field = np.array([[10.0, 20.0], [40.0, 50.0]])
     assert usable_fraction(field, 30.0) == pytest.approx(0.5)
+    assert usable_fraction(field) == pytest.approx(0.5)
+    assert THETA_MAX_DEG == 30.0
 
 
 @pytest.fixture(scope="module")
