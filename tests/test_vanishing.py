@@ -373,7 +373,10 @@ def test_too_few_segments_is_refused_before_fitting_anything():
     _, _, conf = estimate_vanishing_points(segs, _FRAME, K)
     assert conf.reasons == ["слишком мало отрезков"]
     assert conf.support_h == 0 and conf.support_v == 0
-    assert not np.isfinite(conf.residual_px)
+    # Именно бесконечность, а не «что угодно нечисловое»: nan тоже не конечен, но при
+    # сравнении с порогом ведёт себя как «меньше». Живого пути к nan здесь нет, это
+    # профилактика — та же, что и в проверке охран меры устойчивости.
+    assert conf.residual_px == float("inf")
     assert conf.value == 0.0
 
 
@@ -655,10 +658,13 @@ def test_near_frontal_views_are_accepted_when_both_families_are_present(dx, dy):
     """Весь околофронтальный диапазон принимается, когда вертикали есть в кадре.
 
     Отказы в этом диапазоне на бедной сцене вызваны не фронтальностью, а тем, что
-    вертикальный пучок там состоит из трёх-пяти обломков одного проёма: измерено, что
-    на бедной сцене отказ наступает при dx от 400 до 600 мм, а на обогащённой те же
-    ракурсы дают полсотни вертикалей и принимаются с доверием не ниже 0.88.
-    Различитель тот же, что и в работе B, и говорит он о данных, а не об оценщике.
+    вертикальный пучок там состоит из трёх-пяти обломков одного проёма. Измерено на
+    шаге 100 мм: бедная сцена отвергает dx = 100 (ошибка 1.705°, отказ заслуженный),
+    300 (1.494°), 400, 500, 600, а также 1100 и 5000 — то есть это не сплошная полоса
+    и не только околофронтальная область. Обогащённая сцена на тех же ракурсах не
+    отвергает ни одного, минимальное доверие среди принятых 0.687 по ряду до dx = 5000
+    и 0.741 по околофронтальному ряду до 1500. Различитель тот же, что и в работе B, и
+    говорит он о данных, а не об оценщике.
     """
     scene = make_rich_scene(dx=dx, dy=dy)
     vh, vv, conf = estimate_vanishing_points(detect_segments(scene.render()),
@@ -875,12 +881,12 @@ def test_confidence_tracks_stability_when_nothing_else_changes():
     """Устойчивость направления входит в доверие наравне с покрытием, невязкой и углом.
 
     Два входа с одними и теми же точками схода и одними и теми же отклонениями: в
-    первом середины отрезков разнесены на 400 px, во втором на 150. Поддержка,
-    покрытие, невязка и угол совпадают; узкий веер определяет направление хуже, и
-    доверие обязано это учесть.
+    первом середины отрезков разнесены на 1200 px, во втором на 300. Поддержка,
+    покрытие, невязка и угол совпадают; узкий веер определяет направление хуже
+    (неустойчивость 0.036° против 0.149°), и доверие обязано это учесть.
     """
-    wide = estimate_vanishing_points(_bundles_with_fan(400.0), _FRAME, K)[2]
-    tight = estimate_vanishing_points(_bundles_with_fan(150.0), _FRAME, K)[2]
+    wide = estimate_vanishing_points(_bundles_with_fan(1200.0), _FRAME, K)[2]
+    tight = estimate_vanishing_points(_bundles_with_fan(300.0), _FRAME, K)[2]
 
     assert wide.reasons == [] and tight.reasons == []
     assert wide.support_h == tight.support_h and wide.support_v == tight.support_v
@@ -917,20 +923,19 @@ def test_below_the_contract_threshold_a_reason_appears_and_above_it_does_not():
 def _stability_dominated_input():
     """Вход, где под порог доверие уводит именно неустойчивость, а отсечка не сработала.
 
-    Область узкая: отсечка по неустойчивости стоит раньше, чем множитель успевает
-    стать наименьшим, поэтому все четыре величины подобраны совместно — покрытие 0.71,
-    невязка 0.45 px, угол 86.4°, неустойчивость 0.52° при пороге отсечки 0.60.
+    Отсечка по неустойчивости стоит раньше, чем её множитель успевает стать
+    наименьшим, поэтому величины подобраны совместно: покрытие 1.00, невязка 0.29 px,
+    угол 85.9°, неустойчивость 0.30° при пороге отсечки 0.40. Перебор нашёл 206 таких
+    конфигураций, так что область не игольное ушко.
     """
-    spread, scale = 160.0, 0.8
+    spread, scale = 200.0, 0.6
     dev = tuple(scale * x for x in (0.0, 0.0, 0.5, -0.5, 0.7, -0.7, 0.9, -0.9))
     d1, d2 = _direction_pair(86.0)
     n = len(dev)
     mid_h = [(700.0 + 0.3 * spread * i, 400.0 + spread * i) for i in range(n)]
     mid_v = [(400.0 + spread * i, 700.0 + 0.3 * spread * i) for i in range(n)]
-    core = np.vstack([_fan_segments(_vanishing_of(d1), mid_h, 500.0, dev),
-                      _fan_segments(_vanishing_of(d2), mid_v, 500.0, dev)])
-    junk = np.random.default_rng(4).uniform(150.0, 1850.0, size=(8, 4))
-    return np.vstack([core, junk]), (2000, 1500)
+    return np.vstack([_fan_segments(_vanishing_of(d1), mid_h, 500.0, dev),
+                      _fan_segments(_vanishing_of(d2), mid_v, 500.0, dev)]), (3000, 2400)
 
 
 @pytest.mark.parametrize("case", ["угол", "невязка", "покрытие", "устойчивость"])
