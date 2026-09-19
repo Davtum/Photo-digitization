@@ -13,6 +13,16 @@ DEFAULT_DIAGONAL_FOV_DEG = 84.0  # типично для DJI Zenmuse L2 и Mavic
 
 MIN_CALIBRATION_VIEWS = 5
 
+#: Источник матрицы K по происхождению ширины матрицы. Пути различаются по
+#: надёжности: измеренная ширина, выведенная из 35-мм эквивалента и взятая из
+#: таблицы моделей — не одно и то же, и в выходном файле это обязано различаться.
+SOURCE_BY_SENSOR_WIDTH_SOURCE = {
+    None: "exif",
+    "focal_plane": "exif:focal_plane",
+    "crop_factor": "exif:crop_factor",
+    "model_table": "exif:model_table",
+}
+
 
 @dataclass(frozen=True)
 class CalibrationProfile:
@@ -90,8 +100,8 @@ def intrinsics_from_meta(meta: CameraMeta, profile_path=None) -> tuple[np.ndarra
     без него нельзя оценить вклад ошибки фокусного в бюджет (спецификация, п. 6.1).
 
     Возвращаемый источник называет то, откуда параметры взяты на деле:
-    "target" — профиль по мишени, "exif" — фокусное и ширина матрицы из снимка,
-    "database" — типовое поле зрения.
+    "target" — профиль по мишени; "exif" и уточнённые "exif:*" — фокусное из снимка
+    с указанием происхождения ширины матрицы; "database" — типовое поле зрения.
     """
     w, h = meta.image_size
 
@@ -102,7 +112,7 @@ def intrinsics_from_meta(meta: CameraMeta, profile_path=None) -> tuple[np.ndarra
 
     if meta.focal_mm and meta.sensor_width_mm:
         fx = fy = w * meta.focal_mm / meta.sensor_width_mm
-        source = "exif"
+        source = SOURCE_BY_SENSOR_WIDTH_SOURCE[meta.sensor_width_source]
     else:
         diag_px = math.hypot(w, h)
         fx = fy = diag_px / (2.0 * math.tan(math.radians(DEFAULT_DIAGONAL_FOV_DEG) / 2.0))

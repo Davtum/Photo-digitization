@@ -100,3 +100,103 @@ def test_calibrate_from_chessboard_separates_its_two_refusals():
     # Подстроки взаимно исключительны: ни одна не подходит к чужому сообщению.
     assert "мишень распознана лишь" not in str(too_few.value)
     assert "не менее 5 снимков" not in str(not_found.value)
+
+
+# --- калибровка по синтетической мишени с известными параметрами ---
+
+CHESSBOARD = (9, 6)          # внутренние углы: 9 по горизонтали, 6 по вертикали
+SQUARE_MM = 25.0
+SYNTH_IMAGE_SIZE = (640, 480)
+SYNTH_K = np.array([[800.0, 0.0, 320.0], [0.0, 800.0, 240.0], [0.0, 0.0, 1.0]])
+_TEMPLATE_SCALE = 3          # пикселей шаблона на миллиметр мишени
+_TEMPLATE_MARGIN_MM = 25.0   # белое поле вокруг мишени: без него углы не находятся
+
+
+def _chessboard_template():
+    """Мишень в собственных координатах и матрица «объектные мм → пиксели шаблона»."""
+    cols, rows = CHESSBOARD
+    side = int(SQUARE_MM * _TEMPLATE_SCALE)
+    squares = np.indices((rows + 1, cols + 1)).sum(axis=0) % 2
+    board = np.kron(squares, np.ones((side, side), np.uint8)) * 255
+
+    margin = int(_TEMPLATE_MARGIN_MM * _TEMPLATE_SCALE)
+    canvas = np.full((board.shape[0] + 2 * margin, board.shape[1] + 2 * margin), 255, np.uint8)
+    canvas[margin:margin + board.shape[0], margin:margin + board.shape[1]] = board
+
+    shift = (SQUARE_MM + _TEMPLATE_MARGIN_MM) * _TEMPLATE_SCALE
+    to_template = np.array([[_TEMPLATE_SCALE, 0.0, shift],
+                            [0.0, _TEMPLATE_SCALE, shift],
+                            [0.0, 0.0, 1.0]])
+    return canvas, to_template
+
+
+def _render_view(template, to_template, rvec, tvec):
+    """Снимок плоской мишени при заданной позе: гомография точна для плоскости."""
+    import cv2
+
+    rotation, _ = cv2.Rodrigues(np.asarray(rvec, dtype=float))
+    plane = SYNTH_K @ np.column_stack([rotation[:, 0], rotation[:, 1],
+                                       np.asarray(tvec, dtype=float)])
+    return cv2.warpPerspective(template, plane @ np.linalg.inv(to_template),
+                               SYNTH_IMAGE_SIZE, flags=cv2.INTER_LINEAR,
+                               borderMode=cv2.BORDER_CONSTANT, borderValue=255)
+
+
+_SYNTH_POSES = [
+    ((0.00, 0.00, 0.00), (-100, -62, 420)),
+    ((0.25, 0.00, 0.00), (-100, -50, 430)),
+    ((-0.25, 0.00, 0.00), (-100, -70, 430)),
+    ((0.00, 0.28, 0.00), (-90, -62, 430)),
+    ((0.00, -0.28, 0.00), (-110, -62, 430)),
+    ((0.20, 0.20, 0.10), (-95, -58, 450)),
+    ((-0.20, 0.22, -0.10), (-105, -66, 450)),
+    ((0.18, -0.24, 0.15), (-98, -60, 400)),
+    ((-0.22, -0.20, -0.12), (-102, -64, 470)),
+]
+
+
+def synthetic_chessboard_views():
+    """Девять видов мишени, снятых камерой с матрицей SYNTH_K."""
+    template, to_template = _chessboard_template()
+    return [_render_view(template, to_template, rvec, tvec) for rvec, tvec in _SYNTH_POSES]
+
+
+def test_calibrate_from_chessboard_recovers_known_intrinsics():
+    """Калибровка по синтетической мишени возвращает близкие к истине параметры."""
+    from facade_digitizer.pipeline.calib import calibrate_from_chessboard
+
+    views = synthetic_chessboard_views()
+    profile = calibrate_from_chessboard(views, pattern=CHESSBOARD, square_mm=SQUARE_MM,
+                                        image_size=SYNTH_IMAGE_SIZE, model="synthetic")
+
+    K = np.array(profile.K)
+    assert K[0, 0] == pytest.approx(800.0, rel=0.01, abs=8.0)
+    assert K[1, 1] == pytest.approx(800.0, rel=0.01, abs=8.0)
+    assert K[0, 2] == pytest.approx(320.0, rel=0.02, abs=6.4)
+    assert K[1, 2] == pytest.approx(240.0, rel=0.02, abs=4.8)
+    assert 0.0 < profile.rms_px < 1.0
+    assert profile.model == "synthetic"
+    assert profile.image_size == SYNTH_IMAGE_SIZE
+    assert len(profile.dist) >= 5
+
+
+def test_calibrated_profile_outranks_exif_end_to_end(tmp_path):
+    """Профиль, полученный калибровкой, действительно перебивает EXIF того же снимка."""
+    from facade_digitizer.pipeline.calib import calibrate_from_chessboard, save_profile
+    from facade_digitizer.pipeline.io import CameraMeta
+
+    profile = calibrate_from_chessboard(synthetic_chessboard_views(), pattern=CHESSBOARD,
+                                        square_mm=SQUARE_MM, image_size=SYNTH_IMAGE_SIZE,
+                                        model="synthetic")
+    path = tmp_path / "synthetic.json"
+    save_profile(profile, path)
+
+    meta = CameraMeta(model="synthetic", focal_mm=24.0, sensor_width_mm=17.3,
+                      image_size=SYNTH_IMAGE_SIZE, captured_at=None, gnss=None,
+                      sensor_width_source="crop_factor")
+    K, source = intrinsics_from_meta(meta, profile_path=path)
+
+    assert source == "target"
+    assert K[0, 0] == pytest.approx(np.array(profile.K)[0, 0], rel=1e-9, abs=1e-9)
+    # EXIF дал бы заметно иное фокусное — значит, проверка не вырождена.
+    assert abs(K[0, 0] - 640 * 24.0 / 17.3) > 10.0
