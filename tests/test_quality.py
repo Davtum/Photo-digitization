@@ -75,3 +75,76 @@ def test_thresholds_are_injectable():
 def test_usable_fraction_counts_angles():
     field = np.array([[10.0, 20.0], [40.0, 50.0]])
     assert usable_fraction(field, 30.0) == pytest.approx(0.5)
+
+
+@pytest.fixture(scope="module")
+def img():
+    """Один рендер на все проверки аргументов: сам кадр в них годный и неизменный."""
+    return scene().render()
+
+
+def test_usable_threshold_is_injectable(img):
+    """Порог доли кадра — такой же подставляемый порог, как остальные три.
+
+    Вшитое в тело число обошла бы калибровка порогов на реальных данных.
+    """
+    assert assess(img, 3.1, 4.6, 22.0, usable=0.3).verdict == "degraded"
+    lenient = Thresholds(usable_min_fraction=0.2)
+    assert assess(img, 3.1, 4.6, 22.0, usable=0.3, thresholds=lenient).verdict == "ok"
+
+
+def test_non_finite_gsd_is_a_caller_error(img):
+    """NaN в разрешении — поломка расчёта, а не свойство снимка.
+
+    Без проверки `nan > порог` ложно, причин нет, и шлюз выдаёт «годен» — отказ
+    ровно в том модуле, чьё единственное назначение состоит в отлове негодного входа.
+    """
+    for bad in (float("nan"), float("inf"), -float("inf")):
+        with pytest.raises(ValueError, match="gsd_max"):
+            assess(img, 3.1, bad, 22.0)
+        with pytest.raises(ValueError, match="gsd_min"):
+            assess(img, bad, 4.6, 22.0)
+
+
+def test_non_numeric_gsd_is_a_caller_error(img):
+    """Нечисловое значение: math.isfinite на нём поднял бы TypeError вместо внятного отказа."""
+    for bad in ("4.6", None, [4.6]):
+        with pytest.raises(ValueError, match="gsd_max"):
+            assess(img, 3.1, bad, 22.0)
+
+
+def test_impossible_gsd_is_a_caller_error(img):
+    """Разрешение неположительно или границы переставлены — считать по такому нечего."""
+    with pytest.raises(ValueError, match="gsd_max"):
+        assess(img, 3.1, -4.6, 22.0)
+    with pytest.raises(ValueError, match="gsd_min"):
+        assess(img, 0.0, 4.6, 22.0)
+    with pytest.raises(ValueError, match="переставлены"):
+        assess(img, 5.0, 4.6, 22.0)
+
+
+def test_non_finite_angle_is_a_caller_error(img):
+    for bad in (float("nan"), float("inf"), "22.0"):
+        with pytest.raises(ValueError, match="theta_p95"):
+            assess(img, 3.1, 4.6, bad)
+
+
+def test_impossible_angle_is_a_caller_error(img):
+    """Угол визирования к нормали вне [0°, 90°] не описывает наблюдаемый фасад."""
+    with pytest.raises(ValueError, match="theta_p95"):
+        assess(img, 3.1, 4.6, -1.0)
+    with pytest.raises(ValueError, match="theta_p95"):
+        assess(img, 3.1, 4.6, 120.0)
+
+
+def test_usable_fraction_out_of_range_is_a_caller_error(img):
+    """Доля кадра — это доля: вне [0, 1] и нечисловая она бессмысленна."""
+    for bad in (float("nan"), float("inf"), 1.5, -0.1, None):
+        with pytest.raises(ValueError, match="usable"):
+            assess(img, 3.1, 4.6, 22.0, usable=bad)
+
+
+def test_boundary_arguments_are_accepted(img):
+    """Охрана не должна отвергать рабочий вход: крайние допустимые значения проходят."""
+    assert assess(img, 3.1, 4.6, 0.0, usable=1.0).verdict == "ok"
+    assert assess(img, 4.6, 4.6, 90.0, usable=0.0).verdict == "degraded"

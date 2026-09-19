@@ -3,7 +3,16 @@
 Генеративное устранение смаза синтезирует границы, которых в кадре не было, а измерение
 выполняется именно по границам: снимок стал бы визуально убедительным, а миллиметры —
 уверенно неверными. Поэтому модуль только выносит вердикт.
+
+Разделение ответственности. Негодный СНИМОК получает вердикт: это то, ради чего шлюз
+существует. Негодный АРГУМЕНТ (нечисловое, бесконечное, отрицательное разрешение, доля
+вне [0, 1]) — это поломка вызывающего кода, а не свойство снимка, и он поднимает
+ValueError. Вердикт «брак» на такой вход был бы записан в выходной файл как свойство
+кадра и стал бы неотличим от честной отбраковки плохого снимка; оператор переснял бы
+кадр, а сломанный расчёт остался бы на месте. Спецификация, п. 6.3: значение без
+происхождения в выход не попадает — выдуманная причина отбраковки тем более.
 """
+import math
 from dataclasses import dataclass
 
 import cv2
@@ -14,7 +23,7 @@ from facade_digitizer.schema import QualityReport
 
 @dataclass(frozen=True)
 class Thresholds:
-    """Пороги шлюза.
+    """Пороги шлюза. Все четыре подставляемы — калибровка не должна обойти ни один.
 
     Значение sharpness_min ПРЕДВАРИТЕЛЬНОЕ. Оно получено на синтетике (резкая сцена
     даёт около 1.2e-05, лёгкое размытие 8e-08) и подлежит замене после калибровки на
@@ -26,9 +35,31 @@ class Thresholds:
     sharpness_min: float = 1.0e-06
     gsd_max_mm_px: float = 5.0
     theta_p95_max_deg: float = 30.0
+    usable_min_fraction: float = 0.5
 
 
 DEFAULT = Thresholds()
+
+
+def _number(name: str, value, low: float, high: float, low_inclusive: bool = True) -> float:
+    """Аргумент-число: конечное и в осмысленном диапазоне. Иначе — поломка вызова.
+
+    Проверка типа стоит до isfinite намеренно: math.isfinite(x) на нечисловом значении
+    поднимает TypeError, а np.isfinite на строке — тоже TypeError, и без явной проверки
+    сообщение было бы про внутренности шлюза, а не про негодный аргумент.
+    """
+    if value is None or isinstance(value, (str, bytes, bool, complex)):
+        raise ValueError(f"{name}: ожидалось вещественное число, получено {value!r}")
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name}: ожидалось вещественное число, получено {value!r}") from None
+    if not math.isfinite(v):
+        raise ValueError(f"{name}: ожидалось конечное число, получено {v}")
+    if v > high or v < low or (v == low and not low_inclusive):
+        edge = "(" if not low_inclusive else "["
+        raise ValueError(f"{name}: значение {v} вне допустимого {edge}{low}, {high}]")
+    return v
 
 
 def sharpness(image: np.ndarray) -> float:
@@ -48,10 +79,21 @@ def usable_fraction(theta_field_deg: np.ndarray, theta_max_deg: float = 30.0) ->
 
 def assess(image: np.ndarray, gsd_min: float, gsd_max: float, theta_p95: float,
            usable: float = 1.0, thresholds: Thresholds | None = None) -> QualityReport:
-    """Вердикт о пригодности снимка. Возвращает QualityReport (схема, раздел 10)."""
-    t = thresholds or DEFAULT
-    reasons: list[str] = []
+    """Вердикт о пригодности снимка. Возвращает QualityReport (схема, раздел 10).
 
+    Поднимает ValueError, если числовые аргументы не описывают реальный снимок:
+    это поломка вызывающего кода, и маскировать её вердиктом нельзя.
+    """
+    t = thresholds or DEFAULT
+
+    gsd_min = _number("gsd_min", gsd_min, 0.0, 1.0e6, low_inclusive=False)
+    gsd_max = _number("gsd_max", gsd_max, 0.0, 1.0e6, low_inclusive=False)
+    theta_p95 = _number("theta_p95", theta_p95, 0.0, 90.0)
+    usable = _number("usable", usable, 0.0, 1.0)
+    if gsd_min > gsd_max:
+        raise ValueError(f"gsd_min {gsd_min} больше gsd_max {gsd_max}: границы переставлены")
+
+    reasons: list[str] = []
     sharp = sharpness(image)
     if sharp < t.sharpness_min:
         reasons.append(f"недостаточная резкость: {sharp:.2e} < {t.sharpness_min:.2e}")
@@ -59,7 +101,7 @@ def assess(image: np.ndarray, gsd_min: float, gsd_max: float, theta_p95: float,
         reasons.append(f"недостаточное разрешение: {gsd_max:.1f} мм/px > {t.gsd_max_mm_px}")
     if theta_p95 > t.theta_p95_max_deg:
         reasons.append(f"слишком крутой угол визирования: P95 = {theta_p95:.1f}°")
-    if usable < 0.5:
+    if usable < t.usable_min_fraction:
         reasons.append(f"угловому условию удовлетворяет лишь {usable:.0%} кадра")
 
     if not reasons:
