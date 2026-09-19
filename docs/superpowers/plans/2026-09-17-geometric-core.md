@@ -2719,269 +2719,244 @@ git commit -m "Сквозная проверка геометрии: поза и
 
 ---
 
-## Задача 15: Сборка конвейера, CLI и сквозной тест
+## Задача 15: Сборка конвейера и CLI
+
+> **Текст переписан под фактические интерфейсы задач 1–14.** Редакция 2 вызывала
+> `estimate_plane(image, K, mm_per_px)` — третьего параметра такого рода у неё нет и быть не может;
+> `rectify(image, H)` — у неё пять параметров, и без них ректифицированный растр схлопывается;
+> `assess(image, gsd_min, gsd_max, theta_p95)` с `gsd_min = gsd_max = mm_per_px`, то есть
+> подставляла аргумент вместо измерения; брала позу из `plane.camera`, которого нет, поскольку поза
+> требует масштаба, на шаге оценки плоскости ещё неизвестного. Ниже интерфейсы приведены такими,
+> какими они есть в коде на `HEAD`.
 
 **Файлы:**
 - Создать: `facade_digitizer/pipeline/run.py`
-- Тест: `tests/test_e2e.py`
+- Изменить: `facade_digitizer/schema.py` (два поля, см. шаг 3)
+- Изменить: `docs/superpowers/specs/2026-09-17-facade-photo-digitization-design.md` (п. 10, см. шаг 6)
+- Тест: `tests/test_run.py`
 
 **Интерфейсы:**
-- Потребляет: все предыдущие задачи
-- Предоставляет: `process(image_path, mm_per_px, scale_source) -> FacadeModel`,
-  `main() -> int` — точка входа CLI `facade-digitize`
+- Потребляет: `load_image`, `intrinsics_from_meta`, `undistort`, `estimate_plane`,
+  `estimate_plane_manual`, `homography_from_vanishing_points`, `camera_pose`,
+  `rectified_to_facade_mm`, `attainable_mm_per_px`, `rectify`, `local_gsd_field`, `assess`,
+  `CameraOnPlane.theta_deg`
+- Предоставляет: `OperatorReference`, `process(...) -> FacadeModel`, `main() -> int`,
+  точка входа CLI `facade-digitize` (уже объявлена в `pyproject.toml`)
+
+---
+
+### Что именно здесь собирается и чего здесь нет
+
+Это последнее звено геометрического ядра: оно связывает уже проверенные модули в один проход
+«снимок → JSON» и добавляет **ровно одно** новое вычисление — пригодность кадра, которую ни один
+модуль не считает целиком (см. шаг 4). Элементов фасада конвейер не выделяет: `elements` остаётся
+пустым, `coverage = "partial"`. Детекция окон и дверей — следующий этап, и задача 15 не должна
+делать вид, что он уже есть.
+
+### Откуда берётся масштаб, и почему у `process` есть параметр оператора
+
+`camera_pose` требует `mm_per_rect_unit` — числа миллиметров на ректифицированную единицу. Эта
+величина **тождественно равна расстоянию от камеры до плоскости** и из кадра невыводима: снимок
+плоскости с точностью до подобия не знает своего размера. Её задаёт оператор, указывая на снимке
+две точки и истинное расстояние между ними, плюс точку начала отсчёта фасада.
+
+```python
+@dataclass(frozen=True)
+class OperatorReference:
+    origin_px: tuple[float, float]          # точка кадра, которая станет началом координат фасада
+    span_px: tuple[tuple[float, float], tuple[float, float]]
+    span_mm: float                          # истинное расстояние между точками span_px
+    sigma_px: float = ...                   # погрешность указания точки оператором; см. шаг 5
+```
+
+Перевод: обе точки `span_px` и `origin_px` отображаются гомографией в ректифицированные единицы;
+`mm_per_unit = span_mm / |span_rect[1] − span_rect[0]|`; `origin_rect` — образ `origin_px`.
+
+**Это то место, где задача 14 оставила незакрытую оговорку.** Там опорная длина бралась по
+двадцатиметровой стороне фасада, и в отчёте прямо сказано, что реальный оператор даст базу
+примерно вдесятеро короче, отчего погрешность масштаба вырастет. Здесь база — фактический вход,
+и σ масштаба должна считаться **из неё**, а не браться из таблицы. См. шаг 5.
+
+### Почему у `process` два разных «мм на пиксель»
+
+Их действительно два, и смешение — готовый дефект:
+
+- `mm_per_unit` — масштаб ректифицированной системы координат, он же расстояние до плоскости;
+- `raster_mm_per_px` — разрешение выходного растра, свободный параметр визуализации, обязанный
+  лежать внутри `attainable_mm_per_px(image, H, mm_per_unit)`.
+
+Ни один из них не является GSD: GSD — измеренное поле, меняющееся по кадру, и берётся оно из
+`local_gsd_field`. Редакция 2 подставляла один и тот же аргумент во все три роли.
+
+---
 
 - [ ] **Шаг 1: Написать падающий тест**
 
-Файл `tests/test_e2e.py`:
+Файл `tests/test_run.py`. Сцену брать из `tests/test_synth.py` (`make_scene`, `K`), опорные точки
+оператора получать проецированием истинных углов фасада — `scene.project(CORNERS)` из
+`tests/test_homography.py`, как это делает `tests/test_integration.py`. Снимок писать в `tmp_path`
+через `cv2.imwrite`; EXIF в нём не будет, и это входит в проверку (`intrinsics_from_meta` обязан
+дать `calibration` из таблицы и сказать об этом).
 
-```python
-import time
+Обязательные проверки — каждая названа свойством, а не номером:
 
-import cv2
-import numpy as np
-import pytest
-
-from facade_digitizer.pipeline.run import process
-from facade_digitizer.schema import FacadeModel
-from tests.test_synth import make_scene
-
-
-@pytest.fixture
-def scene_file(tmp_path):
-    scene = make_scene(theta_x_deg=18.0, theta_y_deg=12.0, depth=150.0)
-    path = tmp_path / "facade.png"
-    cv2.imwrite(str(path), scene.render())
-    return path
-
-
-def test_produces_valid_schema(scene_file):
-    model = process(scene_file, mm_per_px=2.8, scale_source="operator_reference")
-    assert isinstance(model, FacadeModel)
-    assert model.schema_version == "1.1"
-    FacadeModel.model_validate_json(model.model_dump_json())
-
-
-def test_records_scale_source_and_uncertainty(scene_file):
-    """Инвариант спецификации: величина без источника и σ не выпускается."""
-    model = process(scene_file, mm_per_px=2.8, scale_source="operator_reference")
-    assert model.facade.scale.source == "operator_reference"
-    assert model.facade.scale.sigma_rel > 0
-
-
-def test_records_camera_pose_and_angle_field(scene_file):
-    model = process(scene_file, mm_per_px=2.8, scale_source="operator_reference")
-    img = model.images[0]
-    assert img.pose_to_facade is not None
-    assert img.theta_field_deg["p95"] >= 0.0
-
-
-def test_exif_scale_source_is_marked_as_not_meeting_tolerance(scene_file):
-    """Источники 3 и 4 допуск не выполняют. Спецификация, п. 6.3."""
-    model = process(scene_file, mm_per_px=2.8, scale_source="assumed_floor_height")
-    assert model.facade.scale.meets_tolerance is False
-
-
-def test_pipeline_meets_performance_budget(scene_file):
-    """Спецификация, раздел 16: не более 15 с на снимок."""
-    start = time.perf_counter()
-    process(scene_file, mm_per_px=2.8, scale_source="operator_reference")
-    assert time.perf_counter() - start < 15.0
-```
+1. **Схема валидна на обратном разборе.** `FacadeModel.model_validate_json(model.model_dump_json())`
+   проходит, `schema_version == "1.1"`.
+2. **В выходе нет бесконечностей и NaN.** Проверять не подстрокой в JSON — `json.dumps` пишет
+   `Infinity`, а `NaN` встречается и внутри вложенных списков гомографии. Обойти разобранный JSON
+   рекурсивно и потребовать `math.isfinite` от каждого числа. Подстрочная проверка редакции 2
+   (`assert "null" not in payload or "Infinity" not in payload`) истинна при любом входе: это
+   дизъюнкция, в которой хотя бы один член почти всегда верен.
+3. **Поза записана вместе с происхождением.** `pose_to_facade` содержит `cx`, `cy`, `cz` и признак
+   неразрешённости поворота на 180° с названной причиной. Глобальное ограничение: величина без
+   происхождения не выпускается, а `camera_pose` возвращает пару именно для того, чтобы признак
+   нельзя было потерять молча.
+4. **Поза близка к истине сцены.** Невязка опорной точки и расстояния сверяется с
+   `scene.camera_on_plane()`. Допуск взять с запасом к измеренному в задаче 14 (P95 0.601 % по
+   опорной точке на разреженной сцене): порядка 2 % расстояния. Цель проверки — не повторить замер
+   задачи 14, а поймать сборку, потерявшую или переставившую аргументы: именно такая ошибка
+   ставила камеру в 27 км от фасада и проходила все тесты.
+5. **`theta_cam_deg` и поле углов — разные величины.** `theta_cam_deg` строго меньше
+   `theta_field_deg["max"]` и строго больше `theta_field_deg["min"]` на наклонном ракурсе.
+   Проверка с одним лишь `<= max` проходила бы и при полном равенстве полю.
+6. **GSD измерен, а не скопирован из аргумента.** `quality.gsd_mm_px_max > quality.gsd_mm_px_min`
+   **и** ни одна из границ не равна `raster_mm_per_px`. Без второго условия проверку удовлетворяет
+   любая пара констант.
+7. **Низкое доверие передаёт управление оператору, а не подменяется догадкой.** На шуме:
+   `rectification.needs_operator is True`, `rectification.confidence` записана, `homography is None`,
+   `pose_to_facade is None`, и вердикт качества не `"ok"`. Отдельно: модель всё равно валидна по
+   схеме — отказ обязан быть выражен данными, а не исключением.
+8. **Масштаб вне достижимого диапазона отвергается с названием диапазона.** `process` с заведомо
+   негодным `raster_mm_per_px` поднимает `ValueError`, сообщение содержит достижимые границы.
+9. **σ масштаба зависит от длины опорной базы.** Та же сцена, опорная база вдесятеро короче →
+   `scale.sigma_rel` примерно вдесятеро больше. Это не косметика: см. шаг 5.
+10. **Несовпадение профиля калибровки со снимком отвергается по этому снимку, а не роняет пакет.**
+    `main()` на двух файлах, из которых первый ссылается на несовместимый профиль, возвращает
+    ненулевой код, печатает причину по имени файла и **обрабатывает второй**.
+11. **Бюджет времени.** Спецификация, раздел 16: не более 15 с на снимок. Замерять на кадре того же
+    порядка, что рабочий, а не на миниатюре, иначе проверка бессмысленна.
 
 - [ ] **Шаг 2: Убедиться, что тест падает**
 
-Выполнить: `pytest tests/test_e2e.py -v`
+```bash
+./.venv/Scripts/python.exe -m pytest tests/test_run.py -v
+```
 Ожидается: `ModuleNotFoundError: No module named 'facade_digitizer.pipeline.run'`
 
-- [ ] **Шаг 3: Реализовать**
+- [ ] **Шаг 3: Дополнить схему двумя полями**
 
-Файл `facade_digitizer/pipeline/run.py`:
+`facade_digitizer/schema.py`, класс `Rectification`:
 
-```python
-"""Сборка геометрического конвейера и точка входа CLI."""
-import argparse
-import sys
-from pathlib import Path
+- добавить `needs_operator: bool = False`;
+- сделать `residual_px: float | None` — метрика доверия возвращает `None`, когда невязка не
+  определена, а текущая аннотация `float` заставила бы подставить число вместо отсутствия.
 
-import numpy as np
+`Strict` запрещает лишние поля, поэтому без этого шага проброс признака невозможен в принципе.
+Больше в схеме не менять: всё прочее, что нужно задаче 15, уже описано.
 
-from ..geometry.angles import angle_map
-from ..schema import (
-    SCHEMA_VERSION,
-    CameraIntrinsics,
-    FacadeModel,
-    FacadeRecord,
-    ImageRecord,
-    Rectification,
-    ScaleEstimate,
-)
-from .calib import intrinsics_from_meta, undistort
-from .io import load_image
-from .plane import estimate_plane
-from .quality import assess
-from .rectify import rectify
+- [ ] **Шаг 4: Реализовать `run.py`**
 
-SOFTWARE_VERSION = "facade-digitizer 0.1.0"
+Порядок прохода и требования к каждому звену:
 
-# σ и соответствие допуску по источнику масштаба. Спецификация, п. 6.3.
-SCALE_PROFILE = {
-    "operator_reference": (0.0022, True),
-    "photogrammetry": (0.0010, True),
-    "exif_range": (0.030, False),
-    "assumed_floor_height": (0.050, False),
-}
+1. `load_image(path)` → `(image, meta)`; `intrinsics_from_meta(meta, profile_path)` → `(K, source)`;
+   `undistort(image, K, dist)`, где `dist` берётся из профиля, если он задан, иначе нули.
+2. `estimate_plane(image, K)` → `PlaneResult`. **Если `needs_operator` — не ректифицировать.**
+   Единичная гомография вместо отказа неотличима от настоящей на стороне потребителя; это и есть
+   контракт п. 4.2. Собрать модель с `rectification.needs_operator = True`, `homography = None`,
+   `pose_to_facade = None`, `theta_*` = `None`, вердиктом качества по одной лишь резкости и
+   вернуть её. Причины из `confidence.reasons` попадают в `quality.reasons`.
+3. Масштаб и начало отсчёта — из `OperatorReference`, как описано выше.
+4. `camera_pose(plane.H, plane.vh, plane.vv, K, mm_per_unit, origin_rect)` → **пара**
+   `(camera, half_turn)`. Распаковывать обязательно; `half_turn.resolved`, `half_turn.assumption`
+   и `half_turn.reason` идут в `pose_to_facade`.
+5. **Пригодность кадра — единственное новое вычисление.** Считать на регулярной сетке узлов
+   **кадра** (не фасада), потому что доля нормируется по кадру. Для каждого узла: образ под `H`,
+   затем `rectified_to_facade_mm` → координаты фасада → `camera.theta_deg(x, y)`. Узел пригоден,
+   когда выполняются **оба** условия: угол визирования не превышает порог И знаменатель гомографии
+   сохраняет знак, то есть узел лежит перед камерой, а не за линией схода. `usable` — доля таких
+   узлов; `theta_field_deg` — минимум, максимум и P95 **по видимым узлам той же сетки**.
 
+   Почему не `angle_map` + `usable_mask` из `geometry/angles.py`: они заданы на габарите фасада,
+   часть которого в кадр не попала, и доля по ним отвечала бы на другой вопрос. Признак «за линией
+   схода» брать из `local_gsd_field(...).gsd`: там такие узлы помечены `nan`, и сетку для GSD и для
+   углов надо взять **одну и ту же**, иначе два поля описывают разные точки.
 
-def process(image_path, mm_per_px: float, scale_source: str) -> FacadeModel:
-    """Снимок → модель фасада без элементов: геометрия, поза, качество."""
-    if scale_source not in SCALE_PROFILE:
-        raise ValueError(f"неизвестный источник масштаба: {scale_source}")
+   `theta_cam_deg` — величина отдельная: угол визирования в точке, куда приходит главная точка
+   снимка (`K[0,2]`, `K[1,2]`), полученный тем же путём. Совпадение его с максимумом поля означает
+   ошибку, а не удачу.
+6. `gsd_min`, `gsd_max` — `nanmin` и `nanmax` того же поля GSD. Если `behind_vanishing_line`
+   превышает разумную долю, это причина деградации, а не повод молча усреднить.
+7. `assess(image, gsd_min, gsd_max, theta_p95, usable)` → `QualityReport`. Значения передавать
+   измеренные; подстановка `raster_mm_per_px` в роли GSD — дефект редакции 2, воспроизводить его
+   нельзя.
+8. `attainable_mm_per_px(image, plane.H, mm_per_unit)`, затем `rectify(image, plane.H, mm_per_unit,
+   raster_mm_per_px, origin_rect_units=origin_rect)`. `ValueError` из `rectify` наружу не глушить:
+   он называет достижимый диапазон, и это ровно то, что нужно вызывающему. `origin_rect_units`
+   передаётся обязательно: его пропуск сдвигает все измеренные положения на одну величину и
+   выглядит правдоподобным результатом.
+9. `bounds_mm` — габарит **охваченной** части фасада: углы образа кадра, переведённые
+   `rectified_to_facade_mm`. Не размер снимка в миллиметрах и не габарит здания.
+10. `plane_residual_mm` оставить `None`. `confidence.residual_px` — невязка отрезков относительно
+    точек схода в пикселях снимка, а не невязка подгонки плоскости в миллиметрах; умножение её на
+    GSD выдало бы угловую величину за метрическую. Отсутствие честнее выдуманного числа.
+11. `mode`: `"assisted"`, когда масштаб пришёл от оператора (`operator_reference`), иначе `"auto"`.
+    Оператор в проходе участвовал — выход обязан это показывать.
+12. **Ни одного нечисла в выходе.** Перед сборкой модели проверить каждое число на `isfinite`; там,
+    где схема допускает `None`, записывать `None`, где не допускает — поднимать исключение с
+    названием поля. Бесконечность, просочившаяся в JSON, ломает обратный разбор, то есть
+    обнаруживается у потребителя, а не здесь.
 
-    image, meta = load_image(image_path)
-    K, k_source = intrinsics_from_meta(meta)
-    image = undistort(image, K, [0.0, 0.0, 0.0, 0.0, 0.0])
+- [ ] **Шаг 5: σ масштаба считать, а не брать из таблицы**
 
-    plane = estimate_plane(image, K, mm_per_px)
-    rect = rectify(image, plane.H)
+Для `operator_reference` σ определяется длиной базы и точностью указания точки:
 
-    h, w = image.shape[:2]
-    bounds_mm = (0.0, 0.0, w * mm_per_px, h * mm_per_px)
-    am = angle_map(plane.camera, bounds_mm, shape=(64, 64))
-    theta_p95 = float(np.percentile(am.theta_full, 95))
-
-    gsd_min = gsd_max = mm_per_px
-    quality = assess(image, gsd_min, gsd_max, theta_p95)
-
-    sigma_rel, meets = SCALE_PROFILE[scale_source]
-
-    record = ImageRecord(
-        id="img_0",
-        path=str(Path(image_path).name),
-        camera=CameraIntrinsics(model=meta.model, K=K.tolist(),
-                                dist=[0.0] * 5, calibration=k_source),
-        captured_at=meta.captured_at,
-        pose_to_facade={"cx": plane.camera.cx, "cy": plane.camera.cy, "cz": plane.camera.cz},
-        theta_cam_deg=float(plane.camera.theta_deg(bounds_mm[2] / 2, bounds_mm[3] / 2)),
-        theta_field_deg={"min": float(am.theta_full.min()),
-                         "max": float(am.theta_full.max()), "p95": theta_p95},
-        quality=quality,
-        rectification=Rectification(method=plane.method,
-                                    confidence=plane.confidence.value,
-                                    residual_px=plane.confidence.residual_px),
-        homography={"from": "image_px", "to": "rectified_px", "H": rect.H.tolist()},
-    )
-
-    facade = FacadeRecord(
-        origin="bottom_left",
-        bounds_mm=list(bounds_mm),
-        mm_per_rectified_px=mm_per_px,
-        scale=ScaleEstimate(source=scale_source, sigma_rel=sigma_rel, meets_tolerance=meets),
-        plane_residual_mm={"rms": plane.confidence.residual_px * mm_per_px, "max": None},
-        valid_mask=None,
-    )
-
-    return FacadeModel(
-        schema_version=SCHEMA_VERSION,
-        software_version=SOFTWARE_VERSION,
-        coverage="partial",
-        mode="auto",
-        images=[record],
-        facade=facade,
-        elements=[],
-        groups=[],
-    )
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Оцифровка фасадного снимка: геометрическое ядро")
-    parser.add_argument("image", help="путь к снимку фасада")
-    parser.add_argument("--mm-per-px", type=float, required=True,
-                        help="масштаб: миллиметров на пиксель")
-    parser.add_argument("--scale-source", default="operator_reference",
-                        choices=sorted(SCALE_PROFILE))
-    parser.add_argument("-o", "--output", help="куда записать JSON (по умолчанию stdout)")
-    args = parser.parse_args()
-
-    model = process(args.image, args.mm_per_px, args.scale_source)
-    payload = model.model_dump_json(indent=2)
-
-    if args.output:
-        Path(args.output).write_text(payload, encoding="utf-8")
-    else:
-        sys.stdout.write(payload)
-
-    if model.images[0].quality.verdict == "reject":
-        sys.stderr.write("\nснимок отбракован: " +
-                         "; ".join(model.images[0].quality.reasons) + "\n")
-        return 2
-    return 0
+```
+sigma_rel = sqrt(2) * sigma_px * gsd_at_reference / span_mm
 ```
 
-- [ ] **Шаг 4: Убедиться, что тесты проходят**
+где `gsd_at_reference` — измеренное локальное разрешение в районе опорных точек. Множитель `sqrt(2)`
+— две независимо указанные точки. Значение `sigma_px` по умолчанию выбрать самостоятельно и
+**обосновать в докстринге**: это точность попадания оператора по кромке на экране, и она должна
+быть согласована с тем, как п. 6.3 спецификации получает свои 0.14–0.28 %. Проверить: на базе,
+равной всей двадцатиметровой стороне, выбранное значение обязано давать σ внутри этого диапазона —
+иначе выбрана величина, противоречащая спецификации.
 
-Выполнить: `pytest tests/test_e2e.py -v`
-Ожидается: 5 passed
+`meets_tolerance` — результат сравнения посчитанной σ с верхней границей п. 6.3 для источника 1,
+а не константа. Для остальных источников (`photogrammetry`, `exif_range`, `assumed_floor_height`)
+базы нет, берутся значения таблицы п. 6.3; для источников 3 и 4 `meets_tolerance = False` по
+спецификации.
 
-- [ ] **Шаг 5: Дописать тесты на дефекты редакции 1 и устранить их**
+Смысл шага: оговорка задачи 14 о короткой базе перестаёт быть текстом в спецификации и становится
+числом в выходном файле.
 
-Четыре свойства, которые редакция 1 нарушала молча. Дописать в `tests/test_e2e.py`:
+- [ ] **Шаг 6: Привести п. 10 спецификации в соответствие**
 
-```python
-def test_low_confidence_is_surfaced_not_hidden(tmp_path):
-    """Спецификация, п. 4.2: ниже порога доверия система не гадает.
+В образце JSON п. 10 добавить `"needs_operator": false` в `rectification` и показать в
+`pose_to_facade` признак поворота на 180°. Образец п. 10 — контракт с потребителем; поле, которое
+код пишет, а образец умалчивает, потребитель не ждёт.
 
-    В редакции 1 `run.process` игнорировал флаг `needs_operator`, ректифицировал с
-    единичной гомографией и выпускал method="vanishing_points" с confidence=0.0.
-    """
-    noise = np.random.default_rng(3).integers(0, 255, (900, 1200), dtype=np.uint8)
-    path = tmp_path / "noise.png"
-    cv2.imwrite(str(path), noise)
+**Правку проверять чтением результата, а не кодом возврата скрипта.** В этом проекте дважды
+случалось, что правка спецификации не нашла якорь, скрипт завершился успешно и коммит прошёл с
+неизменённым файлом.
 
-    model = process(path, mm_per_px=2.8, scale_source="operator_reference")
-    assert model.images[0].quality.verdict in {"degraded", "reject"}
-    assert model.images[0].rectification.needs_operator is True
-
-
-def test_output_contains_no_infinities(tmp_path):
-    """inf сериализуется в null и ломает обратную валидацию схемы."""
-    noise = np.random.default_rng(4).integers(0, 255, (900, 1200), dtype=np.uint8)
-    path = tmp_path / "noise.png"
-    cv2.imwrite(str(path), noise)
-
-    payload = process(path, mm_per_px=2.8, scale_source="operator_reference").model_dump_json()
-    assert "null" not in payload or "Infinity" not in payload
-    FacadeModel.model_validate_json(payload)
-
-
-def test_theta_cam_is_not_the_field_maximum(scene_file):
-    """theta_cam и theta(x,y) — разные величины. Глобальные ограничения."""
-    img = process(scene_file, mm_per_px=2.8, scale_source="operator_reference").images[0]
-    assert img.theta_cam_deg < img.theta_field_deg["max"]
-
-
-def test_gsd_is_measured_across_the_frame(scene_file):
-    """В редакции 1 записывалась константа mm_per_px вместо измеренного поля."""
-    q = process(scene_file, mm_per_px=2.8, scale_source="operator_reference").images[0].quality
-    assert q.gsd_mm_px_max > q.gsd_mm_px_min
-```
-
-Чтобы они прошли, в `run.process` необходимо: пробросить `needs_operator` в
-`Rectification` и в схему; при низком доверии не ректифицировать с единичной гомографией, а
-возвращать модель с соответствующим вердиктом; заменить бесконечные значения на `None` с
-опциональным полем в схеме; вычислять `theta_cam_deg` как угол между оптической осью и нормалью
-(θ в точке, куда попадает главная точка снимка), а поле углов — отдельно; брать `gsd_mm_px_min` и
-`gsd_mm_px_max` из `local_gsd`, а не из аргумента.
-
-- [ ] **Шаг 6: Прогнать весь набор тестов**
-
-Выполнить: `pytest -v`
-Ожидается: все тесты проходят, не менее 95 штук
-
-- [ ] **Шаг 7: Коммит**
+- [ ] **Шаг 7: Прогнать весь набор**
 
 ```bash
-git add facade_digitizer/pipeline/run.py tests/test_e2e.py
-git commit -m "Сборка геометрического конвейера, CLI и сквозные тесты на синтетике"
+./.venv/Scripts/python.exe -m pytest -q
+```
+Ожидается: все проходят; было 386 passed и 2 skipped.
+
+Отдельно проверить CLI вживую, а не только через `process`:
+
+```bash
+./.venv/Scripts/python.exe -m facade_digitizer.pipeline.run --help
+```
+
+- [ ] **Шаг 8: Коммит**
+
+```bash
+git add facade_digitizer/pipeline/run.py facade_digitizer/schema.py tests/test_run.py docs/superpowers/specs/2026-09-17-facade-photo-digitization-design.md
+git commit -m "Сборка конвейера и CLI: снимок в модель фасада одним проходом"
 ```
 
 ---
