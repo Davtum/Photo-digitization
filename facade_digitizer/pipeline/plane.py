@@ -18,8 +18,7 @@
 отличил бы её от настоящей и ректифицировал бы снимок тождественным преобразованием,
 получив «результат» без единого признака беды.
 """
-import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -39,6 +38,48 @@ METHOD_MANUAL_FOUR_POINT = "manual_four_point"
 
 
 @dataclass(frozen=True)
+class ManualPlaneConfidence:
+    """Доверие ручного пути: ОБЪЯВЛЕННОЕ оператором, а не измеренное.
+
+    Отдельный тип, а не заполненный `PlaneConfidence`, потому что соглашение
+    «поля доверия объясняют, а не решают» обязано держаться типом, а не
+    комментарием в коде.
+
+    Величины, которых ручной путь не измерял, равны `None`, и это не украшение.
+    Нуль невязки и ровно 90° — правдоподобные ИЗМЕРЕННЫЕ значения: потребитель не
+    отличил бы их от настоящих. `NaN` отличим глазом, но не охраной — сравнение с
+    ним ложно, и проверка вида `residual_px > X` пропустила бы ручной путь молча,
+    ровно как нечисловое разрешение в задаче 9 давало вердикт «годен» без единой
+    причины. `None` пропустить молча нельзя: `None > 0.5` возбуждает `TypeError`,
+    и охрана, которой ручной путь не по зубам, падает громко и сразу.
+
+    `value = 1.0` — не измерение, а запись того, что плоскость задал оператор:
+    звать его второй раз некуда. Поддержки и покрытие нулевые, потому что отрезков
+    не искали и поддерживать гипотезу нечему.
+    """
+
+    value: float
+    support_h: int
+    support_v: int
+    residual_px: float | None
+    orthogonality_deg: float | None
+    coverage: float
+    reasons: list[str] = field(default_factory=list)
+
+
+def _manual_confidence() -> ManualPlaneConfidence:
+    """Свежий экземпляр на каждый вызов.
+
+    Общая на модуль константа была бы изменяемой через `reasons`: один потребитель
+    дописал бы причину в список, и она появилась бы у всех последующих результатов,
+    включая уже отданные.
+    """
+    return ManualPlaneConfidence(value=1.0, support_h=0, support_v=0,
+                                 residual_px=None, orthogonality_deg=None,
+                                 coverage=0.0, reasons=[])
+
+
+@dataclass(frozen=True)
 class PlaneResult:
     """Плоскость фасада: приведение, доверие к нему и происхождение.
 
@@ -53,30 +94,11 @@ class PlaneResult:
     """
 
     H: np.ndarray | None
-    confidence: PlaneConfidence
+    confidence: PlaneConfidence | ManualPlaneConfidence
     method: str
     needs_operator: bool
     vh: np.ndarray | None = None
     vv: np.ndarray | None = None
-
-
-# Доверие ручного пути. Оно КОНСТРУИРУЕТСЯ, а не измеряется: отрезков не искали,
-# точек схода по ним не оценивали, поддерживать гипотезу нечему — отсюда нулевые
-# поддержки и нулевое покрытие. Невязка и угол между направлениями записаны как NaN
-# намеренно: нулевая невязка и ровно 90° — правдоподобные ИЗМЕРЕННЫЕ значения, и
-# потребитель не отличил бы их от настоящих, тогда как NaN отличает сразу. Риск,
-# что NaN проскочит сквозь чью-то охрану вида `residual > X` (сравнение с NaN ложно),
-# принят осознанно: решение уже принято и записано в `needs_operator`, и повторно
-# решать по полям доверия потребитель не вправе — эти поля объясняют, а не решают.
-MANUAL_CONFIDENCE = PlaneConfidence(
-    value=1.0,
-    support_h=0,
-    support_v=0,
-    residual_px=math.nan,
-    orthogonality_deg=math.nan,
-    coverage=0.0,
-    reasons=[],
-)
 
 
 def estimate_plane(image, K, min_confidence: float = CONFIDENCE_THRESHOLD) -> PlaneResult:
@@ -126,5 +148,5 @@ def estimate_plane_manual(image_pts, aspect_ratio=None, size_mm=None,
                                     size_mm=size_mm,
                                     assume_calibrated=assume_calibrated,
                                     K=K, image_size=image_size)
-    return PlaneResult(H=H, confidence=MANUAL_CONFIDENCE,
+    return PlaneResult(H=H, confidence=_manual_confidence(),
                        method=METHOD_MANUAL_FOUR_POINT, needs_operator=False)

@@ -1,15 +1,21 @@
-import math
-
+import cv2
 import numpy as np
 import pytest
 
 from facade_digitizer.pipeline.plane import estimate_plane, estimate_plane_manual
 from tests.test_homography import CORNERS, apply
-from tests.test_synth import K, make_scene
+from tests.test_synth import SIZE, K, make_rich_scene, make_scene
+
+# «Хороший случай» берётся на ОБОГАЩЁННОЙ сцене. На бедной доверие измерено равным
+# 0.5597 при пороге 0.5, а неустойчивость направления — 0.355° при отсечке 0.40°,
+# то есть бедная сцена сидит вплотную к решающей отсечке задачи 7: такой тест упал
+# бы от любого ухудшения оценки точек схода, не сказав, что сломалась не
+# оркестрация. На обогащённой доверие 0.7389 и неустойчивость 0.158°. Близость
+# бедной сцены к отсечке зафиксирована отдельной характеризующей проверкой ниже.
 
 
 def test_plane_is_estimated_on_a_good_scene():
-    sc = make_scene()
+    sc = make_rich_scene()
     res = estimate_plane(sc.render(), K)
     assert res.method == "vanishing_points"
     assert not res.needs_operator
@@ -18,7 +24,7 @@ def test_plane_is_estimated_on_a_good_scene():
 
 def test_estimated_homography_rectifies_the_facade():
     """Гомография проверяется по существу, а не по факту непустоты."""
-    sc = make_scene()
+    sc = make_rich_scene()
     res = estimate_plane(sc.render(), K)
     r = apply(res.H, sc.project(CORNERS))
     a, b = r[1] - r[0], r[3] - r[0]
@@ -37,7 +43,7 @@ def test_low_confidence_requests_the_operator_instead_of_guessing():
 
 def test_vanishing_points_are_carried_out_for_the_pose_step():
     """Позу считает сборка конвейера, поэтому точки схода обязаны выйти наружу."""
-    sc = make_scene()
+    sc = make_rich_scene()
     res = estimate_plane(sc.render(), K)
     assert res.vh is not None and res.vv is not None
     assert np.asarray(res.vh).shape == (3,)
@@ -68,16 +74,56 @@ def test_manual_confidence_is_not_borrowed_from_the_automatic_path():
 
 def test_threshold_is_honoured():
     """Порог доверия действительно решает, а не декоративен."""
-    sc = make_scene()
+    sc = make_rich_scene()
     strict = estimate_plane(sc.render(), K, min_confidence=0.999)
     assert strict.needs_operator
     assert strict.H is None
 
 
-# Три проверки ниже добавлены сверх набора брифа: мутационная проверка показала, что
-# восемь тестов брифа переживают мутации решений, которые бриф не описывал, — «порог
+# Проверки ниже добавлены сверх набора брифа: мутационная проверка показала, что
+# восемь тестов брифа переживают мутации решений, которых бриф не описывал, — «порог
 # отключается аргументом», «отказ всё равно отдаёт точки схода», «ручное доверие
 # записывает правдоподобные измеренные числа».
+
+# Шаг сетки и размер угла фасада для сгрудившегося пучка. Подобраны измерением:
+# при них метрика доверия называет ровно одну причину — «поддержавшие отрезки
+# занимают малую долю кадра», — а сами точки схода остаются безупречными
+# (ортогональность 89.9°), и гомография по ним СТРОИТСЯ. Это и нужно: мутант,
+# снявший причины из условия отказа, доживает до утверждения, а не падает раньше.
+CLUSTER_CORNER_MM = 3000.0
+CLUSTER_STEP_MM = 500.0
+
+
+def render_clustered_bundle():
+    """Кадр с геометрически безупречными отрезками, сгрудившимися в одном углу.
+
+    Прямые идут вдоль осей фасада и спроецированы той же сценой, поэтому их точки
+    схода — истинные точки схода фасада, а не приближение. Порочен здесь не пучок,
+    а его расположение: середины поддержавших отрезков занимают малую долю кадра,
+    и метрика доверия отказывает по НАЗВАННОЙ причине, не вырождаясь.
+    """
+    sc = make_scene()
+    img = np.full((SIZE[1], SIZE[0]), 200, dtype=np.uint8)
+    for t in np.arange(CLUSTER_STEP_MM, CLUSTER_CORNER_MM + 1.0, CLUSTER_STEP_MM):
+        for line in (np.array([[0.0, t], [CLUSTER_CORNER_MM, t]]),
+                     np.array([[t, 0.0], [t, CLUSTER_CORNER_MM]])):
+            p = sc.project(line)
+            cv2.line(img, tuple(np.round(p[0]).astype(int)),
+                     tuple(np.round(p[1]).astype(int)), 60, 1)
+    return img
+
+
+def test_the_clustered_bundle_is_a_valid_probe():
+    """Охрана самой пробы: пучок отвергается ПО ПРИЧИНЕ, а не по вырождению.
+
+    Без этой проверки соседний тест мог бы «работать» на входе, где точки схода
+    вырождены: тогда он подтверждал бы не запрет догадки, а невозможность её
+    построить. Здесь же точки схода истинные — ортогональность держится у 90°.
+    """
+    res = estimate_plane(render_clustered_bundle(), K)
+    assert res.confidence.reasons == ["поддержавшие отрезки занимают малую долю кадра"]
+    assert res.confidence.support_h >= 2 and res.confidence.support_v >= 2
+    assert res.confidence.orthogonality_deg == pytest.approx(90.0, abs=1.0)
 
 
 def test_a_named_reason_refuses_at_any_threshold():
@@ -86,9 +132,13 @@ def test_a_named_reason_refuses_at_any_threshold():
     Порог — не единственная охрана: непустой список причин означает, что метрика
     доверия отвергла вход по существу, и такой вход не годится ни при каком пороге.
     Иначе один аргумент вызывающего кода снимал бы весь запрет на догадку.
+
+    Вход подобран так, чтобы утверждение сработало НА ДЕЛЕ: на шумовом кадре код,
+    снявший причины из условия, падал бы внутри построения гомографии по
+    вырожденным точкам схода — убийство мутанта случалось бы по исключению, а не по
+    проверяемой причине, и уцелело бы только до ближайшей смены пути отказа.
     """
-    noise = np.random.default_rng(1).integers(0, 255, (600, 600), dtype=np.uint8)
-    res = estimate_plane(noise, K, min_confidence=0.0)
+    res = estimate_plane(render_clustered_bundle(), K, min_confidence=0.0)
     assert res.confidence.reasons
     assert res.needs_operator
     assert res.H is None
@@ -106,15 +156,54 @@ def test_refusal_does_not_hand_out_untrusted_vanishing_points():
     assert res.vh is None and res.vv is None
 
 
-def test_manual_confidence_does_not_fake_measured_numbers():
-    """Величины, которых ручной путь не измерял, записаны как NaN.
+def test_manual_confidence_cannot_slip_through_a_threshold_guard():
+    """Неизмеренные величины ручного пути равны `None`, и это проверяется охраной.
 
     Нулевая невязка и ровно 90° — правдоподобные ИЗМЕРЕННЫЕ значения: потребитель
-    не отличил бы их от настоящих и решил бы, что плоскость подтверждена
-    измерением. NaN отличим сразу. Пустого списка причин для этого мало — он
-    одинаков у ручного пути и у безупречного автоматического.
+    не отличил бы их от настоящих. `NaN` отличим глазом, но не охраной: сравнение с
+    ним ложно, и проверка вида `residual_px > X` пропустила бы ручной путь молча.
+    Поэтому проверяется не только само значение, но и ПОВЕДЕНИЕ под охраной —
+    сравнение обязано падать, а не возвращать ложь.
     """
     pts = np.array([[100.0, 100.0], [900.0, 120.0], [880.0, 700.0], [120.0, 690.0]])
     res = estimate_plane_manual(pts, aspect_ratio=2.0)
-    assert math.isnan(res.confidence.residual_px)
-    assert math.isnan(res.confidence.orthogonality_deg)
+    assert res.confidence.residual_px is None
+    assert res.confidence.orthogonality_deg is None
+    with pytest.raises(TypeError):
+        _ = res.confidence.residual_px > 0.5        # охрана «велика невязка»
+    with pytest.raises(TypeError):
+        _ = res.confidence.orthogonality_deg < 75.0  # охрана «не ортогональны"
+
+
+def test_manual_confidence_is_not_shared_between_results():
+    """Доверие ручного пути строится заново на каждый вызов.
+
+    Общая на модуль константа была бы изменяемой через `reasons`: дописанная одним
+    потребителем причина появилась бы у всех результатов, включая уже отданные.
+    """
+    pts = np.array([[100.0, 100.0], [900.0, 120.0], [880.0, 700.0], [120.0, 690.0]])
+    first = estimate_plane_manual(pts, aspect_ratio=2.0).confidence
+    second = estimate_plane_manual(pts, aspect_ratio=2.0).confidence
+    first.reasons.append("дописано потребителем")
+    assert second.reasons == []
+
+
+def test_the_sparse_scene_sits_close_to_the_cutoff():
+    """ХАРАКТЕРИЗУЮЩАЯ проверка: не требование к системе, а зафиксированный факт.
+
+    Бедная сцена проходит порог, но еле-еле. Измерено: доверие 0.5597 против 0.7389
+    у обогащённой при пороге 0.5; неустойчивость направления 0.355° при отсечке
+    0.40°; вертикальный пучок поддержан 8 отрезками против 48. Причина видна:
+    вертикальных прямых на бедной сцене почти нет — только кромки единственного
+    проёма.
+
+    Тест существует ради того, чтобы близость к отсечке была записана, а не
+    обнаружилась когда-нибудь падением «хорошего случая». Если он упадёт, это
+    означает не поломку оркестрации, а смену поведения оценщика точек схода —
+    и число здесь надо ПЕРЕИЗМЕРИТЬ, а не подогнать.
+    """
+    sparse = estimate_plane(make_scene().render(), K).confidence
+    rich = estimate_plane(make_rich_scene().render(), K).confidence
+    assert 0.5 < sparse.value < 0.6            # измерено 0.5597: запас меньше 0.1
+    assert rich.value - sparse.value > 0.1     # измерено 0.7389 против 0.5597
+    assert sparse.support_v * 3 < rich.support_v   # измерено 8 против 48
