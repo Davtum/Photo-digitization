@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from facade_digitizer.geometry.homography import (
+    _ORIENTATION_MIN_RELATIVE,
     _rectified_x_grows_with_image_x,
     camera_pose,
     foot_point_in_rectified,
@@ -26,9 +27,28 @@ CALIBRATED_NEEDS_K = "для assume_calibrated нужны K и image_size"
 # обязаны их различать: «центр кадра на линии схода» и «градиент вырожден».
 CENTRE_NOT_IN_FRONT = "центр кадра не лежит перед плоскостью фасада"
 GRADIENT_DEGENERATE = "градиент ректифицированной X в центре кадра вырожден"
+CENTRE_NOT_FINITE = "образ центра кадра неконечен"
+FOOT_NOT_CONSISTENT = "образ точки схода нормали вырожден"
+TOO_MANY_DISAMBIGUATIONS = "доопределение должно быть ровно одно"
 
 REFUSAL_PATTERNS = (FOUR_POINT_UNDERDETERMINED, CALIBRATED_NEEDS_K,
-                    CENTRE_NOT_IN_FRONT, GRADIENT_DEGENERATE)
+                    CENTRE_NOT_IN_FRONT, GRADIENT_DEGENERATE,
+                    CENTRE_NOT_FINITE, FOOT_NOT_CONSISTENT,
+                    TOO_MANY_DISAMBIGUATIONS)
+
+# Допуски для ТОЧНЫХ точек схода. Истинная невязка на этих ракурсах — единицы ULP
+# (до 3.6e-12 мм по опорной точке) и 3e-16 относительно по расстоянию. Прежние
+# `abs=1.0` и `rel=0.02` были шире истинной невязки на одиннадцать и четырнадцать
+# порядков: систематический сдвиг `cz` в один процент — а это масштаб всего
+# измерительного слоя — проходил сквозь них молча.
+EXACT_FOOT_ABS_MM = 1e-9
+EXACT_DISTANCE_REL = 1e-12
+
+# Околоплоскостные ракурсы обусловлены хуже: при 0.001 мм от плоскости невязка
+# опорной точки доходит до 5e-5 мм, расстояния — до 5.5e-9 относительно. Допуск
+# всё равно на пять порядков уже однопроцентного сдвига.
+NEAR_PLANE_FOOT_ABS_MM = 1e-3
+NEAR_PLANE_DISTANCE_REL = 1e-7
 
 # Почти рёберный ракурс: камера в 200 мм от плоскости и в 20 м вбок. Линия схода
 # плоскости проходит в 36 px от главной точки — ближе, чем прежний фиксированный
@@ -44,6 +64,29 @@ def exact_vps(sc):
 def apply(H, pts):
     p = np.column_stack([np.atleast_2d(pts), np.ones(len(np.atleast_2d(pts)))]) @ H.T
     return p[:, :2] / p[:, 2:3]
+
+
+# Шаг центральной разности. Независимый измеритель наклона: формула кода здесь
+# сознательно НЕ повторяется — тест, переписывающий правило из кода, подтверждает
+# только то, что его удалось переписать, и переживает согласованную ошибку в нём.
+NUMERIC_STEP_PX = 1.0
+
+
+def numeric_x_slope(H, u, v, axis=0, step=NUMERIC_STEP_PX):
+    """Численная производная ректифицированной X по координате кадра.
+
+    Центральная разность с фиксированным шагом, без обращения к внутренностям
+    `homography.py`: гомография применяется как чёрный ящик.
+    """
+    offset = np.zeros(3)
+    offset[axis] = step
+
+    def x_rect(point):
+        p = H @ point
+        return p[0] / p[2]
+
+    base = np.array([u, v, 1.0])
+    return (x_rect(base + offset) - x_rect(base - offset)) / (2.0 * step)
 
 
 def test_rectification_restores_right_angles_and_ratio():
@@ -88,11 +131,12 @@ def test_camera_pose_recovered_against_known_truth(dx, dy, dist):
     r = apply(H, sc.project(CORNERS))
     mmu = 20000.0 / np.linalg.norm(r[1] - r[0])
 
-    got = camera_pose(H, vh, vv, K, mmu, tuple(r[0]))
+    got, half_turn = camera_pose(H, vh, vv, K, mmu, tuple(r[0]))
     truth = sc.camera_on_plane()
-    assert got.cx == pytest.approx(truth.cx, abs=1.0)
-    assert got.cy == pytest.approx(truth.cy, abs=1.0)
-    assert got.cz == pytest.approx(truth.cz, rel=0.02)
+    assert half_turn.resolved is False
+    assert got.cx == pytest.approx(truth.cx, abs=EXACT_FOOT_ABS_MM)
+    assert got.cy == pytest.approx(truth.cy, abs=EXACT_FOOT_ABS_MM)
+    assert got.cz == pytest.approx(truth.cz, rel=EXACT_DISTANCE_REL)
 
 
 def test_four_point_requires_disambiguation():
@@ -231,7 +275,7 @@ def recover(sc, vh, vv):
     H = homography_from_vanishing_points(vh, vv, K, SIZE)
     r = apply(H, sc.project(CORNERS))
     mmu = 20000.0 / np.linalg.norm(r[1] - r[0])
-    return r, camera_pose(H, vh, vv, K, mmu, tuple(r[0]))
+    return r, camera_pose(H, vh, vv, K, mmu, tuple(r[0])).camera
 
 
 @pytest.mark.parametrize("sh,sv", [(-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)])
@@ -274,9 +318,9 @@ def test_orientation_survives_a_grazing_view_that_defeats_a_fixed_pixel_probe():
     assert r[3, 1] < r[0, 1]      # Y вниз
 
     truth = sc.camera_on_plane()
-    assert got.cx == pytest.approx(truth.cx, abs=1.0)
-    assert got.cy == pytest.approx(truth.cy, abs=1.0)
-    assert got.cz == pytest.approx(truth.cz, rel=0.02)
+    assert got.cx == pytest.approx(truth.cx, abs=EXACT_FOOT_ABS_MM)
+    assert got.cy == pytest.approx(truth.cy, abs=EXACT_FOOT_ABS_MM)
+    assert got.cz == pytest.approx(truth.cz, rel=EXACT_DISTANCE_REL)
 
 
 def test_grazing_view_really_is_the_hard_case():
@@ -299,13 +343,14 @@ def test_grazing_view_really_is_the_hard_case():
     H = homography_from_vanishing_points(*exact_vps(sc), K, SIZE)
     w, h = SIZE
     p = H @ np.array([w / 2.0, h / 2.0, 1.0])
-    dp = H @ np.array([1.0, 0.0, 0.0])
-    numerator = dp[0] * p[2] - p[0] * dp[2]
-    magnitude = abs(dp[0] * p[2]) + abs(p[0] * dp[2])
-
-    assert np.all(np.isfinite(p)) and np.all(np.isfinite(dp))
+    assert np.all(np.isfinite(p))
     assert p[2] > 0                                    # центр кадра перед плоскостью
-    assert abs(numerator) > 0.5 * magnitude            # производная далека от вырождения
+
+    # Производная считается ЧИСЛЕННО, независимо от формулы кода: согласованно
+    # неверная формула переписанную проверку пережила бы.
+    slope = numeric_x_slope(H, w / 2.0, h / 2.0)
+    assert np.isfinite(slope)
+    assert abs(slope) > 1e-3                           # далека от вырождения
 
 
 def test_camera_lying_in_the_facade_plane_is_refused():
@@ -321,14 +366,16 @@ def test_camera_lying_in_the_facade_plane_is_refused():
     assert not re.search(GRADIENT_DEGENERATE, str(excinfo.value))
 
 
-@pytest.mark.parametrize("dist_mm", [200.0, 5.0, 2.0, 0.1, 0.001])
+@pytest.mark.parametrize("dist_mm", [200.0, 5.0, 2.0, 0.1, 0.001, 1e-11])
 def test_analytic_criterion_works_arbitrarily_close_to_the_plane(dist_mm):
-    """Аналитический признак не имеет нижней границы по расстоянию до плоскости.
+    """Аналитический признак почти не имеет нижней границы по расстоянию.
 
-    Лестница проб её имела: при 2 мм линия схода (около 0.36 px от главной точки)
+    Лестница проб её имела на 2 мм: линия схода (около 0.36 px от главной точки)
     оказывалась ближе наименьшей пробы (0.42 px), и доопределение отказывало.
-    Производная берётся в самом центре и такой границы не знает — отказ остаётся
-    только при расстоянии ровно нуль, когда знаменатель обращается в нуль точно.
+    Производная берётся в самом центре и такой границы не знает. Граница всё же
+    есть, но лежит на одиннадцать порядков ниже: 1e-11 мм ещё работает, 1e-12 мм
+    уже отвергается (соседний тест). Формулировка «отказ только при расстоянии
+    ровно нуль» была бы шире измеренного.
     """
     sc = make_scene(-20000.0, 0.0, dist_mm)
     r, got = recover(sc, *exact_vps(sc))
@@ -336,9 +383,22 @@ def test_analytic_criterion_works_arbitrarily_close_to_the_plane(dist_mm):
     assert r[1, 0] > r[0, 0]
     assert r[3, 1] < r[0, 1]
     truth = sc.camera_on_plane()
-    assert got.cx == pytest.approx(truth.cx, abs=1.0)
-    assert got.cy == pytest.approx(truth.cy, abs=1.0)
-    assert got.cz == pytest.approx(truth.cz, rel=0.02)
+    assert got.cx == pytest.approx(truth.cx, abs=NEAR_PLANE_FOOT_ABS_MM)
+    assert got.cy == pytest.approx(truth.cy, abs=NEAR_PLANE_FOOT_ABS_MM)
+    assert got.cz == pytest.approx(truth.cz, rel=NEAR_PLANE_DISTANCE_REL)
+
+
+@pytest.mark.parametrize("dist_mm", [1e-12, 1e-13, 0.0])
+def test_refusal_boundary_near_the_plane_is_where_it_was_measured(dist_mm):
+    """Граница отказа названа измеренным числом, а не «ровно нулём».
+
+    При таком расстоянии знаменатель гомографии в центре кадра перестаёт быть
+    положительным, и доопределение отвергается явно. Соседний тест показывает,
+    что 1e-11 мм ещё работает: граница закреплена с обеих сторон.
+    """
+    sc = make_scene(-20000.0, 0.0, dist_mm)
+    with pytest.raises(ValueError, match=CENTRE_NOT_IN_FRONT):
+        homography_from_vanishing_points(*exact_vps(sc), K, SIZE)
 
 
 def test_degenerate_gradient_is_refused_by_name():
@@ -378,7 +438,8 @@ def rolled_scene(roll_deg):
                           roll @ base.R_wc, K, SIZE)
 
 
-@pytest.mark.parametrize("roll_deg", [0.0, 45.0, -45.0, 89.0, -89.0, 90.0])
+@pytest.mark.parametrize("roll_deg",
+                         [0.0, 45.0, -45.0, 89.0, -89.0, -89.999, -89.9999, 90.0])
 def test_orientation_is_correct_for_any_roll_within_the_rule(roll_deg):
     """Крен камеры в (-90, +90]: правило применимо, поза обязана совпасть с истиной.
 
@@ -395,9 +456,9 @@ def test_orientation_is_correct_for_any_roll_within_the_rule(roll_deg):
 
     assert np.all(np.isfinite(r))
     truth = sc.camera_on_plane()
-    assert got.cx == pytest.approx(truth.cx, abs=1.0)
-    assert got.cy == pytest.approx(truth.cy, abs=1.0)
-    assert got.cz == pytest.approx(truth.cz, rel=0.02)
+    assert got.cx == pytest.approx(truth.cx, abs=EXACT_FOOT_ABS_MM)
+    assert got.cy == pytest.approx(truth.cy, abs=EXACT_FOOT_ABS_MM)
+    assert got.cz == pytest.approx(truth.cz, rel=EXACT_DISTANCE_REL)
 
 
 def test_quarter_turn_roll_is_exactly_where_the_fallback_takes_over():
@@ -409,30 +470,42 @@ def test_quarter_turn_roll_is_exactly_where_the_fallback_takes_over():
     путь ещё работает. Без этой проверки запасной путь мог бы незаметно стать
     основным — или, наоборот, перестать вызываться вовсе.
     """
-    def relative_derivatives(roll_deg):
+    def numeric_slopes(roll_deg):
+        """Оба наклона, измеренные численно — без формулы из кода."""
         sc = rolled_scene(roll_deg)
         vh = K @ (sc.R_wc @ np.array([1.0, 0, 0]))
         vv = K @ (sc.R_wc @ np.array([0, 1.0, 0]))
         H = homography_from_vanishing_points(vh, vv, K, SIZE)
-        p = H @ np.array([SIZE[0] / 2.0, SIZE[1] / 2.0, 1.0])
-        out = []
-        for direction in (np.array([1.0, 0, 0]), np.array([0, 1.0, 0])):
-            dp = H @ direction
-            numerator = dp[0] * p[2] - p[0] * dp[2]
-            magnitude = abs(dp[0] * p[2]) + abs(p[0] * dp[2])
-            assert np.isfinite(numerator) and magnitude > 0
-            out.append(abs(numerator) / magnitude)
-        return out
+        u, v = SIZE[0] / 2.0, SIZE[1] / 2.0
+        by_u = numeric_x_slope(H, u, v, axis=0)
+        by_v = numeric_x_slope(H, u, v, axis=1)
+        assert np.isfinite(by_u) and np.isfinite(by_v)
+        return by_u, by_v
 
-    by_u_at_90, by_v_at_90 = relative_derivatives(90.0)
-    assert by_u_at_90 < 1e-12       # основной путь вырожден
-    assert by_v_at_90 > 0.5         # запасной путь полновесен
+    by_u_at_90, by_v_at_90 = numeric_slopes(90.0)
+    assert abs(by_u_at_90) < 1e-15      # основной путь вырожден: чистый шум
+    assert abs(by_v_at_90) > 1e-5       # запасной путь полновесен
 
-    by_u_at_89, _ = relative_derivatives(89.0)
-    assert by_u_at_89 > 1e-12       # при 89 градусах основной путь ещё работает
+    by_u_at_89, by_v_at_89 = numeric_slopes(89.0)
+    assert abs(by_u_at_89) > 1e-7       # при 89 градусах основной путь ещё работает
+
+    # Порог сверяется с КОНСТАНТОЙ МОДУЛЯ, а не с переписанным литералом.
+    relative_at_90 = abs(by_u_at_90) / abs(by_v_at_90)
+    relative_at_89 = abs(by_u_at_89) / abs(by_v_at_89)
+    assert relative_at_90 < _ORIENTATION_MIN_RELATIVE
+    assert relative_at_89 > _ORIENTATION_MIN_RELATIVE
+
+    # Сверки с константой мало: она обязана быть НЕСУЩЕЙ. Крен -89.999 держит её
+    # снизу — там относительная величина 2.3e-4, а основной и запасной пути дают
+    # РАЗНЫЕ знаки, поэтому поднятие порога выше 2.3e-4 включило бы запасной путь
+    # и перевернуло ответ. Сам ответ проверяется в тесте области применимости,
+    # куда этот крен внесён; здесь закрепляется зазор.
+    by_u_near, by_v_near = numeric_slopes(-89.999)
+    relative_at_minus_89_999 = abs(by_u_near) / abs(by_v_near)
+    assert _ORIENTATION_MIN_RELATIVE < relative_at_minus_89_999 < 1e-3
 
 
-@pytest.mark.parametrize("roll_deg", [180.0, -90.0, 135.0])
+@pytest.mark.parametrize("roll_deg", [91.0, 135.0, 180.0, -90.0])
 def test_roll_outside_the_rule_turns_the_result_by_half_a_circle(roll_deg):
     """ГРАНИЦА ПОСТАНОВКИ, а не дефект реализации. Закреплена намеренно.
 
@@ -456,7 +529,153 @@ def test_roll_outside_the_rule_turns_the_result_by_half_a_circle(roll_deg):
 
     assert np.all(np.isfinite(r))
     # Поворот на 180 градусов вокруг начала фасада: обе координаты меняют знак.
-    assert got.cx == pytest.approx(-truth.cx, abs=1.0)
-    assert got.cy == pytest.approx(-truth.cy, abs=1.0)
+    assert got.cx == pytest.approx(-truth.cx, abs=EXACT_FOOT_ABS_MM)
+    assert got.cy == pytest.approx(-truth.cy, abs=EXACT_FOOT_ABS_MM)
     # Расстояние до плоскости поворотом не затрагивается и остаётся верным.
-    assert got.cz == pytest.approx(truth.cz, rel=0.02)
+    assert got.cz == pytest.approx(truth.cz, rel=EXACT_DISTANCE_REL)
+
+
+# --- Успешная ветка assume_calibrated и незакрытые охраны ------------------------
+
+
+def test_four_point_calibrated_variant_reproduces_the_vanishing_point_result():
+    """Успешная ветка `assume_calibrated`, а не только её отказ.
+
+    Четыре угла фасада в кадре задают те же два пучка, что и точки схода, поэтому
+    результат обязан совпасть с `homography_from_vanishing_points` на тех же осях.
+    Прежде проверялся только отказ, и подмена `vh` на `vv` внутри ветки проходила
+    незамеченной.
+    """
+    sc = make_scene()
+    image_pts = sc.project(CORNERS)
+
+    H = homography_from_four_points(image_pts, assume_calibrated=True,
+                                    K=K, image_size=SIZE)
+    r = apply(H, image_pts)
+
+    # Прямые углы и отношение сторон фасада 20000 x 15000.
+    a, b = r[1] - r[0], r[3] - r[0]
+    ang = np.degrees(np.arccos(abs(a @ b) / (np.linalg.norm(a) * np.linalg.norm(b))))
+    assert ang == pytest.approx(90.0, abs=1e-6)
+    assert np.linalg.norm(a) / np.linalg.norm(b) == pytest.approx(20000.0 / 15000.0, rel=1e-9)
+
+    # Ориентация растра та же, что у основного пути.
+    assert r[1, 0] > r[0, 0]
+    assert r[3, 1] < r[0, 1]
+
+    # И та же поза. Это и есть различитель подмены vh на vv: при перестановке
+    # пучков оси меняются местами и опорная точка уезжает.
+    mmu = 20000.0 / np.linalg.norm(r[1] - r[0])
+    got, _ = camera_pose(H, *exact_vps(sc), K, mmu, tuple(r[0]))
+    truth = sc.camera_on_plane()
+    assert got.cx == pytest.approx(truth.cx, abs=1e-6)
+    assert got.cy == pytest.approx(truth.cy, abs=1e-6)
+    assert got.cz == pytest.approx(truth.cz, rel=1e-9)
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"assume_calibrated": True, "K": None, "image_size": SIZE},
+    {"assume_calibrated": True, "K": K, "image_size": None},
+])
+def test_calibrated_variant_needs_both_k_and_image_size(kwargs):
+    """Нужны ОБА аргумента. Проверка `K is None or image_size is None`.
+
+    С `and` вместо `or` каждый из этих двух вызовов прошёл бы охрану насквозь.
+    """
+    pts = np.array([[100.0, 100.0], [900.0, 120.0], [880.0, 700.0], [120.0, 690.0]])
+    with pytest.raises(ValueError, match=CALIBRATED_NEEDS_K):
+        homography_from_four_points(pts, **kwargs)
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"aspect_ratio": 2.0, "size_mm": (1460.0, 1900.0)},
+    {"aspect_ratio": 2.0, "assume_calibrated": True, "K": K, "image_size": SIZE},
+    {"size_mm": (1460.0, 1900.0), "assume_calibrated": True, "K": K, "image_size": SIZE},
+])
+def test_four_point_rejects_more_than_one_disambiguation(kwargs):
+    """Противоречивый вход отвергается, а не толкуется.
+
+    `given` прежде сравнивалась только с нулём, то есть использовалась по знаку:
+    при двух доопределениях сразу одно молча отбрасывалось (ветка размеров берёт
+    `size_mm` и на `aspect_ratio` не смотрит).
+    """
+    pts = np.array([[100.0, 100.0], [900.0, 120.0], [880.0, 700.0], [120.0, 690.0]])
+    with pytest.raises(ValueError, match=TOO_MANY_DISAMBIGUATIONS) as excinfo:
+        homography_from_four_points(pts, **kwargs)
+    assert not re.search(FOUR_POINT_UNDERDETERMINED, str(excinfo.value))
+
+
+def test_zero_vanishing_point_is_refused_instead_of_yielding_nan():
+    """Нулевая точка схода: нормировка делит на нуль и даёт nan по всей матрице.
+
+    Путь не умозрительный — именно так выглядит вырожденная оценка. Без охраны
+    конечности сравнение `p[2] <= 0` на nan ложно, и доопределение пошло бы
+    дальше по мусору.
+    """
+    sc = make_scene()
+    _, vv = exact_vps(sc)
+    # Деление на нуль здесь — предмет проверки, а не неожиданность.
+    with np.errstate(all="ignore"),             pytest.raises(ValueError, match=CENTRE_NOT_FINITE) as excinfo:
+        homography_from_vanishing_points(np.zeros(3), vv, K, SIZE)
+    assert not re.search(CENTRE_NOT_IN_FRONT, str(excinfo.value))
+
+
+def test_non_finite_derivative_does_not_decide_the_sign():
+    """Охрана конечности ВНУТРИ перебора направлений.
+
+    Матрица подобрана так, чтобы образ центра кадра остался конечным и лежал
+    перед плоскостью, а числитель производной обратился в nan через inf - inf.
+    Без охраны `abs(nan) <= порог` ложно, и функция вернула бы `nan > 0`, то есть
+    знак наугад; с охраной — переходит к следующему направлению и отказывает.
+    """
+    big = 1e200
+    broken = np.array([[big, 0.0, 1.0],
+                       [0.0, 0.0, 1.0],
+                       [big, 0.0, 1.0]])
+    with np.errstate(all="ignore"):          # переполнение — предмет проверки
+        centre = broken @ np.array([SIZE[0] / 2.0, SIZE[1] / 2.0, 1.0])
+        derivative = broken @ np.array([1.0, 0.0, 0.0])
+        assert np.all(np.isfinite(centre)) and centre[2] > 0
+        assert np.all(np.isfinite(derivative))
+        assert not np.isfinite(derivative[0] * centre[2] - centre[0] * derivative[2])
+
+        with pytest.raises(ValueError, match=GRADIENT_DEGENERATE):
+            _rectified_x_grows_with_image_x(broken, SIZE)
+
+
+@pytest.mark.parametrize("bad_H", [
+    np.zeros((3, 3)),
+    np.full((3, 3), np.nan),
+])
+def test_foot_point_refuses_a_homography_that_does_not_match(bad_H):
+    """Охрана в `foot_point_in_rectified`, заменившая мёртвую.
+
+    Прежняя `abs(p[2]) < 1e-12` с сообщением «фасад строго фронтален» не
+    срабатывала никогда: для согласованной гомографии третья компонента
+    тождественно равна +-1, а фронтальность её не вырождает. На nan прежняя
+    охрана вдобавок молчала и возвращала (nan, nan).
+    """
+    sc = make_scene()
+    vh, vv = exact_vps(sc)
+    with np.errstate(all="ignore"),             pytest.raises(ValueError, match=FOOT_NOT_CONSISTENT):
+        foot_point_in_rectified(bad_H, vh, vv, K)
+
+
+def test_foot_point_third_component_is_unit_for_a_matching_homography():
+    """Почему прежняя охрана была мертва — закреплено измерением.
+
+    Для согласованной гомографии образ точки схода нормали имеет третью
+    компоненту ровно +-1 на любом ракурсе, включая строго фронтальный, который
+    прежнее сообщение называло причиной вырождения.
+    """
+    for dx, dy, dist in [(0.0, 0.0, 12000.0), (3000.0, -2000.0, 12000.0),
+                         (-20000.0, 0.0, 200.0)]:
+        sc = make_scene(dx, dy, dist)
+        vh, vv = exact_vps(sc)
+        H = homography_from_vanishing_points(vh, vv, K, SIZE)
+        d1, d2 = np.linalg.inv(K) @ vh, np.linalg.inv(K) @ vv
+        d1 = d1 / np.linalg.norm(d1)
+        d2 = d2 - (d2 @ d1) * d1
+        d2 = d2 / np.linalg.norm(d2)
+        third = (H @ (K @ np.cross(d1, d2)))[2]
+        assert abs(third) == pytest.approx(1.0, rel=1e-12)
