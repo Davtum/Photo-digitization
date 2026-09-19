@@ -148,3 +148,67 @@ def test_boundary_arguments_are_accepted(img):
     """Охрана не должна отвергать рабочий вход: крайние допустимые значения проходят."""
     assert assess(img, 3.1, 4.6, 0.0, usable=1.0).verdict == "ok"
     assert assess(img, 4.6, 4.6, 90.0, usable=0.0).verdict == "degraded"
+
+
+def test_empty_image_is_a_caller_error():
+    """Пустой кадр давал nan в резкости и вердикт «с оговоркой» без внятной причины."""
+    for bad in (np.zeros((0, 0), np.uint8), np.zeros((0, 16), np.uint8), np.array([])):
+        with pytest.raises(ValueError, match="изображение"):
+            assess(bad, 3.1, 4.6, 22.0)
+
+
+def test_non_2d_image_is_a_caller_error():
+    """Шлюз меряет резкость полутонового кадра; трёхканальный массив сюда не доходит."""
+    with pytest.raises(ValueError, match="изображение"):
+        assess(np.zeros((32, 32, 3), np.uint8), 3.1, 4.6, 22.0)
+    with pytest.raises(ValueError, match="изображение"):
+        assess(np.zeros(32, np.uint8), 3.1, 4.6, 22.0)
+
+
+def test_non_numeric_image_is_a_caller_error():
+    """Список и массив объектов: np.isfinite на них поднял бы TypeError из внутренностей."""
+    for bad in ([[1, 2], [3, 4]], None, np.array([[None, 1], [2, 3]], dtype=object)):
+        with pytest.raises(ValueError, match="изображение"):
+            assess(bad, 3.1, 4.6, 22.0)
+
+
+def test_non_finite_pixels_are_a_caller_error():
+    frame = np.full((32, 32), 100.0)
+    frame[5, 5] = np.nan
+    with pytest.raises(ValueError, match="изображение"):
+        assess(frame, 3.1, 4.6, 22.0)
+
+
+def test_valid_frames_of_both_kinds_are_accepted(img):
+    """Охрана не должна отвергать рабочий кадр: и uint8, и float проходят."""
+    assert assess(img, 3.1, 4.6, 22.0).verdict == "ok"
+    assert assess(img.astype(np.float64), 3.1, 4.6, 22.0).verdict == "ok"
+
+
+REFUSALS = {
+    "gsd_min": lambda img: assess(img, float("nan"), 4.6, 22.0),
+    "gsd_max": lambda img: assess(img, 3.1, float("nan"), 22.0),
+    "theta_p95": lambda img: assess(img, 3.1, 4.6, float("nan")),
+    "usable": lambda img: assess(img, 3.1, 4.6, 22.0, usable=float("nan")),
+    "переставлены": lambda img: assess(img, 5.0, 4.6, 22.0),
+    "изображение": lambda img: assess(np.zeros((0, 0), np.uint8), 3.1, 4.6, 22.0),
+}
+
+
+def test_refusal_messages_do_not_overlap(img):
+    """Подстроки из match= взаимно исключительны: иначе тест зеленеет по чужому отказу.
+
+    Проверяется, что каждая подстрока встречается ровно в одном сообщении из всех, и что
+    ни одна не содержит вертикальной черты, которую match= прочитал бы как альтернативу.
+    """
+    messages = {}
+    for key, call in REFUSALS.items():
+        assert "|" not in key
+        with pytest.raises(ValueError) as exc:
+            call(img)
+        messages[key] = str(exc.value)
+        assert key in messages[key]
+
+    for key in REFUSALS:
+        hits = [k for k, message in messages.items() if key in message]
+        assert hits == [key], f"подстрока {key!r} подходит и к чужим отказам: {hits}"

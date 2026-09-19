@@ -62,6 +62,32 @@ def _number(name: str, value, low: float, high: float, low_inclusive: bool = Tru
     return v
 
 
+def _image(image) -> np.ndarray:
+    """Кадр на входе шлюза: двумерный, непустой, из чисел и без нечисловых отсчётов.
+
+    Пустой массив не бывает свойством снимка — это поломка вызывающего кода, и здесь
+    действует то же разграничение, что для числовых аргументов. Формально кадр проверяет
+    загрузка (задача 10), но шлюз стоит последним рубежом перед измерительным конвейером,
+    и полагаться на безошибочность цепочки выше нет оснований.
+    """
+    # Проверка типа и вида отсчётов слита в одно условие сознательно: np.isfinite на
+    # массиве объектов поднимает TypeError, а image.ndim на списке — AttributeError,
+    # и отказ был бы про внутренности шлюза вместо негодного аргумента. Принадлежность
+    # проверяется по кортежу, а не по строке "uif": пустая строка — её подстрока.
+    kind = image.dtype.kind if isinstance(image, np.ndarray) else ""
+    if kind not in ("u", "i", "f"):
+        raise ValueError(f"изображение: ожидался числовой массив numpy, "
+                         f"получено {type(image).__name__}")
+    if image.ndim != 2:
+        raise ValueError(f"изображение: ожидался двумерный полутоновый кадр, "
+                         f"получено измерений: {image.ndim}")
+    if image.size == 0:
+        raise ValueError("изображение: кадр пуст, измерять нечего")
+    if kind == "f" and not bool(np.isfinite(image).all()):
+        raise ValueError("изображение: среди отсчётов есть нечисловые или бесконечные")
+    return image
+
+
 def sharpness(image: np.ndarray) -> float:
     """Вариация лапласиана, нормированная на дисперсию яркости.
 
@@ -81,8 +107,9 @@ def assess(image: np.ndarray, gsd_min: float, gsd_max: float, theta_p95: float,
            usable: float = 1.0, thresholds: Thresholds | None = None) -> QualityReport:
     """Вердикт о пригодности снимка. Возвращает QualityReport (схема, раздел 10).
 
-    Поднимает ValueError, если числовые аргументы не описывают реальный снимок:
-    это поломка вызывающего кода, и маскировать её вердиктом нельзя.
+    Поднимает ValueError, если аргументы — числовые или сам кадр — не описывают реальный
+    снимок: это поломка вызывающего кода, и маскировать её вердиктом нельзя. Сообщения
+    об отказе не пересекаются между собой по подстрокам (см. тесты).
     """
     t = thresholds or DEFAULT
 
@@ -91,10 +118,14 @@ def assess(image: np.ndarray, gsd_min: float, gsd_max: float, theta_p95: float,
     theta_p95 = _number("theta_p95", theta_p95, 0.0, 90.0)
     usable = _number("usable", usable, 0.0, 1.0)
     if gsd_min > gsd_max:
-        raise ValueError(f"gsd_min {gsd_min} больше gsd_max {gsd_max}: границы переставлены")
+        raise ValueError(f"границы разрешения переставлены: {gsd_min} > {gsd_max} мм/px")
+
+    image = _image(image)
 
     reasons: list[str] = []
     sharp = sharpness(image)
+    if not math.isfinite(sharp):
+        raise ValueError(f"изображение: резкость неопределена ({sharp})")
     if sharp < t.sharpness_min:
         reasons.append(f"недостаточная резкость: {sharp:.2e} < {t.sharpness_min:.2e}")
     if gsd_max > t.gsd_max_mm_px:
