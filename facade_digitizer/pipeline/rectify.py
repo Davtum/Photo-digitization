@@ -84,24 +84,41 @@ def _frame_bounds_units(image, H_units):
     return corners.min(axis=0), corners.max(axis=0)
 
 
+def _bounds(span, mm_per_rect_unit):
+    """Границы масштаба по размахам образа кадра. Общий источник для отказа и для справки."""
+    return (float(span.max() * mm_per_rect_unit / MAX_SIDE_PX),
+            float(span.min() * mm_per_rect_unit))
+
+
+def _side(px):
+    """Сторона растра для сообщения об отказе; переполнение названо словом, а не `inf`."""
+    return f"{px:.0f}" if math.isfinite(px) else "переполнение"
+
+
 def attainable_mm_per_px(image, H_units, mm_per_rect_unit):
     """Границы `mm_per_px`, при которых растр получается возможного размера.
 
-    Возвращает пару (наименьшее, наибольшее), ОБЕ границы достижимы: на нижней
-    длинная сторона растра равна ровно `MAX_SIDE_PX`, на верхней короткая — ровно
-    одному пикселю. Величины нужны не для украшения сообщения об отказе: без них
-    вызывающий подбирает масштаб вслепую, а именно слепой подбор и породил растр
-    16x16 в редакции 1.
+    Возвращает пару (наименьшее, наибольшее). ОБЕ границы включены, обе достижимы и
+    обе ЖЁСТКИЕ: на нижней длинная сторона растра равна ровно `MAX_SIDE_PX`, на
+    верхней короткая — ровно одному пикселю, а шаг наружу с любой стороны приводит к
+    отказу. Величины нужны не для украшения сообщения: без них вызывающий подбирает
+    масштаб вслепую, а именно слепой подбор и породил растр 16x16 в редакции 1.
+
+    Жёсткость верхней границы не даётся даром. Проверять округлённые размеры растра
+    («хотя бы один пиксель») — значит принимать масштаб вплоть до УДВОЕННОЙ верхней
+    границы: при короткой стороне 0.5 единицы округление даёт единицу, и растр 1x1
+    возвращается без единого слова. Это то же молчаливое схлопывание, ради которого
+    задача переписывалась, только с другого конца. Поэтому `rectify` сверяет сам
+    `mm_per_px` с этими границами, а размеры растра округляет уже после сверки.
 
     Вырожденный образ кадра (нулевой размах хотя бы по одной оси) даёт перевёрнутую
-    пару — годного значения нет вовсе; вызывающий распознаёт это как `lo > hi`.
+    или нулевую пару — годного значения нет вовсе; вызывающий распознаёт это как
+    нарушение `0 < lo <= hi`.
     """
     image = _grayscale(image)
     mm_per_rect_unit = _positive_finite("mm_per_rect_unit", mm_per_rect_unit)
-    lo_xy, hi_xy = _frame_bounds_units(image, H_units)
-    span = hi_xy - lo_xy
-    return (float(span.max() * mm_per_rect_unit / MAX_SIDE_PX),
-            float(span.min() * mm_per_rect_unit))
+    low, high = _frame_bounds_units(image, H_units)
+    return _bounds(high - low, mm_per_rect_unit)
 
 
 def rectify(image, H_units, mm_per_rect_unit, mm_per_px, origin_rect_units=(0.0, 0.0)):
@@ -126,25 +143,34 @@ def rectify(image, H_units, mm_per_rect_unit, mm_per_px, origin_rect_units=(0.0,
     вызывающий обязан передать её сам. Перепутанное здесь начало сдвигает ВСЕ
     измеренные положения разом и на одну и ту же величину, то есть выглядит как
     правдоподобный результат.
+
+    `mm_per_px` сверяется с `attainable_mm_per_px` — обе границы включены, обе
+    жёсткие и несимметричности между ними нет: шаг наружу с любой стороны даёт
+    отказ, называющий достижимый диапазон.
     """
     image = _grayscale(image)
     mm_per_rect_unit = _positive_finite("mm_per_rect_unit", mm_per_rect_unit)
     mm_per_px = _positive_finite("mm_per_px", mm_per_px)
 
-    (x0, y0), (x1, y1) = _frame_bounds_units(image, H_units)
+    low, high = _frame_bounds_units(image, H_units)
+    x0, y0 = low
+    x1, y1 = high
 
     scale = mm_per_rect_unit / mm_per_px          # единицы -> пиксели выхода
-    out_w = int(round((x1 - x0) * scale))
-    out_h = int(round((y1 - y0) * scale))
-    if not (1 <= out_w <= MAX_SIDE_PX and 1 <= out_h <= MAX_SIDE_PX):
-        lo, hi = attainable_mm_per_px(image, H_units, mm_per_rect_unit)
+    lo, hi = _bounds(high - low, mm_per_rect_unit)
+    if not lo <= mm_per_px <= hi:
         reachable = (f"годится mm_per_px от {lo:.4g} до {hi:.4g} мм"
-                     if lo <= hi else "годного mm_per_px нет вовсе: образ кадра вырожден")
+                     if 0 < lo <= hi else "годного mm_per_px нет вовсе: образ кадра вырожден")
         raise ValueError(
-            f"невозможный размер ректифицированного растра {out_w}x{out_h} "
+            f"невозможный размер ректифицированного растра "
+            f"{_side((x1 - x0) * scale)}x{_side((y1 - y0) * scale)} "
             f"при mm_per_px={mm_per_px:.4g}: {reachable}; "
             "проверьте mm_per_rect_unit и доверие к плоскости"
         )
+    # Округление — уже ПОСЛЕ сверки: внутри границ оно не выводит стороны за [1, MAX_SIDE_PX],
+    # а до сверки оно же и размывало верхнюю границу вдвое.
+    out_w = int(round((x1 - x0) * scale))
+    out_h = int(round((y1 - y0) * scale))
 
     S = np.array([[scale, 0.0, -x0 * scale], [0.0, scale, -y0 * scale], [0.0, 0.0, 1.0]])
     H_total = S @ H_units

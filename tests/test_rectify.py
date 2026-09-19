@@ -109,20 +109,39 @@ def test_valid_mask_covers_exactly_the_image_quadrilateral():
     assert rect.valid_mask.mean() < 1.0
 
 
-def test_impossible_size_is_refused_by_its_own_reason_at_both_ends():
-    """Отказ по размеру наступает ДО варпа, называет свою причину и ловит оба конца.
+#: Шаг наружу от границы — тысячная доля её самой. МНОЖИТЕЛЬ здесь не годится, и это
+#: не придирка к стилю: прежняя проверка округлённых размеров принимала масштаб вплоть
+#: до УДВОЕННОЙ верхней границы, поэтому проба «в десять раз больше» проскакивала
+#: мягкую зону целиком и объявляла границу жёсткой, когда та таковой не была.
+BOUNDARY_STEP = 1e-3
 
-    `pytest.raises(ValueError)` из брифа отличает отказ лишь от полного молчания.
-    Снятая охрана «убивалась» им случайно: абсурдный масштаб доходил до
-    `cv2.warpPerspective`, и тот падал нехваткой памяти — исходом, зависящим от
-    объёма памяти машины, а не от кода. Здесь проверяется именно отказ по своей
-    причине, и с обеих сторон: растр, раздутый за MAX_SIDE_PX, и растр, схлопнутый
-    в ноль, — тот самый случай 16x16 из редакции 1.
+
+def test_range_boundaries_are_hard_and_symmetric():
+    """Шаг внутрь — успех, шаг наружу — отказ по своей причине. С ОБЕИХ сторон.
+
+    Нижняя граница была жёсткой и раньше: убавить тысячную — и отказ. Верхняя была
+    мягкой: проверялись ОКРУГЛЁННЫЕ стороны растра, поэтому короткая сторона в 0.5
+    единицы округлялась до единицы, и `rectify` молча возвращал растр 1x1 при
+    масштабе почти вдвое выше заявленного потолка. Растр в один пиксель — то же
+    молчаливое схлопывание, ради устранения которого переписывалась задача, только с
+    другого конца диапазона.
+
+    Заодно проверяется, что сами границы достижимы и означают именно то, что
+    объявлено: на нижней длинная сторона растра равна ровно MAX_SIDE_PX, на верхней
+    короткая — ровно одному пикселю.
     """
     sc, _, H, mmu = prepared()
-    for bad in (1e-4, 1e6):
+    img = sc.render()
+    lo, hi = attainable_mm_per_px(img, H, mmu)
+
+    assert max(rectify(img, H, mmu, lo).image.shape) == MAX_SIDE_PX
+    assert min(rectify(img, H, mmu, hi).image.shape) == 1
+    assert max(rectify(img, H, mmu, lo * (1 + BOUNDARY_STEP)).image.shape) <= MAX_SIDE_PX
+    assert min(rectify(img, H, mmu, hi * (1 - BOUNDARY_STEP)).image.shape) >= 1
+
+    for outside in (lo * (1 - BOUNDARY_STEP), hi * (1 + BOUNDARY_STEP)):
         with pytest.raises(ValueError, match=REFUSAL_IMPOSSIBLE_SIZE):
-            rectify(sc.render(), H, mmu, mm_per_px=bad)
+            rectify(img, H, mmu, outside)
 
 
 def test_non_positive_mm_per_px_is_refused_by_its_own_reason():
@@ -148,28 +167,22 @@ def test_non_positive_mm_per_rect_unit_is_refused_by_its_own_reason():
             rectify(sc.render(), H, bad, 4.0)
 
 
-def test_impossible_size_message_names_an_attainable_range():
-    """Отказ по размеру называет диапазон, и обе его границы ДЕЙСТВИТЕЛЬНО работают.
+def test_impossible_size_message_names_the_attainable_range():
+    """Отказ по размеру называет диапазон, а не оставляет вычислять его вызывающему.
 
-    Сообщение «сторона превышает предел» оставляло вызывающему подбирать масштаб
-    вслепую — ровно тот подбор, из которого вырос растр 16x16. Диапазон проверяется
-    поведением, а не переписыванием формулы: на нижней границе длинная сторона
-    растра равна ровно MAX_SIDE_PX, на верхней короткая — ровно одному пикселю, а
-    шаг наружу с обеих сторон приводит к отказу.
+    Сообщение «сторона превышает предел» вынуждало подбирать масштаб вслепую —
+    ровно тот подбор, из которого вырос растр 16x16. Проба берётся ВЫШЕ верхней
+    границы: там отказ ничего не выделяет, тогда как проба ниже нижней границы
+    заставляла бы мутанта без охраны просить десятки петабайт и падать нехваткой
+    памяти вместо того, чтобы отличаться поведением.
     """
     sc, _, H, mmu = prepared()
     img = sc.render()
     lo, hi = attainable_mm_per_px(img, H, mmu)
     assert lo < hi
 
-    assert max(rectify(img, H, mmu, lo).image.shape) == MAX_SIDE_PX
-    assert min(rectify(img, H, mmu, hi).image.shape) == 1
-    for outside in (lo * 0.9, hi * 10.0):
-        with pytest.raises(ValueError, match=REFUSAL_IMPOSSIBLE_SIZE):
-            rectify(img, H, mmu, outside)
-
     with pytest.raises(ValueError) as excinfo:
-        rectify(img, H, mmu, 1e-4)
+        rectify(img, H, mmu, hi * 4.0)
     assert f"{lo:.4g}" in str(excinfo.value)
     assert f"{hi:.4g}" in str(excinfo.value)
 
@@ -250,7 +263,9 @@ def refusal_messages():
     def calls():
         yield REFUSAL_NON_POSITIVE, lambda: rectify(img, H, mmu, 0.0)
         yield REFUSAL_MM_PER_RECT_UNIT, lambda: rectify(img, H, 0.0, 4.0)
-        yield REFUSAL_IMPOSSIBLE_SIZE, lambda: rectify(img, H, mmu, 1e-4)
+        # Выше верхней границы, а не ниже нижней: отказ обязан быть отказом, а не
+        # падением на попытке выделить растр в сотни миллионов пикселей.
+        yield REFUSAL_IMPOSSIBLE_SIZE, lambda: rectify(img, H, mmu, 1e6)
         yield REFUSAL_NOT_NUMERIC, lambda: rectify(None, H, mmu, 4.0)
         yield REFUSAL_NOT_GRAYSCALE, lambda: rectify(np.zeros((8, 8, 3), np.uint8), H, mmu, 4.0)
         yield REFUSAL_EMPTY_FRAME, lambda: rectify(np.zeros((0, 0), np.uint8), H, mmu, 4.0)
