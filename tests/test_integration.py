@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Сквозная проверка геометрической цепочки через РЕАЛЬНЫЙ детектор отрезков.
 
 Единственное место, где восстановленная поза сравнивается с истиной сцены по всей
@@ -37,7 +36,7 @@ from facade_digitizer.geometry.homography import (
 from facade_digitizer.pipeline.plane import estimate_plane
 from facade_digitizer.pipeline.rectify import attainable_mm_per_px, rectify
 from tests.test_homography import CORNERS, apply, exact_vps
-from tests.test_synth import K, SIZE, make_rich_scene, make_scene
+from tests.test_synth import SIZE, K, make_rich_scene, make_scene
 
 FACADE_W_MM = 20000.0
 FACADE_H_MM = 15000.0

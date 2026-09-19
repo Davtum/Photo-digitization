@@ -224,7 +224,8 @@ def test_scalar_formula_underestimates(theta_x_deg, theta_y_deg, ratio):
         cy=y_edge - (cz + d_true) * math.tan(math.radians(theta_y_deg)),
         cz=cz,
     )
-    dx, dy = parallax_offset(cam, x_edge, y_edge, depth=d_true)
+    # Нормаль к ребру здесь (1, 0), поэтому в ширину откоса входит только x-компонента.
+    dx, _dy = parallax_offset(cam, x_edge, y_edge, depth=d_true)
     w = abs(dx)
 
     correct = reveal_depth(

@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from facade_digitizer.schema import Element, FacadeModel, Recess, SizeMM
+from facade_digitizer.schema import FacadeModel, Recess, SizeMM
 
 
 def test_element_requires_uncertainty_with_size():

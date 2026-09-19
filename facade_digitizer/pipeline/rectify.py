@@ -169,8 +169,8 @@ def rectify(image, H_units, mm_per_rect_unit, mm_per_px, origin_rect_units=(0.0,
         )
     # Округление — уже ПОСЛЕ сверки: внутри границ оно не выводит стороны за [1, MAX_SIDE_PX],
     # а до сверки оно же и размывало верхнюю границу вдвое.
-    out_w = int(round((x1 - x0) * scale))
-    out_h = int(round((y1 - y0) * scale))
+    out_w = round((x1 - x0) * scale)
+    out_h = round((y1 - y0) * scale)
 
     S = np.array([[scale, 0.0, -x0 * scale], [0.0, scale, -y0 * scale], [0.0, 0.0, 1.0]])
     H_total = S @ H_units

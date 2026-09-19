@@ -351,7 +351,7 @@ def test_inlier_tolerance_is_two_pixels_and_cuts_exactly_there():
     # схлопнутом до нуля; без верхней — при допуске, распухшем до бесконечности.
     _, tight, _ = _fit_vanishing_point(segs, 1.0, np.random.default_rng(0))
     _, wide, _ = _fit_vanishing_point(segs, 4.0, np.random.default_rng(0))
-    assert int(tight.sum()) == 7 < 8 < int(wide.sum()) == 10, (
+    assert (int(tight.sum()), int(mask.sum()), int(wide.sum())) == (7, 8, 10), (
         f"число инлайеров при 1, 2 и 4 px: {int(tight.sum())}, {int(mask.sum())}, "
         f"{int(wide.sum())} — отсечка перестала быть восьмёркой ровно на 2 px")
 
