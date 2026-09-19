@@ -92,6 +92,11 @@ def calibrate_from_chessboard(
                               rms_px=float(rms), image_size=image_size)
 
 
+def _normalized_model(model) -> str:
+    """Имя модели для сверки: регистр и обрамляющие пробелы значения не имеют."""
+    return (model or "").strip().upper()
+
+
 def intrinsics_from_meta(meta: CameraMeta, profile_path=None) -> tuple[np.ndarray, str]:
     """Матрица K и источник её происхождения.
 
@@ -102,13 +107,30 @@ def intrinsics_from_meta(meta: CameraMeta, profile_path=None) -> tuple[np.ndarra
     Возвращаемый источник называет то, откуда параметры взяты на деле:
     "target" — профиль по мишени; "exif" и уточнённые "exif:*" — фокусное из снимка
     с указанием происхождения ширины матрицы; "database" — типовое поле зрения.
+
+    Переданный профиль сверяется со снимком и по модели камеры, и по разрешению.
+    Несовпадение — отказ, а не молчаливый переход к EXIF: профиль передан явным
+    действием оператора, и противоречие между этим действием и метаданными снимка
+    означает чужой файл, то есть систематически неверные внутренние параметры без
+    единого признака неисправности. Кому нужен запасной источник — тот просто не
+    передаёт profile_path.
     """
     w, h = meta.image_size
 
     if profile_path is not None and Path(profile_path).exists():
         prof = load_profile(profile_path)
-        if tuple(prof.image_size) == (w, h):
-            return np.array(prof.K, dtype=float), "target"
+        if _normalized_model(prof.model) != _normalized_model(meta.model):
+            raise ValueError(
+                f"профиль калиброван на камере «{prof.model}», "
+                f"а снимок сделан камерой «{meta.model}»"
+            )
+        if tuple(prof.image_size) != (w, h):
+            prof_w, prof_h = prof.image_size
+            raise ValueError(
+                f"профиль калиброван при разрешении {prof_w}×{prof_h}, "
+                f"а снимок имеет {w}×{h}"
+            )
+        return np.array(prof.K, dtype=float), "target"
 
     if meta.focal_mm and meta.sensor_width_mm:
         fx = fy = w * meta.focal_mm / meta.sensor_width_mm

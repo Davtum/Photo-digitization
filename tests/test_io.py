@@ -159,8 +159,14 @@ def test_source_distinguishes_how_sensor_width_was_obtained():
                           sensor_width_source=sensor_width_source)
         return intrinsics_from_meta(meta)[1]
 
-    sources = {source_for(s) for s in (None, "focal_plane", "crop_factor", "model_table")}
-    assert sources == {"exif", "exif:focal_plane", "exif:crop_factor", "exif:model_table"}
+    # Поимённо, а не «четыре различных значения»: различимость не есть соответствие,
+    # и перестановка двух целей местами прошла бы проверку на различимость.
+    assert {s: source_for(s) for s in (None, "focal_plane", "crop_factor", "model_table")} == {
+        None: "exif",
+        "focal_plane": "exif:focal_plane",
+        "crop_factor": "exif:crop_factor",
+        "model_table": "exif:model_table",
+    }
 
 
 def test_exif_branch_is_reachable_on_a_real_photograph(tmp_path):

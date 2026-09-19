@@ -200,3 +200,65 @@ def test_calibrated_profile_outranks_exif_end_to_end(tmp_path):
     assert K[0, 0] == pytest.approx(np.array(profile.K)[0, 0], rel=1e-9, abs=1e-9)
     # EXIF дал бы заметно иное фокусное — значит, проверка не вырождена.
     assert abs(K[0, 0] - 640 * 24.0 / 17.3) > 10.0
+
+
+# --- сверка профиля со снимком: чужой профиль не берётся молча ---
+
+
+def _profile_for(model, image_size, fx=3333.0):
+    from facade_digitizer.pipeline.calib import CalibrationProfile
+
+    return CalibrationProfile(
+        model=model, K=[[fx, 0, 2640.0], [0, fx, 1978.0], [0, 0, 1.0]],
+        dist=[0.0] * 5, rms_px=0.3, image_size=image_size,
+    )
+
+
+def _meta_for(model, image_size):
+    from facade_digitizer.pipeline.io import CameraMeta
+
+    return CameraMeta(model=model, focal_mm=24.0, sensor_width_mm=17.3,
+                      image_size=image_size, captured_at=None, gnss=None)
+
+
+def test_profile_of_another_camera_is_refused(tmp_path):
+    """Совпадения разрешения мало: два разных аппарата дают одинаковый кадр.
+
+    Молча взятый чужой профиль — систематически неверные внутренние параметры
+    без единого признака неисправности. Профиль передаётся явным действием
+    оператора, поэтому противоречие с метаданными снимка есть отказ.
+    """
+    from facade_digitizer.pipeline.calib import save_profile
+
+    path = tmp_path / "m3e.json"
+    save_profile(_profile_for("M3E", (5280, 3956)), path)
+
+    with pytest.raises(ValueError, match="профиль калиброван на камере") as refusal:
+        intrinsics_from_meta(_meta_for("ZENMUSE P1", (5280, 3956)), profile_path=path)
+
+    assert "при разрешении" not in str(refusal.value)   # отказ именно по модели
+
+
+def test_profile_of_another_resolution_is_refused(tmp_path):
+    from facade_digitizer.pipeline.calib import save_profile
+
+    path = tmp_path / "m3e.json"
+    save_profile(_profile_for("M3E", (5280, 3956)), path)
+
+    with pytest.raises(ValueError, match="профиль калиброван при разрешении") as refusal:
+        intrinsics_from_meta(_meta_for("M3E", (4000, 3000)), profile_path=path)
+
+    assert "на камере" not in str(refusal.value)        # отказ именно по разрешению
+
+
+def test_profile_match_ignores_case_and_padding(tmp_path):
+    """Регистр и обрамляющие пробелы в имени модели не повод отказывать."""
+    from facade_digitizer.pipeline.calib import save_profile
+
+    path = tmp_path / "m3e.json"
+    save_profile(_profile_for("  m3e  ", (5280, 3956)), path)
+
+    K, source = intrinsics_from_meta(_meta_for("M3E", (5280, 3956)), profile_path=path)
+
+    assert source == "target"
+    assert K[0, 0] == pytest.approx(3333.0, rel=1e-9, abs=1e-9)
