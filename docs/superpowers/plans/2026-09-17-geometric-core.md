@@ -2516,133 +2516,142 @@ git commit -m "Ректификация с привязкой растра к м
 
 ## Задача 13: Оркестрация плоскости с передачей управления оператору
 
+> **Текст переписан под фактические интерфейсы задач 6–12.** Редакция 2 плана вызывала здесь
+> `camera_pose_from_homography`, которой не существует, передавала в гомографию объекты точек
+> схода вместо векторов и помещала позу в результат, хотя поза требует масштаба, на этом шаге
+> ещё неизвестного.
+
 **Файлы:**
 - Создать: `facade_digitizer/pipeline/plane.py`
-- Тест: дописать `tests/test_rectify.py`
+- Тест: `tests/test_plane.py`
 
 **Интерфейсы:**
-- Потребляет: задачи 6–9, 12
-- Предоставляет: `PlaneResult(H, camera, confidence, method, needs_operator)`,
-  `estimate_plane(image, K, mm_per_px, min_confidence=0.5) -> PlaneResult`,
-  `estimate_plane_manual(image_pts, aspect_ratio=None, size_mm=None, mm_per_px=1.0) -> PlaneResult`
+- Потребляет: `detect_segments`, `estimate_vanishing_points` (задачи 6–7);
+  `homography_from_vanishing_points`, `homography_from_four_points` (задача 8)
+- Предоставляет: `PlaneResult(H, confidence, method, needs_operator, vh, vv)`,
+  `estimate_plane(image, K, min_confidence=0.5) -> PlaneResult`,
+  `estimate_plane_manual(image_pts, aspect_ratio=None, size_mm=None, assume_calibrated=False,
+  K=None, image_size=None) -> PlaneResult`
 
-- [ ] **Шаг 1: Дописать падающие тесты**
+**Почему результат не несёт позы.** Восстановление позы требует масштаба ректифицированных
+координат, то есть числа миллиметров на единицу, а оно становится известно только после задания
+опорного размера оператором. Поэтому `plane` отдаёт гомографию и точки схода, а позу вычисляет
+сборка конвейера, где масштаб уже есть. Попытка вернуть позу здесь неизбежно потребовала бы
+выдумать масштаб.
 
-Добавить в `tests/test_rectify.py`:
+**Ниже порога доверия система не гадает** (спецификация, п. 4.2). Это не диагностика, а контракт:
+при низком доверии возвращается результат с поднятым признаком `needs_operator`, и ректификация
+по такой гомографии не выполняется вовсе — вызывающий код обязан либо получить ручное
+доопределение, либо отказаться от снимка.
+
+- [ ] **Шаг 1: Написать падающий тест**
+
+Файл `tests/test_plane.py`:
 
 ```python
+import numpy as np
+import pytest
+
 from facade_digitizer.pipeline.plane import estimate_plane, estimate_plane_manual
+from tests.test_homography import CORNERS, apply
+from tests.test_synth import K, SIZE, make_scene
 
 
-def test_plane_is_estimated_on_good_scene():
-    scene = make_scene(theta_x_deg=20.0, theta_y_deg=15.0, depth=0.0)
-    res = estimate_plane(scene.render(), K, mm_per_px=2.8)
+def test_plane_is_estimated_on_a_good_scene():
+    sc = make_scene()
+    res = estimate_plane(sc.render(), K)
     assert res.method == "vanishing_points"
     assert not res.needs_operator
-    assert res.camera.cz > 0
+    assert res.confidence.value > 0.5
 
 
-def test_low_confidence_requests_operator_instead_of_guessing():
-    """Спецификация, п. 4.2: ниже порога система не гадает."""
+def test_estimated_homography_rectifies_the_facade():
+    """Гомография проверяется по существу, а не по факту непустоты."""
+    sc = make_scene()
+    res = estimate_plane(sc.render(), K)
+    r = apply(res.H, sc.project(CORNERS))
+    a, b = r[1] - r[0], r[3] - r[0]
+    ang = np.degrees(np.arccos(abs(a @ b) / (np.linalg.norm(a) * np.linalg.norm(b))))
+    assert ang == pytest.approx(90.0, abs=0.5)
+
+
+def test_low_confidence_requests_the_operator_instead_of_guessing():
+    """Спецификация, п. 4.2: ниже порога доверия система не гадает."""
     noise = np.random.default_rng(1).integers(0, 255, (600, 600), dtype=np.uint8)
-    res = estimate_plane(noise, K, mm_per_px=2.8)
+    res = estimate_plane(noise, K)
     assert res.needs_operator
     assert res.confidence.reasons
+    assert res.H is None
 
 
-def test_manual_plane_requires_disambiguation():
+def test_vanishing_points_are_carried_out_for_the_pose_step():
+    """Позу считает сборка конвейера, поэтому точки схода обязаны выйти наружу."""
+    sc = make_scene()
+    res = estimate_plane(sc.render(), K)
+    assert res.vh is not None and res.vv is not None
+    assert np.asarray(res.vh).shape == (3,)
+
+
+def test_manual_requires_disambiguation():
     pts = np.array([[100.0, 100.0], [900.0, 120.0], [880.0, 700.0], [120.0, 690.0]])
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="четырёх точек недостаточно"):
         estimate_plane_manual(pts)
 
 
-def test_manual_plane_succeeds_with_sizes():
+def test_manual_with_sizes_produces_those_sizes():
     pts = np.array([[100.0, 100.0], [900.0, 120.0], [880.0, 700.0], [120.0, 690.0]])
-    res = estimate_plane_manual(pts, size_mm=(1460.0, 1900.0), mm_per_px=1.0)
+    res = estimate_plane_manual(pts, size_mm=(1460.0, 1900.0))
     assert res.method == "manual_four_point"
-    assert res.confidence.value == 1.0
+    assert not res.needs_operator
+    r = apply(res.H, pts)
+    assert np.linalg.norm(r[1] - r[0]) == pytest.approx(1460.0, rel=1e-6)
+
+
+def test_manual_confidence_is_not_borrowed_from_the_automatic_path():
+    """Ручной вариант не должен изображать измеренное доверие."""
+    pts = np.array([[100.0, 100.0], [900.0, 120.0], [880.0, 700.0], [120.0, 690.0]])
+    res = estimate_plane_manual(pts, aspect_ratio=2.0)
+    assert res.confidence.reasons == []
+    assert res.confidence.support_h == 0 and res.confidence.support_v == 0
+
+
+def test_threshold_is_honoured():
+    """Порог доверия действительно решает, а не декоративен."""
+    sc = make_scene()
+    strict = estimate_plane(sc.render(), K, min_confidence=0.999)
+    assert strict.needs_operator
+    assert strict.H is None
 ```
 
-- [ ] **Шаг 2: Убедиться, что тесты падают**
+- [ ] **Шаг 2: Убедиться, что тест падает**
 
-Выполнить: `pytest tests/test_rectify.py -v`
+Выполнить: `./.venv/Scripts/python.exe -m pytest tests/test_plane.py -v`
 Ожидается: `ModuleNotFoundError: No module named 'facade_digitizer.pipeline.plane'`
 
 - [ ] **Шаг 3: Реализовать**
 
-Файл `facade_digitizer/pipeline/plane.py`:
+Файл `facade_digitizer/pipeline/plane.py`. Требования к реализации:
 
-```python
-"""Оркестрация оценки плоскости фасада. Спецификация, п. 4.2."""
-from dataclasses import dataclass
-
-import numpy as np
-
-from ..geometry.camera import CameraOnPlane
-from ..geometry.homography import (
-    camera_pose_from_homography,
-    homography_from_four_points,
-    homography_from_vanishing_points,
-)
-from ..geometry.vanishing import PlaneConfidence, detect_segments, estimate_vanishing_points
-
-
-@dataclass(frozen=True)
-class PlaneResult:
-    H: np.ndarray
-    camera: CameraOnPlane
-    confidence: PlaneConfidence
-    method: str
-    needs_operator: bool
-
-
-def estimate_plane(
-    image: np.ndarray, K: np.ndarray, mm_per_px: float, min_confidence: float = 0.5
-) -> PlaneResult:
-    """Автоматическая оценка. Ниже порога доверия — запрос к оператору, а не догадка."""
-    h, w = image.shape[:2]
-    segments = detect_segments(image)
-    vh, vv, conf = estimate_vanishing_points(segments, (w, h), K)
-
-    if conf.value < min_confidence:
-        return PlaneResult(
-            H=np.eye(3), camera=CameraOnPlane(0.0, 0.0, mm_per_px * float(K[0, 0])),
-            confidence=conf, method="vanishing_points", needs_operator=True,
-        )
-
-    H = homography_from_vanishing_points(vh, vv, K, (w, h))
-    camera = camera_pose_from_homography(H, K, mm_per_px)
-    return PlaneResult(H=H, camera=camera, confidence=conf,
-                       method="vanishing_points", needs_operator=False)
-
-
-def estimate_plane_manual(
-    image_pts: np.ndarray,
-    aspect_ratio: float | None = None,
-    size_mm: tuple[float, float] | None = None,
-    mm_per_px: float = 1.0,
-) -> PlaneResult:
-    """Ручной вариант: четыре точки плюс доопределение отношения сторон."""
-    H = homography_from_four_points(image_pts, aspect_ratio=aspect_ratio, size_mm=size_mm)
-    conf = PlaneConfidence(
-        value=1.0, support_h=4, support_v=4, residual_px=0.0,
-        orthogonality_deg=90.0, coverage=1.0, reasons=[],
-    )
-    camera = CameraOnPlane(0.0, 0.0, max(mm_per_px * 1000.0, 1.0))
-    return PlaneResult(H=H, camera=camera, confidence=conf,
-                       method="manual_four_point", needs_operator=False)
-```
+- `estimate_plane` детектирует отрезки, оценивает точки схода, и **только при доверии не ниже
+  порога** строит гомографию; иначе возвращает `H = None`, `needs_operator = True` и причины,
+  полученные от метрики доверия. Возвращать единичную гомографию при низком доверии запрещено:
+  вызывающий код не отличит её от настоящей.
+- В `homography_from_vanishing_points` передаются **векторы** `vh.point`, `vv.point`, а не
+  объекты.
+- `PlaneResult` несёт `vh` и `vv` наружу — они нужны сборке конвейера для восстановления позы.
+- `estimate_plane_manual` поддерживает **все три** способа доопределения, как требует
+  спецификация п. 4.2: отношение сторон, два размера в миллиметрах, подтверждение калибровки.
+  Доверие для ручного пути конструируется явно и не изображает измеренное.
 
 - [ ] **Шаг 4: Убедиться, что тесты проходят**
 
-Выполнить: `pytest tests/test_rectify.py -v`
-Ожидается: 7 passed
+Ожидается: 8 passed
 
 - [ ] **Шаг 5: Коммит**
 
 ```bash
-git add facade_digitizer/pipeline/plane.py tests/test_rectify.py
-git commit -m "Оркестрация плоскости фасада с передачей управления оператору при низком доверии"
+git add facade_digitizer/pipeline/plane.py tests/test_plane.py
+git commit -m "Оркестрация плоскости фасада с передачей управления оператору"
 ```
 
 ---
