@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 import cv2
 import numpy as np
+import piexif
 import pytest
 
 from facade_digitizer.geometry.camera import CameraOnPlane
@@ -30,8 +31,10 @@ from facade_digitizer.pipeline.plane import estimate_plane
 from facade_digitizer.pipeline.quality import DEFAULT as QUALITY_THRESHOLDS
 from facade_digitizer.pipeline.quality import THETA_MAX_DEG
 from facade_digitizer.pipeline.run import (
+    SIGMA_REL_TOLERANCE,
     OperatorReference,
     _apply,
+    _camera_record,
     _field_grid,
     _frame_fields,
     _gsd_at,
@@ -225,6 +228,186 @@ def test_low_confidence_hands_control_to_operator(tmp_path):
     assert record.quality.reasons
     # Отказ обязан быть выражен данными: модель всё равно валидна по схеме.
     assert FacadeModel.model_validate_json(model.model_dump_json()).mode == "assisted"
+
+
+def test_needs_operator_records_the_sentinel_angle_not_a_measurement(tmp_path):
+    """Угол визирования на отказном пути — предельные 90°, а не измеренное число.
+
+    `_needs_operator_model` не может измерить угол — он требует позы, а плоскость не
+    восстановлена, — и записывает 90° как названный предел, не как измерение
+    (`run.py`, докстринг `_needs_operator_model`). Ноль в семантике поля означает
+    «идеально фронтальный, отличные условия», то есть противоположное по смыслу
+    утверждение: мутация 90.0 -> 0.0 превратила бы честный отказ в самый лестный
+    возможный результат.
+    """
+    rng = np.random.default_rng(0)
+    noise = rng.integers(0, 256, size=(900, 1200), dtype=np.uint8)
+    path = tmp_path / "noise.png"
+    cv2.imwrite(str(path), noise)
+    reference = OperatorReference(origin_px=(100.0, 800.0),
+                                  span_px=((100.0, 800.0), (1100.0, 800.0)),
+                                  span_mm=5000.0)
+
+    model = process(path, operator_reference=reference, raster_mm_per_px=RASTER_MM_PER_PX)
+
+    assert model.images[0].rectification.needs_operator is True
+    assert model.images[0].quality.theta_field_deg_p95 == 90.0
+    assert model.images[0].quality.verdict == "degraded"
+
+
+def test_needs_operator_never_reports_a_measured_tolerance(tmp_path):
+    """На отказном пути `meets_tolerance` — всегда `False`, даже когда σ мала сама по себе.
+
+    Плоскость не восстановлена (`needs_operator = True`, `homography = None`), и
+    допуск не достигнут НИЧЕМ — это утверждает докстринг `_needs_operator_model`
+    дословно. Без принудительного `False` признак стал бы результатом голого
+    сравнения `sigma_rel <= SIGMA_REL_TOLERANCE`, и вход ниже подобран так, чтобы
+    именно это сравнение обмануло: опорная база во всю ширину кадра (~3000 px) при
+    span_mm = 5000 даёт σ около 0.22 %, что МЕНЬШЕ порога 0.28 % — то есть без
+    принуждения признак стал бы `True` на записи, где ничего не измерено.
+    """
+    rng = np.random.default_rng(0)
+    noise = rng.integers(0, 256, size=(2000, 3000), dtype=np.uint8)
+    path = tmp_path / "noise_wide.png"
+    cv2.imwrite(str(path), noise)
+    reference = OperatorReference(origin_px=(50.0, 1000.0),
+                                  span_px=((50.0, 1000.0), (2950.0, 1000.0)),
+                                  span_mm=5000.0)
+
+    model = process(path, operator_reference=reference, raster_mm_per_px=RASTER_MM_PER_PX)
+
+    record = model.images[0]
+    assert record.rectification.needs_operator is True
+    assert record.homography is None
+    scale = model.facade.scale
+    # Голое сравнение сочло бы допуск достигнутым — это и есть западня входа.
+    assert scale.sigma_rel < SIGMA_REL_TOLERANCE
+    assert scale.meets_tolerance is False
+
+
+def test_needs_operator_rejects_a_uniformly_flat_frame(tmp_path):
+    """Строго однородный кадр на отказном пути получает `reject`, а не `degraded`.
+
+    Ветка `verdict == "reject"` внутри `_needs_operator_model` достижима только при
+    нулевой дисперсии яркости: `sharpness` считает вариацию лапласиана, нормированную
+    на дисперсию, и на постоянном кадре она равна ровно нулю. Проверяются обе ветви:
+    здесь — `reject` с названной причиной, а `test_low_confidence_hands_control_to_operator`
+    и `test_needs_operator_records_the_sentinel_angle_not_a_measurement` закрепляют
+    `degraded` на кадре с достаточной резкостью.
+    """
+    uniform = np.full((900, 1200), 128, dtype=np.uint8)
+    path = tmp_path / "uniform.png"
+    cv2.imwrite(str(path), uniform)
+    reference = OperatorReference(origin_px=(100.0, 800.0),
+                                  span_px=((100.0, 800.0), (1100.0, 800.0)),
+                                  span_mm=5000.0)
+
+    model = process(path, operator_reference=reference, raster_mm_per_px=RASTER_MM_PER_PX)
+
+    record = model.images[0]
+    assert record.rectification.needs_operator is True
+    assert record.quality.verdict == "reject"
+    assert record.quality.sharpness == 0.0
+    assert any("резкост" in reason for reason in record.quality.reasons)
+
+
+def test_gnss_reaches_the_output_when_present_in_exif(tmp_path):
+    """Координаты съёмки из EXIF доходят до JSON, а не теряются молча.
+
+    `pipeline/io.py` разбирает GNSS в `CameraMeta.gnss`, но до задачи 15 `ImageRecord`
+    такого поля не нёс вовсе, а `Strict` запрещает лишние поля — координаты читались
+    и тут же выбрасывались. Снимок без EXIF (весь модуль работает с такими) даёт
+    `gnss = None`, а не выдуманный ноль — это проверяет
+    `test_pose_is_recorded_together_with_its_origin` и соседние тесты на `baseline`
+    заодно, поскольку тот же путь используется для остальных полей записи.
+    """
+    rng = np.random.default_rng(1)
+    noise = rng.integers(0, 256, size=(900, 1200), dtype=np.uint8)
+    path = tmp_path / "gnss.jpg"
+    cv2.imwrite(str(path), noise)
+    blob = piexif.dump({
+        "0th": {}, "Exif": {}, "1st": {}, "Interop": {}, "thumbnail": None,
+        "GPS": {
+            piexif.GPSIFD.GPSLatitude: ((12, 1), (30, 1), (3600, 100)),
+            piexif.GPSIFD.GPSLatitudeRef: b"N",
+            piexif.GPSIFD.GPSLongitude: ((45, 1), (15, 1), (1800, 100)),
+            piexif.GPSIFD.GPSLongitudeRef: b"E",
+            piexif.GPSIFD.GPSAltitude: (12345, 100),
+            piexif.GPSIFD.GPSAltitudeRef: 0,
+        },
+    })
+    piexif.insert(blob, str(path))
+    reference = OperatorReference(origin_px=(100.0, 800.0),
+                                  span_px=((100.0, 800.0), (1100.0, 800.0)),
+                                  span_mm=5000.0)
+
+    model = process(path, operator_reference=reference, raster_mm_per_px=RASTER_MM_PER_PX)
+
+    gnss = model.images[0].gnss
+    assert gnss is not None
+    assert gnss["lat"] == pytest.approx(12.51)
+    assert gnss["lon"] == pytest.approx(45.255)
+    assert gnss["alt_m"] == pytest.approx(123.45)
+
+
+def test_gnss_is_none_without_exif(workdir):
+    """Снимок без EXIF не выдумывает координаты: `gnss = None`, а не нуль."""
+    data = baseline(workdir)
+    assert data.model.images[0].gnss is None
+
+
+def test_gnss_reaches_the_output_on_the_resolved_plane_path_too(tmp_path):
+    """GNSS доходит до JSON и на пути с восстановленной плоскостью, не только на отказном.
+
+    `ImageRecord` собирается в сборке дважды — в `_needs_operator_model` и в основном
+    пути `process()`, и оба места прокидывают `meta.gnss` порознь. Проверка на
+    отказном пути (`test_gnss_reaches_the_output_when_present_in_exif`) не покрывает
+    вторую запись: мутация, вернувшая `gnss=None` только здесь, тем прогоном не
+    ловится. Снимок пишется как JPEG (а не PNG, как у `baseline`), чтобы нести EXIF
+    и при этом остаться настоящей сценой — плоскость обязана восстановиться.
+    """
+    scene = make_scene(dist=DISTANCE_MM)
+    image = scene.render()
+    path = tmp_path / "facade.jpg"
+    cv2.imwrite(str(path), image)
+    blob = piexif.dump({
+        "0th": {}, "Exif": {}, "1st": {}, "Interop": {}, "thumbnail": None,
+        "GPS": {
+            piexif.GPSIFD.GPSLatitude: ((12, 1), (30, 1), (3600, 100)),
+            piexif.GPSIFD.GPSLatitudeRef: b"N",
+            piexif.GPSIFD.GPSLongitude: ((45, 1), (15, 1), (1800, 100)),
+            piexif.GPSIFD.GPSLongitudeRef: b"E",
+            piexif.GPSIFD.GPSAltitude: (12345, 100),
+            piexif.GPSIFD.GPSAltitudeRef: 0,
+        },
+    })
+    piexif.insert(blob, str(path))
+    reference = _reference(scene)
+
+    model = process(path, operator_reference=reference, raster_mm_per_px=RASTER_MM_PER_PX)
+
+    record = model.images[0]
+    assert record.rectification.needs_operator is False
+    gnss = record.gnss
+    assert gnss is not None
+    assert gnss["lat"] == pytest.approx(12.51)
+    assert gnss["lon"] == pytest.approx(45.255)
+    assert gnss["alt_m"] == pytest.approx(123.45)
+
+
+def test_camera_record_rejects_a_non_finite_k(workdir):
+    """`_camera_record` проверяет K поэлементно, как и почти все прочие числа сборки.
+
+    Ниже по потоку K уходит в линейную алгебру `camera_pose`, и нечисловой элемент
+    упал бы раньше даже без этой проверки — рецензент утечки не нашёл. Но это
+    страховка по совпадению работы `camera_pose`, а не по контракту самой сборки, и
+    шаг 12 задания требует проверять КАЖДОЕ число, а не полагаться на то, что
+    негодное значение будет с чем-то перемножено достаточно рано.
+    """
+    _, meta = load_image(baseline(workdir).path)
+    bad_K = np.array([[3600.0, 0.0, 2640.0], [0.0, float("nan"), 1978.0], [0.0, 0.0, 1.0]])
+    with pytest.raises(ValueError, match=r"camera\.K\[1\]\[1\]"):
+        _camera_record(meta, bad_K, "database")
 
 
 def test_unreachable_raster_scale_is_rejected_by_naming_the_range(workdir):

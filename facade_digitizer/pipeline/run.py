@@ -79,14 +79,22 @@ SIGMA_REL_TOLERANCE = 0.0028
 #: Согласованность с п. 6.3 ПРОВЕРЕНА, а не постулирована. Диапазон 0.14–0.28 %
 #: спецификации относится к базе во всю двадцатиметровую сторону фасада, и такая
 #: база помещается в кадр 5280x3956 при f = 3600 px лишь с дистанции около 14 м;
-#: рабочие дистанции — от 20 до 25 м. Измерено на сцене `tests/test_synth.make_scene`
-#: (смещения 3000 и -2000 мм, опорная база — вся нижняя сторона фасада):
+#: рабочие дистанции — от 20 до 25 м.
+#:
+#: **Протокол замера**, чтобы следующая проверка воспроизвела те же числа, а не
+#: третьи. Сцена — `tests/test_synth.make_scene` с умолчательными смещениями
+#: (3000 и -2000 мм), опорная база — вся нижняя сторона фасада (20000 мм).
+#: Снимок пишется на диск через `cv2.imwrite` и потому без EXIF, поэтому K — НЕ
+#: истинная K сцены (f = 3600), а та, что даёт сама сборка в этом случае: типовое
+#: поле зрения 84° по диагонали (f ≈ 3663.6 px), путь `intrinsics_from_meta` при
+#: отсутствующем EXIF. Величина измерена самим проходом `process()`, тем же путём,
+#: каким её получает конвейер, а не отдельной формулой:
 #:
 #:     дистанция 20 м   среднеквадратичное разрешение при базе 5.74 мм/px   σ = 0.183 %
-#:     дистанция 25 м   то же                             7.16 мм/px        σ = 0.228 %
+#:     дистанция 25 м   то же                             7.07 мм/px        σ = 0.225 %
 #:
 #: Обе величины внутри диапазона; крайние значения `sigma_px`, при которых это ещё
-#: так на обеих дистанциях, — 3.45 и 5.53, и 4.5 лежит между ними, а не у края.
+#: так на обеих дистанциях, — 3.45 и 5.60, и 4.5 лежит между ними, а не у края.
 #: Проверка закреплена в
 #: `tests/test_run.py::test_default_sigma_px_agrees_with_the_specification`.
 DEFAULT_OPERATOR_SIGMA_PX = 4.5
@@ -385,13 +393,22 @@ def _theta_at(H, camera, mm_per_unit, origin_rect, point_px) -> float:
 
 
 def _camera_record(meta, K, source) -> CameraIntrinsics:
-    """Внутренние параметры с происхождением. Источник обязан дойти до выхода."""
+    """Внутренние параметры с происхождением. Источник обязан дойти до выхода.
+
+    `K` проверяется поэлементно на конечность, как и практически все прочие числа
+    сборки (шаг 12 задания). Ниже по потоку та же матрица уходит в линейную алгебру
+    `camera_pose`, где нечисловой элемент упал бы раньше и без этой проверки —
+    но это страховка по совпадению, а не по контракту: K читается из EXIF или из
+    файла профиля калибровки, и обе цепочки не гарантируют конечность на входе сюда.
+    """
     calibration = _CALIBRATION_BY_SOURCE.get(source)
     if calibration is None:
         if not source.startswith("exif"):
             raise ValueError(f"неизвестное происхождение внутренних параметров: {source}")
         calibration = "exif"
-    return CameraIntrinsics(model=meta.model, K=[[float(v) for v in row] for row in K],
+    K_checked = [[_finite(f"camera.K[{row}][{col}]", v) for col, v in enumerate(values)]
+                for row, values in enumerate(K)]
+    return CameraIntrinsics(model=meta.model, K=K_checked,
                             dist=[0.0] * 5, calibration=calibration)
 
 
@@ -441,6 +458,7 @@ def _needs_operator_model(path, image_id, meta, K, source, plane, reference, ima
         path=str(path),
         camera=_camera_record(meta, K, source),
         captured_at=meta.captured_at,
+        gnss=meta.gnss,
         pose_to_facade=None,
         theta_cam_deg=None,
         theta_field_deg=None,
@@ -536,6 +554,26 @@ def process(image_path, *, operator_reference: OperatorReference,
     # доля, превысившая допустимую долю НЕпригодных узлов, отвергает кадр и так —
     # здесь она лишь называется по имени. Вердикт при этом пересчитывается явно,
     # а не выводится из этой импликации.
+    #
+    # **Достижимость этой ветки через `process()` проверена, а не предположена.**
+    # Пройдено систематически 585 сочетаний ракурса и дистанции (dx от -60000 до
+    # 25000 мм, dy до ±7000 мм, dist от 200 до 25000 мм), каждое — полным проходом
+    # `estimate_plane` по отрезкам, найденным на РЕНДЕРЕННОМ кадре, тем же путём,
+    # каким сборка получает K (без EXIF, типовое поле зрения). Итог: доля узлов за
+    # линией схода растёт вместе с тем, насколько ракурс близок к рёберному, но
+    # доверие к плоскости падает вместе с ней же — оценка точек схода на таких
+    # ракурсах хуже обусловлена (меньше устойчивость направления, ближе к порогу
+    # ортогональности). Максимум, полученный при доверии ещё НЕ ниже
+    # `CONFIDENCE_THRESHOLD` (0.5) и потому дошедший до этой строки: доля 0.453 при
+    # доверии 0.515 (dx=-38000, dist=2500). Ни одно из 585 сочетаний не дало доли
+    # свыше 0.5 — порога, по которому решает эта ветка. Это не доказательство
+    # недостижимости: подобранного контрпримера может не быть только потому, что
+    # его не нашли. Но граница подходит вплотную с обеих сторон синхронно, а не
+    # порознь, и это довод не в пользу случайности. Ветка испытана напрямую, в
+    # обход шлюза доверия, в `tests/test_angles.py::
+    # test_nodes_behind_vanishing_line_are_excluded_and_counted` (там же и мера
+    # `GRAZING_BEHIND_FRACTION`) — то есть поведение `behind_vanishing_line` само по
+    # себе проверено, а недостающая часть — именно проход ОТСЮДА, из `process()`.
     if fields.behind_vanishing_line > 1.0 - quality_gate.DEFAULT.usable_min_fraction:
         report = report.model_copy(update={
             "verdict": "degraded" if report.verdict == "ok" else report.verdict,
@@ -575,6 +613,7 @@ def process(image_path, *, operator_reference: OperatorReference,
         path=str(path),
         camera=_camera_record(meta, K, source),
         captured_at=meta.captured_at,
+        gnss=meta.gnss,
         pose_to_facade={
             "cx": _finite("pose_to_facade.cx", camera.cx),
             "cy": _finite("pose_to_facade.cy", camera.cy),

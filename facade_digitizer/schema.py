@@ -87,6 +87,7 @@ class ImageRecord(Strict):
     path: str
     camera: CameraIntrinsics
     captured_at: str | None = None
+    gnss: dict | None = None
     pose_to_facade: dict | None = None
     theta_cam_deg: float | None = None
     theta_field_deg: dict | None = None
