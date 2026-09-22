@@ -6,8 +6,9 @@
 Из истины сцены берутся ТОЛЬКО начало отсчёта и одна опорная длина; гомография,
 точки схода, поза, поле углов и разрешение приходят из кадра.
 
-Снимок пишется на диск через `cv2.imwrite`, поэтому EXIF в нём нет: путь
-«внутренние параметры из таблицы» входит в проверку, а не обходится подстановкой.
+Снимок пишется на диск через `save_image` без EXIF-блока, поэтому EXIF в нём нет:
+путь «внутренние параметры из таблицы» входит в проверку, а не обходится
+подстановкой.
 """
 import json
 import math
@@ -26,7 +27,7 @@ from facade_digitizer.pipeline.calib import (
     intrinsics_from_meta,
     save_profile,
 )
-from facade_digitizer.pipeline.io import load_image
+from facade_digitizer.pipeline.io import load_image, save_image
 from facade_digitizer.pipeline.plane import estimate_plane
 from facade_digitizer.pipeline.quality import DEFAULT as QUALITY_THRESHOLDS
 from facade_digitizer.pipeline.quality import THETA_MAX_DEG
@@ -103,7 +104,7 @@ def baseline(workdir):
         scene = make_scene(dist=DISTANCE_MM)
         image = scene.render()
         path = workdir / "facade.png"
-        cv2.imwrite(str(path), image)
+        save_image(path, image)
         reference = _reference(scene)
         try:
             model = process(path, operator_reference=reference,
@@ -209,7 +210,7 @@ def test_low_confidence_hands_control_to_operator(tmp_path):
     rng = np.random.default_rng(0)
     noise = rng.integers(0, 256, size=(900, 1200), dtype=np.uint8)
     path = tmp_path / "noise.png"
-    cv2.imwrite(str(path), noise)
+    save_image(path, noise)
     reference = OperatorReference(origin_px=(100.0, 800.0),
                                   span_px=((100.0, 800.0), (1100.0, 800.0)),
                                   span_mm=5000.0)
@@ -243,7 +244,7 @@ def test_needs_operator_records_the_sentinel_angle_not_a_measurement(tmp_path):
     rng = np.random.default_rng(0)
     noise = rng.integers(0, 256, size=(900, 1200), dtype=np.uint8)
     path = tmp_path / "noise.png"
-    cv2.imwrite(str(path), noise)
+    save_image(path, noise)
     reference = OperatorReference(origin_px=(100.0, 800.0),
                                   span_px=((100.0, 800.0), (1100.0, 800.0)),
                                   span_mm=5000.0)
@@ -269,7 +270,7 @@ def test_needs_operator_never_reports_a_measured_tolerance(tmp_path):
     rng = np.random.default_rng(0)
     noise = rng.integers(0, 256, size=(2000, 3000), dtype=np.uint8)
     path = tmp_path / "noise_wide.png"
-    cv2.imwrite(str(path), noise)
+    save_image(path, noise)
     reference = OperatorReference(origin_px=(50.0, 1000.0),
                                   span_px=((50.0, 1000.0), (2950.0, 1000.0)),
                                   span_mm=5000.0)
@@ -297,7 +298,7 @@ def test_needs_operator_rejects_a_uniformly_flat_frame(tmp_path):
     """
     uniform = np.full((900, 1200), 128, dtype=np.uint8)
     path = tmp_path / "uniform.png"
-    cv2.imwrite(str(path), uniform)
+    save_image(path, uniform)
     reference = OperatorReference(origin_px=(100.0, 800.0),
                                   span_px=((100.0, 800.0), (1100.0, 800.0)),
                                   span_mm=5000.0)
@@ -324,7 +325,7 @@ def test_gnss_reaches_the_output_when_present_in_exif(tmp_path):
     rng = np.random.default_rng(1)
     noise = rng.integers(0, 256, size=(900, 1200), dtype=np.uint8)
     path = tmp_path / "gnss.jpg"
-    cv2.imwrite(str(path), noise)
+    save_image(path, noise)
     blob = piexif.dump({
         "0th": {}, "Exif": {}, "1st": {}, "Interop": {}, "thumbnail": None,
         "GPS": {
@@ -369,7 +370,7 @@ def test_gnss_reaches_the_output_on_the_resolved_plane_path_too(tmp_path):
     scene = make_scene(dist=DISTANCE_MM)
     image = scene.render()
     path = tmp_path / "facade.jpg"
-    cv2.imwrite(str(path), image)
+    save_image(path, image)
     blob = piexif.dump({
         "0th": {}, "Exif": {}, "1st": {}, "Interop": {}, "thumbnail": None,
         "GPS": {
@@ -594,7 +595,7 @@ def _ok_frame(directory):
     if not _OK_FRAME:
         scene = make_scene(dx=1500.0, dy=-1000.0, dist=12000.0)
         path = directory / "ok_frame.png"
-        cv2.imwrite(str(path), scene.render())
+        save_image(path, scene.render())
         points = scene.project(np.array([[8000.0, 6000.0], [12000.0, 6000.0]]))
         reference = OperatorReference(
             origin_px=(float(points[0][0]), float(points[0][1])),
@@ -835,7 +836,7 @@ def test_incompatible_profile_is_rejected_per_file_and_the_batch_goes_on(workdir
                                     rms_px=0.3, image_size=SIZE), profile_path)
 
     wrong_size = tmp_path / "wrong_size.png"
-    cv2.imwrite(str(wrong_size), cv2.resize(data.image, (SIZE[0] // 2, SIZE[1] // 2)))
+    save_image(wrong_size, cv2.resize(data.image, (SIZE[0] // 2, SIZE[1] // 2)))
     out_dir = tmp_path / "out"
 
     ref = data.reference
@@ -869,3 +870,39 @@ def test_pipeline_fits_the_time_budget(workdir):
     process(data.path, operator_reference=data.reference,
             raster_mm_per_px=RASTER_MM_PER_PX)
     assert time.perf_counter() - started < 15.0
+
+
+def test_cli_accepts_an_image_at_an_absolute_cyrillic_path(tmp_path, capsys):
+    """CLI принимает снимок по АБСОЛЮТНОМУ пути с кириллицей.
+
+    Каталог этого проекта называется «Оцифровка фото». До починки `load_image`
+    такой путь `cv2.imread` не открывал вовсе: файл существовал, но снимок
+    считался ненайденным. Тест гоняет настоящий `main()` — точку входа CLI,
+    разбирающую argv, — а не только внутренний `process()`, чтобы поймать и
+    дефект на уровне разбора путей в самом `main` (`Path(image).stem` и т. п.).
+    """
+    scene = make_scene(dist=DISTANCE_MM)
+    image = scene.render()
+    directory = tmp_path / "Оцифровка фото" / "снимки"
+    directory.mkdir(parents=True)
+    path = directory / "фасад.png"
+    save_image(path, image)
+    reference = _reference(scene)
+    out_dir = tmp_path / "Оцифровка фото" / "выход"
+
+    code = main([
+        str(path),
+        "--raster-mm-per-px", str(RASTER_MM_PER_PX),
+        "--origin-px", str(reference.origin_px[0]), str(reference.origin_px[1]),
+        "--span-px", str(reference.span_px[0][0]), str(reference.span_px[0][1]),
+                    str(reference.span_px[1][0]), str(reference.span_px[1][1]),
+        "--span-mm", str(reference.span_mm),
+        "--out-dir", str(out_dir),
+    ])
+
+    captured = capsys.readouterr()
+    assert code == 0, captured.err
+    out_path = out_dir / "фасад.json"
+    assert out_path.exists()
+    model = FacadeModel.model_validate_json(out_path.read_text("utf-8"))
+    assert model.images[0].quality is not None

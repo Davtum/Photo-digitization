@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 #: Ширина кадра 35-мм плёнки. По ней EXIF-поле FocalLengthIn35mmFilm пересчитывается
 #: в ширину матрицы: sensor_width_mm = 36 · FocalLength / FocalLengthIn35mmFilm.
@@ -41,15 +42,62 @@ class CameraMeta:
 
 
 def load_image(path: str | Path):
-    """Снимок в градациях серого плюс метаданные камеры."""
+    """Снимок в градациях серого плюс метаданные камеры.
+
+    Читает байты сам (`np.fromfile`) и декодирует их (`cv2.imdecode`), а не
+    `cv2.imread(str(path))`. На Windows `cv2.imread` переводит путь в ANSI-кодовую
+    страницу процесса и не открывает файл, если путь содержит символы вне неё —
+    а каталог этого проекта называется «Оцифровка фото». `np.fromfile` открывает
+    файл через собственный, не ANSI, слой Python и такого ограничения не имеет.
+
+    Два разных отказа различаются по типу исключения, а не сливаются в один:
+    файла нет — `FileNotFoundError`; файл есть, но не декодируется (испорчен или
+    это не изображение) — `ValueError`. Раньше оба давали одинаковый
+    `FileNotFoundError` с одним и тем же текстом, и оператор не мог по сообщению
+    отличить опечатку в пути от битого снимка.
+    """
     path = Path(path)
-    img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    try:
+        raw = np.fromfile(str(path), dtype=np.uint8)
+    except OSError as error:
+        raise FileNotFoundError(f"изображение не найдено: {path}") from error
+
+    img = cv2.imdecode(raw, cv2.IMREAD_GRAYSCALE) if raw.size else None
     if img is None:
-        raise FileNotFoundError(f"не удалось прочитать изображение: {path}")
+        raise ValueError("не удалось прочитать изображение (файл испорчен либо "
+                         f"формат не распознан): {path}")
 
     h, w = img.shape[:2]
     meta = _read_exif(path, (w, h))
     return img, meta
+
+
+def save_image(path: str | Path, image: np.ndarray) -> Path:
+    """Пишет изображение на диск в обход кодовой страницы Windows.
+
+    `cv2.imwrite` страдает тем же дефектом, что и `cv2.imread` (см. `load_image`),
+    но хуже: на не-ASCII пути он не только не пишет файл, но и **молча возвращает
+    `True`** — то есть сообщает об успехе, ничего не записав. Проверено исполнением
+    ("imwrite растр.png: вернул True, файл существует: False"). Тихий `True` без
+    файла здесь недопустим ни при каких обстоятельствах.
+
+    Кодируем в память (`cv2.imencode`, формат — по расширению пути) и пишем байты
+    сами (`ndarray.tofile`) — путь при этом ни разу не проходит через C++-слой
+    OpenCV. Любой отказ — исключение с названной причиной: неверный формат или
+    нечего кодировать — `ValueError`; файловая система отказала (нет каталога, нет
+    прав) — исключение `tofile`/`OSError`, не перехватывается и не глушится.
+    """
+    path = Path(path)
+    suffix = path.suffix
+    if not suffix:
+        raise ValueError(f"у пути нет расширения, формат кодирования не определить: {path}")
+
+    ok, buf = cv2.imencode(suffix, image)
+    if not ok:
+        raise ValueError(f"не удалось закодировать изображение в формат {suffix!r}: {path}")
+
+    buf.tofile(str(path))
+    return path
 
 
 def _rational(tag_dict, tag):
