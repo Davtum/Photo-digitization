@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from facade_digitizer.schema import FacadeModel, Recess, SizeMM
+from facade_digitizer.schema import FacadeModel, Recess, SizeMM, ThetaDeg
 
 
 def test_element_requires_uncertainty_with_size():
@@ -19,6 +19,52 @@ def test_recess_measured_requires_theta():
 def test_recess_assumed_does_not_require_theta():
     r = Recess(value_mm=150, sigma_mm=50, origin="assumed_class_default", datum="quarter_edge")
     assert r.theta_perp_deg is None
+
+
+def test_recess_unavailable_carries_no_value():
+    """`origin = "unavailable"` — данных нет, и это допустимо без value_mm/sigma_mm.
+
+    Задача 18: грань откоса разметили не на той стороне либо ракурс ниже порога
+    применимости. До этой задачи `value_mm`/`sigma_mm` были обязательными `float`
+    без исключения — сборка была бы вынуждена выдумать число ровно там, где
+    спецификация, п. 6.3, это запрещает.
+    """
+    r = Recess(origin="unavailable", reveal_side="right")
+    assert r.value_mm is None
+    assert r.sigma_mm is None
+    assert r.datum is None
+
+
+def test_recess_unavailable_rejects_an_invented_value():
+    """Обратная охрана: `unavailable` не может НЕСТИ число — иначе оно не отличимо
+    от настоящего измерения."""
+    with pytest.raises(ValidationError):
+        Recess(value_mm=150.0, sigma_mm=17.0, origin="unavailable")
+    with pytest.raises(ValidationError):
+        Recess(datum="quarter_edge", origin="unavailable")
+
+
+def test_recess_measured_origin_requires_both_numbers_and_datum():
+    """Любое измеренное происхождение обязано нести value_mm, sigma_mm И datum —
+    `Recess` без одного из них есть половина измерения, а не измерение."""
+    with pytest.raises(ValidationError):
+        Recess(sigma_mm=17.0, origin="operator", datum="frame_plane")
+    with pytest.raises(ValidationError):
+        Recess(value_mm=150.0, origin="operator", datum="frame_plane")
+    with pytest.raises(ValidationError):
+        Recess(value_mm=150.0, sigma_mm=17.0, origin="operator")
+
+
+def test_element_theta_is_optional_but_validated_when_present():
+    """`theta` — новое поле задачи 18 (п. 2.1, п. 10): не θ_cam, угол ЭЛЕМЕНТА."""
+    payload = _minimal_payload()
+    payload["elements"][0]["theta"] = {"x_deg": 21.4, "y_deg": 12.8, "full_deg": 24.7}
+    m = FacadeModel.model_validate(payload)
+    assert m.elements[0].theta == ThetaDeg(x_deg=21.4, y_deg=12.8, full_deg=24.7)
+
+    # Без поля — элемент по-прежнему валиден (обратная совместимость, задача 18).
+    m2 = FacadeModel.model_validate(_minimal_payload())
+    assert m2.elements[0].theta is None
 
 
 def test_schema_version_is_pinned():

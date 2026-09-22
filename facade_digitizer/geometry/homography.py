@@ -230,6 +230,25 @@ def foot_point_in_rectified(H, vh, vv, K):
     return (float(p[0] / p[2]), float(p[1] / p[2]))
 
 
+def apply_homography(H, points):
+    """Точки -> их образ под `H`, в неоднородных координатах. Форма выхода — всегда (N, 2).
+
+    Единственная реализация для всех потребителей, применяющих гомографию к
+    произвольным точкам (а не к регулярной сетке узлов, как `local_gsd_field`):
+    `pipeline/run.py` (сборка конвейера) и `pipeline/elements.py` (оцифровка
+    проёмов). Второй, независимой реализации того же деления намеренно нет —
+    расхождение между копиями было бы невидимо потребителю.
+
+    Деление на ноль подавлено осознанно: знаменатель гомографии обнуляется на
+    линии схода, и вызывающий код обязан заметить это по неконечному результату
+    точки, а не по брошенному предупреждению numpy.
+    """
+    pts = np.atleast_2d(np.asarray(points, dtype=float))
+    homogeneous = np.column_stack([pts, np.ones(len(pts))]) @ np.asarray(H, dtype=float).T
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return homogeneous[:, :2] / homogeneous[:, 2:3]
+
+
 def rectified_to_facade_mm(points_rect, origin_rect, mm_per_rect_unit):
     """Ректифицированные координаты -> миллиметры в системе фасада.
 

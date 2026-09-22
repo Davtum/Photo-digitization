@@ -21,11 +21,11 @@ class SizeMM(Strict):
 
 
 class Recess(Strict):
-    value_mm: float
-    sigma_mm: float
+    value_mm: float | None = None
+    sigma_mm: float | None = None
     origin: Literal["measured_from_reveal", "measured_from_shadow", "fused",
                     "assumed_class_default", "operator", "unavailable"]
-    datum: Literal["quarter_edge", "frame_plane", "glazing_plane"]
+    datum: Literal["quarter_edge", "frame_plane", "glazing_plane"] | None = None
     reveal_side: Literal["left", "right", "top", "bottom"] | None = None
     theta_perp_deg: float | None = None
     consistency: Literal["ok", "suspect", "unchecked"] = "unchecked"
@@ -36,6 +36,48 @@ class Recess(Strict):
         if self.origin in measured and self.theta_perp_deg is None:
             raise ValueError("измеренная глубина обязана нести theta_perp_deg")
         return self
+
+    @model_validator(mode="after")
+    def unavailable_carries_no_invented_number(self):
+        """`origin = "unavailable"` значит «не измерено» — и не может нести число.
+
+        Задача 18 ввела первого потребителя, которому есть что записывать в этот
+        `origin`: грань откоса ниже вычисляемого порога применимости (п. 6.2) либо
+        размеченная не на той стороне проёма (п. 5.5). До неё `value_mm`/`sigma_mm`
+        были обязательными полями `float` БЕЗ исключения для `unavailable`, то есть
+        сама схема заставляла бы выдумать число ровно там, где спецификация,
+        п. 6.3, это запрещает: «значение без происхождения в выход не попадает»,
+        а `unavailable` и есть запись «происхождения нет». `datum` подчиняется
+        тому же правилу: он описывает, ДО ЧЕГО измерена глубина, и для
+        неизмеренной глубины не имеет смысла.
+
+        Обратное направление проверяется тем же местом: любое ИЗМЕРЕННОЕ
+        происхождение обязано нести оба числа и датум — `Recess` без них не
+        измерение, а его историческая половина, неотличимая от забытого поля.
+        """
+        if self.origin == "unavailable":
+            if self.value_mm is not None or self.sigma_mm is not None or self.datum is not None:
+                raise ValueError(
+                    "recess.origin = 'unavailable' не может нести value_mm, sigma_mm "
+                    "или datum: неизмеренная глубина не выпускается числом")
+        elif self.value_mm is None or self.sigma_mm is None or self.datum is None:
+            raise ValueError(
+                "recess: value_mm, sigma_mm и datum обязательны при любом происхождении, "
+                "кроме 'unavailable'")
+        return self
+
+
+class ThetaDeg(Strict):
+    """Угол визирования В ТОЧКЕ ЭЛЕМЕНТА. Спецификация, п. 2.1 и раздел 10.
+
+    Не θ_cam (наклон камеры) и не сводка поля углов кадра — это θ(x, y) этого
+    конкретного элемента, тем же путём, каким конвейер считает поле углов
+    (`facade_digitizer.pipeline.elements`). Подмена одной величины другой —
+    ровно та ошибка, от которой предостерегает п. 2.1.
+    """
+    x_deg: float
+    y_deg: float
+    full_deg: float
 
 
 class ScaleEstimate(Strict):
@@ -119,6 +161,7 @@ class Element(Strict):
     edge_reference: Literal["wall_plane"]
     edge_type: Literal["sharp_wall_edge", "surround", "cladding_edge", "unknown"]
     contour_mm: list[Point]
+    theta: ThetaDeg | None = None
     size_mm: SizeMM
     origin: Literal["auto", "auto_confirmed", "auto_edited", "operator", "regularized"]
     recess: Recess | None = None

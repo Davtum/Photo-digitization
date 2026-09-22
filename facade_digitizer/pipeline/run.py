@@ -36,10 +36,15 @@ from pathlib import Path
 import numpy as np
 
 from facade_digitizer.geometry.angles import local_gsd_field
-from facade_digitizer.geometry.homography import camera_pose, rectified_to_facade_mm
+from facade_digitizer.geometry.homography import (
+    apply_homography,
+    camera_pose,
+    rectified_to_facade_mm,
+)
 from facade_digitizer.pipeline import quality as quality_gate
 from facade_digitizer.pipeline.calib import intrinsics_from_meta, load_profile, undistort
-from facade_digitizer.pipeline.io import load_image
+from facade_digitizer.pipeline.elements import ElementMark, digitize_elements, load_marks
+from facade_digitizer.pipeline.io import load_image, save_image
 from facade_digitizer.pipeline.plane import estimate_plane
 from facade_digitizer.pipeline.rectify import attainable_mm_per_px, rectify
 from facade_digitizer.schema import (
@@ -175,11 +180,15 @@ def _finite_or_none(value):
 
 
 def _apply(H, points):
-    """Точки кадра в ректифицированные единицы. Форма выхода — всегда (N, 2)."""
-    pts = np.atleast_2d(np.asarray(points, dtype=float))
-    homogeneous = np.column_stack([pts, np.ones(len(pts))]) @ np.asarray(H, dtype=float).T
-    with np.errstate(divide="ignore", invalid="ignore"):
-        return homogeneous[:, :2] / homogeneous[:, 2:3]
+    """Точки кадра в ректифицированные единицы. Тонкая обёртка над `apply_homography`.
+
+    Реализация переехала в `geometry.homography` (задача 18), где та же функция
+    нужна и `pipeline.elements`: разметка проёмов переводится в миллиметры фасада
+    ТОЙ ЖЕ гомографией, что и поля кадра здесь, а вторая независимая реализация
+    деления могла разойтись бы с этой незаметно. Имя и сигнатура сохранены —
+    от них зависят существующие тесты этого модуля.
+    """
+    return apply_homography(H, points)
 
 
 def _field_grid(image_size, shape):
@@ -497,7 +506,9 @@ def _needs_operator_model(path, image_id, meta, K, source, plane, reference, ima
 def process(image_path, *, operator_reference: OperatorReference,
             raster_mm_per_px: float, profile_path=None,
             scale_source: str = "operator_reference",
-            image_id: str = "img_0") -> FacadeModel:
+            image_id: str = "img_0",
+            marks: list[ElementMark] | None = None,
+            save_rectified_to=None) -> FacadeModel:
     """Снимок -> модель фасада. Один проход геометрического ядра.
 
     `operator_reference` обязателен: без опорного размера расстояние до плоскости
@@ -513,6 +524,20 @@ def process(image_path, *, operator_reference: OperatorReference,
 
     Несовпадение профиля калибровки со снимком тоже поднимает `ValueError`: профиль
     передан явным действием оператора, и противоречие означает чужой файл.
+
+    `marks` — разметка проёмов оператором (задача 18, `pipeline.elements.ElementMark`),
+    необязательная: без неё `elements` остаётся пустым списком, а `coverage` —
+    `"partial"`, ровно как до появления этой задачи. Разметка требует восстановленной
+    плоскости фасада: на пути `needs_operator` она поднимает `ValueError`, а не
+    молча игнорируется — размечать элементы без гомографии нечем.
+
+    `save_rectified_to` — путь для выровненного растра (`--save-rectified` CLI).
+    Сохраняется ТОТ ЖЕ объект `Rectified`, что и породил `homography.H` этой же
+    записи: второго, независимого вызова `rectify()` здесь нет, поэтому записанная
+    гомография и сохранённый файл не могут разойтись (спецификация задачи 18,
+    требование к шагу 7 плана). Рядом сохраняется маска охвата (`_mask` в имени).
+    Растр — для просмотра и работы оператора, а не носитель измерения: сама
+    разметка выполняется по ИСХОДНОМУ снимку (п. 6.5).
     """
     scale_source = _checked_scale_source(scale_source)
     path = Path(image_path)
@@ -525,6 +550,15 @@ def process(image_path, *, operator_reference: OperatorReference,
 
     plane = estimate_plane(image, K)
     if plane.needs_operator:
+        if marks:
+            raise ValueError(
+                "разметка элементов недоступна: доверие к плоскости ниже порога, "
+                "плоскость не восстановлена, и размечать элементы не на чём "
+                "(сначала нужно подтверждение оператора, спецификация, п. 4.2)")
+        if save_rectified_to is not None:
+            raise ValueError(
+                "растр нечего сохранять: плоскость фасада не восстановлена "
+                "(needs_operator), ректификация не выполнялась")
         return _needs_operator_model(path, image_id, meta, K, source, plane,
                                      operator_reference, image, raster_mm_per_px,
                                      scale_source)
@@ -586,6 +620,12 @@ def process(image_path, *, operator_reference: OperatorReference,
     rectified = rectify(image, plane.H, mm_per_unit, raster_mm_per_px,
                         origin_rect_units=origin_rect)
 
+    if save_rectified_to is not None:
+        raster_path = Path(save_rectified_to)
+        save_image(raster_path, rectified.image)
+        mask_path = raster_path.with_name(f"{raster_path.stem}_mask{raster_path.suffix}")
+        save_image(mask_path, (rectified.valid_mask.astype(np.uint8) * 255))
+
     if scale_source == "operator_reference":
         gsd_at_reference = math.sqrt(sum(
             _finite("gsd_at_reference", _gsd_at(fields.gsd, image_size, point)) ** 2
@@ -607,6 +647,20 @@ def process(image_path, *, operator_reference: OperatorReference,
     bounds_mm = [_finite("facade.bounds_mm", v) for v in
                  (corners_mm[:, 0].min(), corners_mm[:, 1].min(),
                   corners_mm[:, 0].max(), corners_mm[:, 1].max())]
+
+    # Оцифровка проёмов (задача 18). Геометрия передаётся ТА ЖЕ, что уже вычислена
+    # выше и записана в выход этой же записи (`plane.H`, `camera`, `mm_per_unit`,
+    # `origin_rect`) — второй, независимой оценки плоскости для разметки нет.
+    elements = []
+    coverage = "partial"
+    if marks:
+        coverage = ("full" if any(m.class_ == "facade_boundary" for m in marks)
+                    else "partial")
+        elements = digitize_elements(
+            marks, H=plane.H, camera=camera, mm_per_unit=mm_per_unit,
+            origin_rect=origin_rect, image_size=image_size,
+            sigma_px=operator_reference.sigma_px, sigma_rel=sigma_rel,
+            residual_px=plane.confidence.residual_px)
 
     record = ImageRecord(
         id=image_id,
@@ -646,7 +700,7 @@ def process(image_path, *, operator_reference: OperatorReference,
     )
     return FacadeModel(
         software_version=SOFTWARE_VERSION,
-        coverage="partial",
+        coverage=coverage,
         mode="assisted",
         images=[record],
         facade=FacadeRecord(
@@ -661,7 +715,7 @@ def process(image_path, *, operator_reference: OperatorReference,
             # Отсутствие честнее выдуманного числа.
             plane_residual_mm=None,
         ),
-        elements=[],
+        elements=elements,
     )
 
 
@@ -688,6 +742,16 @@ def _parse_args(argv):
                              "геометрическому ядру недоступны")
     parser.add_argument("--profile", default=None,
                         help="профиль калибровки камеры по мишени (JSON)")
+    parser.add_argument("--marks", default=None,
+                        help="JSON-разметка проёмов оператором (задача 18): список "
+                             "объектов class/mounting/edge_type/corners_px[/reveal]; "
+                             "координаты — в ИСХОДНОМ снимке, не в выровненном растре")
+    parser.add_argument("--save-rectified", action="store_true",
+                        help="сохранить выровненный растр и маску охвата рядом с "
+                             "JSON (<имя>_rectified.png, <имя>_rectified_mask.png). "
+                             "Растр — для просмотра оператором и работы с ним, а НЕ "
+                             "носитель измерения: сама разметка — по исходному "
+                             "снимку (спецификация, п. 6.5)")
     parser.add_argument("--out-dir", default=None,
                         help="каталог для выходных JSON; по умолчанию рядом со снимком")
     return parser.parse_args(argv)
@@ -705,16 +769,31 @@ def main(argv=None) -> int:
     reference = OperatorReference(origin_px=tuple(args.origin_px),
                                   span_px=((x1, y1), (x2, y2)),
                                   span_mm=args.span_mm, sigma_px=args.sigma_px)
+    # Одна и та же разметка передаётся на каждый снимок пакета — тем же соглашением,
+    # что уже действует для `reference` (опорная точка и база берутся общими для
+    # всех `images` командной строки). Файл читается и проверяется на строгость
+    # формата ровно один раз, до цикла: негодный `--marks` должен назвать причину
+    # сразу, а не при обработке первого снимка пакета.
+    marks = load_marks(args.marks) if args.marks else None
     failures = 0
     for index, image in enumerate(args.images):
         source = Path(image)
         out_dir = Path(args.out_dir) if args.out_dir else source.parent
+        save_rectified_to = (out_dir / f"{source.stem}_rectified.png"
+                             if args.save_rectified else None)
+        if save_rectified_to is not None:
+            # `save_image` пишет байты сама и каталог не создаёт (задача 17,
+            # починка `cv2.imwrite` на путях с кириллицей); каталог обязан
+            # существовать ДО того, как `process()` попытается в него писать.
+            out_dir.mkdir(parents=True, exist_ok=True)
         try:
             model = process(source, operator_reference=reference,
                             raster_mm_per_px=args.raster_mm_per_px,
                             profile_path=args.profile,
                             scale_source=args.scale_source,
-                            image_id=f"img_{index}")
+                            image_id=f"img_{index}",
+                            marks=marks,
+                            save_rectified_to=save_rectified_to)
         # Отказ по снимку — свойство этого снимка либо переданных для него
         # аргументов; он называется по имени файла и не прекращает пакет.
         except (ValueError, FileNotFoundError) as error:

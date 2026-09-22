@@ -1,0 +1,245 @@
+{
+  "schema_version": "1.1",
+  "software_version": "facade-digitizer 0.1.0",
+  "coverage": "partial",
+  "mode": "assisted",
+  "images": [
+    {
+      "id": "img_0",
+      "path": "data\\cmp\\base\\cmp_b0013.jpg",
+      "camera": {
+        "model": "unknown",
+        "K": [
+          [
+            793.2510527770905,
+            0.0,
+            498.0
+          ],
+          [
+            0.0,
+            793.2510527770905,
+            512.0
+          ],
+          [
+            0.0,
+            0.0,
+            1.0
+          ]
+        ],
+        "dist": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "calibration": "database"
+      },
+      "captured_at": null,
+      "gnss": null,
+      "pose_to_facade": {
+        "cx": 4006.5635749909693,
+        "cy": 4102.516379647103,
+        "cz": 7963.275951096606,
+        "units": "mm",
+        "half_turn": {
+          "resolved": false,
+          "assumption": "снимок считается не перевёрнутым: из двух вариантов взят тот, где ось X фасада растёт вместе с x изображения",
+          "reason": "поворот на 180 градусов не определяется двумя точками схода плоскости фасада: (vh, vv) и (-vh, -vv) задают одни и те же точки",
+          "resolver": "линия схода заведомо горизонтальной плоскости (земли), восстановимая из тех же отрезков кадра; разрешение двузначности выносится в интеграцию"
+        }
+      },
+      "theta_cam_deg": 0.031392495465600724,
+      "theta_field_deg": {
+        "min": 0.7970367036647059,
+        "max": 41.98045048088614,
+        "p95": 37.721831987400066
+      },
+      "quality": {
+        "verdict": "reject",
+        "sharpness": 0.5779069257431382,
+        "gsd_mm_px_min": 10.035642476484647,
+        "gsd_mm_px_max": 10.045093794524778,
+        "theta_field_deg_p95": 37.721831987400066,
+        "reasons": [
+          "недостаточное разрешение: 10.0 мм/px > 5.0"
+        ]
+      },
+      "rectification": {
+        "method": "vanishing_points",
+        "confidence": 0.6579645839329729,
+        "residual_px": 0.32956270765694373,
+        "needs_operator": false
+      },
+      "homography": {
+        "from": "image_px",
+        "to": "rectified_px",
+        "H": [
+          [
+            0.999557300361181,
+            -0.002928419699403388,
+            2.9987017721891607
+          ],
+          [
+            0.0024516240478224755,
+            0.9996877962022946,
+            -1.1290438995459088e-14
+          ],
+          [
+            -6.04638798563864e-7,
+            -3.338939418214544e-7,
+            1.0004719137213773
+          ]
+        ],
+        "origin_rect_px": [
+          99.84539586413814,
+          921.4606458274519
+        ],
+        "attainable_mm_per_px": [
+          0.5153649091010033,
+          10026.987032930072
+        ]
+      }
+    }
+  ],
+  "facade": {
+    "origin": "operator_reference",
+    "bounds_mm": [
+      -1002.4638138969691,
+      -1055.6852721058915,
+      9024.523219033103,
+      9251.612909914174
+    ],
+    "mm_per_rectified_px": 10.04016064257028,
+    "scale": {
+      "source": "assumed_floor_height",
+      "sigma_rel": 0.05,
+      "meets_tolerance": false
+    },
+    "plane_residual_mm": null,
+    "valid_mask": null
+  },
+  "elements": [
+    {
+      "id": "w_000",
+      "class": "window",
+      "mounting": "embedded",
+      "edge_reference": "wall_plane",
+      "edge_type": "unknown",
+      "contour_mm": [
+        [
+          1560.018428085959,
+          7563.851219088644
+        ],
+        [
+          2467.7673837386997,
+          7561.532827347455
+        ],
+        [
+          2469.5670103923567,
+          8201.119330158292
+        ],
+        [
+          1561.8372680334874,
+          8203.40270120531
+        ]
+      ],
+      "theta": {
+        "x_deg": -14.042656588451294,
+        "y_deg": 25.392476800206268,
+        "full_deg": 28.21532619385398
+      },
+      "size_mm": {
+        "width": 907.7422652352542,
+        "height": 639.5715515401503,
+        "sigma_width": 82.8892383938268,
+        "sigma_height": 76.37581564291972
+      },
+      "origin": "operator",
+      "recess": null,
+      "confidence": null,
+      "meets_tolerance": false
+    },
+    {
+      "id": "w_001",
+      "class": "window",
+      "mounting": "embedded",
+      "edge_reference": "wall_plane",
+      "edge_type": "unknown",
+      "contour_mm": [
+        [
+          1555.5288585161445,
+          5985.201664826502
+        ],
+        [
+          2463.325239665019,
+          5982.796822692035
+        ],
+        [
+          2465.0964277646335,
+          6612.276276194395
+        ],
+        [
+          1557.318956281733,
+          6614.6466474218205
+        ]
+      ],
+      "theta": {
+        "x_deg": -14.07298941033338,
+        "y_deg": 15.418471773915261,
+        "full_deg": 20.440262196189565
+      },
+      "size_mm": {
+        "width": 907.7900663434866,
+        "height": 629.464736685492,
+        "sigma_width": 80.61439900234625,
+        "sigma_height": 73.68201240435853
+      },
+      "origin": "operator",
+      "recess": null,
+      "confidence": null,
+      "meets_tolerance": false
+    },
+    {
+      "id": "w_002",
+      "class": "window",
+      "mounting": "embedded",
+      "edge_reference": "wall_plane",
+      "edge_type": "unknown",
+      "contour_mm": [
+        [
+          1539.5996859451031,
+          3828.576219904658
+        ],
+        [
+          2457.25665914592,
+          3826.0260372920834
+        ],
+        [
+          2459.057022271798,
+          4465.8742819984045
+        ],
+        [
+          1541.4194775869737,
+          4468.38904277014
+        ]
+      ],
+      "theta": {
+        "x_deg": -14.147323458676262,
+        "y_deg": 0.3216132869166338,
+        "full_deg": 14.150690179303618
+      },
+      "size_mm": {
+        "width": 917.6507535935818,
+        "height": 639.8330942052226,
+        "sigma_width": 79.72425486616196,
+        "sigma_height": 72.62379445566135
+      },
+      "origin": "operator",
+      "recess": null,
+      "confidence": null,
+      "meets_tolerance": false
+    }
+  ],
+  "groups": []
+}
