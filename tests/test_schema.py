@@ -73,8 +73,21 @@ def test_schema_version_is_pinned():
 
 
 def test_roundtrip_preserves_values():
+    """Обход через JSON сверяется МОДЕЛЬЮ ЦЕЛИКОМ, а не одним полем.
+
+    Прежде проверялась только `width` одного элемента. Такая сверка проходит и
+    тогда, когда по дороге потеряны `sigma_width`, `origin`, `edge_reference`,
+    `facade.scale` или `schema_version`: сериализация выдаёт ключ `class` по
+    алиасу, а разбор принимает и алиас, и имя поля, так что рассогласование имён
+    видно ровно на тех полях, которых никто не смотрит. Сравнение моделей
+    `pydantic` рекурсивно и покрывает все поля сразу.
+    """
     m = FacadeModel.model_validate(_minimal_payload())
     again = FacadeModel.model_validate_json(m.model_dump_json())
+    assert again == m
+    # И тот же JSON после второго обхода: сериализация идемпотентна, то есть
+    # равенство моделей выше не достигнуто за счёт потери на обеих сторонах.
+    assert again.model_dump_json() == m.model_dump_json()
     assert again.elements[0].size_mm.width == 1460
 
 

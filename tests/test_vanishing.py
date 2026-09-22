@@ -27,11 +27,32 @@ def test_detects_segments_on_synthetic_facade():
     assert len(segs) >= 8  # четыре стороны стены плюс контуры проёма
 
 
+def _segment_lengths(segs):
+    return np.hypot(segs[:, 2] - segs[:, 0], segs[:, 3] - segs[:, 1])
+
+
 def test_filters_short_segments():
+    """Фильтр длины отсекает ИМЕННО короткие, а не просто прореживает выборку.
+
+    Прежде проверялось одно `len(long_only) < len(all_segs)` — условие, которому
+    удовлетворяет любое прореживание, включая выброс каждого второго отрезка или
+    обрезку списка по счёту. Здесь проверяется сам порог: в отфильтрованном
+    наборе нет ни одного отрезка короче него, а в исходном такие есть (иначе
+    фильтру нечего было бы делать и проверка зеленела бы вхолостую).
+    """
     img = make_scene().render()
-    long_only = detect_segments(img, min_length_px=500.0)
+    threshold = 500.0
+    long_only = detect_segments(img, min_length_px=threshold)
     all_segs = detect_segments(img, min_length_px=10.0)
+
+    assert len(long_only) > 0
+    assert _segment_lengths(long_only).min() >= threshold
+    assert _segment_lengths(all_segs).min() < threshold
     assert len(long_only) < len(all_segs)
+    # Отсечены ровно те, что короче порога, а не «столько же, но другие»:
+    # число выживших совпадает с числом длинных в полном наборе.
+    assert len(long_only) == int(np.count_nonzero(
+        _segment_lengths(all_segs) >= threshold))
 
 
 def test_returns_empty_on_blank_image():

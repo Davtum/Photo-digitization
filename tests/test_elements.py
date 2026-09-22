@@ -26,6 +26,7 @@ import pytest
 from pydantic import ValidationError
 
 from facade_digitizer.geometry.angles import FIELD_SHAPE, local_gsd_field
+from facade_digitizer.geometry.camera import CameraOnPlane
 from facade_digitizer.geometry.homography import (
     apply_homography,
     camera_pose,
@@ -35,8 +36,10 @@ from facade_digitizer.geometry.parallax import (
     REFERENCE_SIGMA_CZ_REL,
     REFERENCE_SIGMA_THETA_DEG,
     reveal_depth_sigma,
+    signed_reveal_width_mm,
     visible_reveal_side,
 )
+from facade_digitizer.pipeline import quality as quality_gate
 from facade_digitizer.pipeline.elements import (
     ASSISTED_SIZE_TOLERANCE_MM,
     FOCAL_RELATIVE_ERROR,
@@ -56,6 +59,7 @@ from facade_digitizer.pipeline.quality import THETA_MAX_DEG
 from facade_digitizer.pipeline.run import (
     DEFAULT_MARK_SIGMA_PX,
     DEFAULT_OPERATOR_SIGMA_PX,
+    GATE_REJECT_WITHHOLDS_TOLERANCE,
     OperatorReference,
     main,
     process,
@@ -94,6 +98,36 @@ STEEP_VIEW = {"dx": -1500.0, "dy": -3000.0, "dist": 10000.0}
 #: пригодной области, и элемент обязан отвергаться: п. 2.2 нормирует пригодную
 #: область условием на ТОЧКИ, а не на центр элемента.
 CORNER_OUTSIDE_VIEW = {"dx": -500.0, "dy": -1000.0, "dist": 9500.0}
+
+#: Четыре ракурса, на которых ХУДШИМ оказывается КАЖДЫЙ из четырёх углов контура
+#: по очереди. Нужны именно четыре, и вот почему.
+#:
+#: Все прежние фикстуры этого модуля ставили камеру справа-сверху от проёма
+#: (проём лежит в левой нижней четверти фасада), поэтому худшим на ВСЕХ четырёх
+#: оказывался угол № 0 — нижний левый:
+#:
+#:     MILD_VIEW            8.05  6.28  5.77  7.66   -> худший индекс 0
+#:     STEEP_VIEW          25.38 18.73 17.05 24.31   -> худший индекс 0
+#:     CORNER_OUTSIDE_VIEW 34.46 29.36 24.58 31.09   -> худший индекс 0
+#:     SHALLOW_REVEAL_VIEW 17.75 12.70  5.96 14.05   -> худший индекс 0
+#:
+#: На такой выборке «худший угол контура» и «первый угол контура» — одно и то же
+#: число, и проверка, отличавшая худший от ЦЕНТРОИДА, от ПЕРВОГО его не отличала:
+#: подмена `if theta > worst_theta` на `if index == 0` не роняла ни одного из 536
+#: тестов. Ракурсы ниже подобраны переносом опорной точки камеры в каждую из
+#: четырёх четвертей относительно проёма; худший угол везде ниже `THETA_MAX_DEG`,
+#: иначе элемент отвергался бы целиком и проверять было бы нечего.
+#:
+#:     индекс 0 (низ-лево)   камера справа-сверху   8.05 против 6.28 5.77 7.66
+#:     индекс 1 (низ-право)  камера слева-сверху   26.09 против 23.33 19.71 15.26
+#:     индекс 2 (верх-право) камера слева-снизу    22.51 против 10.22 17.35 18.08
+#:     индекс 3 (верх-лево)  камера справа-снизу   27.14 против 25.08 19.68 22.51
+WORST_CORNER_VIEWS = [
+    (0, {"dx": -5000.0, "dy": -3500.0, "dist": 10000.0}),
+    (1, {"dx": -7500.0, "dy": 0.0, "dist": 11000.0}),
+    (2, {"dx": -7500.0, "dy": -5500.0, "dist": 10000.0}),
+    (3, {"dx": 0.0, "dy": -5500.0, "dist": 13000.0}),
+]
 
 #: Ракурс, на котором θ_⊥ видимой грани откоса лежит МЕЖДУ вычисляемым порогом
 #: п. 6.2 (≈10.3° при здешнем GSD) и отозванной спецификацией константой 15°:
@@ -477,6 +511,46 @@ def test_element_theta_is_the_worst_corner_not_the_centroid():
             element.theta.full_deg, rel=1e-9)
 
 
+@pytest.mark.parametrize("worst_index,view", WORST_CORNER_VIEWS,
+                         ids=["corner0", "corner1", "corner2", "corner3"])
+def test_element_theta_is_taken_at_the_worst_corner_whichever_corner_that_is(
+        worst_index, view):
+    """Угол элемента берётся у ХУДШЕГО угла контура — а не у первого и не у центра.
+
+    Предыдущая проверка отличала «худший» от «центроида» и на этом
+    останавливалась. Отличить его от «первого» она не могла: во всех четырёх
+    фикстурах модуля худшим был именно нулевой угол (см. `WORST_CORNER_VIEWS`), и
+    подмена сравнения `theta > worst_theta` на `index == 0` проходила весь набор.
+    Здесь худшим по очереди побывает каждый из четырёх, и обе подмены расходятся
+    с ожиданием на трёх ракурсах из четырёх.
+
+    Проверяется и то, что КОМПОНЕНТЫ взяты в той же точке, что полный угол:
+    тройка, собранная из разных углов контура, не была бы углом ни одного из них.
+    Ожидание считается из ИСТИННЫХ углов проёма сцены, а не из внутренностей
+    модуля.
+    """
+    sc = make_scene(depth=150.0, **view)
+    _, camera, _, _ = exact_geometry(sc)
+    corners = sc.openings[0].corners_mm()
+    thetas = [camera.theta_deg(float(x), float(y)) for x, y in corners]
+
+    # Проверка предположения о ракурсе: он и подобран ради этого.
+    assert int(np.argmax(thetas)) == worst_index
+    assert max(thetas) < THETA_MAX_DEG
+
+    element = _digitize(sc, [_window_mark(sc)])[0]
+    assert element.theta.full_deg == pytest.approx(max(thetas), abs=0.05)
+    if worst_index != 0:
+        # Отличает «худший» от «первый»: на этих трёх ракурсах они разные числа.
+        assert element.theta.full_deg > thetas[0] + 0.5
+    assert element.theta.full_deg > sum(thetas) / 4.0
+
+    x, y = float(corners[worst_index][0]), float(corners[worst_index][1])
+    tan_x, tan_y = camera.tan_theta(x, y)
+    assert element.theta.x_deg == pytest.approx(math.degrees(math.atan(tan_x)), abs=0.05)
+    assert element.theta.y_deg == pytest.approx(math.degrees(math.atan(tan_y)), abs=0.05)
+
+
 def test_element_behind_the_vanishing_line_is_refused():
     """Проём за линией схода — отказ, а не подстановка мусорных координат.
 
@@ -499,7 +573,7 @@ def test_element_behind_the_vanishing_line_is_refused():
 def test_marks_outside_the_frame_are_refused_by_name():
     """Углы разметки обязаны лежать В КАДРЕ — тот же контракт, что у опорных точек.
 
-    Без этой охраны `_nearest_node` зажимает индекс к краю сетки, и локальное
+    Без этой охраны `angles.nearest_node` зажимает индекс к краю сетки, и локальное
     разрешение «у проёма» берётся из совсем другого места кадра — ровно тот
     дефект, который проект уже нашёл и закрыл для опорной точки оператора
     (`run.py:_points_in_frame`). Пиксельные координаты привязаны к снимку, и
@@ -583,14 +657,63 @@ def test_recess_sigma_carries_the_sec_squared_phi_conversion():
     sigma_u = cam.cz / math.cos(phi) ** 2 * math.radians(REFERENCE_SIGMA_THETA_DEG)
     expected = reveal_depth_sigma(width_mm, u_mm, cam.cz,
                                   math.sqrt(2.0) * SIGMA_PX * gsd, sigma_u,
-                                  REFERENCE_SIGMA_CZ_REL * cam.cz)
+                                  SIGMA_REL * cam.cz)
     without_sec2 = reveal_depth_sigma(
         width_mm, u_mm, cam.cz, math.sqrt(2.0) * SIGMA_PX * gsd,
         cam.cz * math.radians(REFERENCE_SIGMA_THETA_DEG),
-        REFERENCE_SIGMA_CZ_REL * cam.cz)
+        SIGMA_REL * cam.cz)
 
     assert element.recess.sigma_mm == pytest.approx(expected, rel=2e-3)
     assert element.recess.sigma_mm != pytest.approx(without_sec2, rel=2e-3)
+
+
+def test_recess_sigma_takes_the_distance_uncertainty_from_the_measured_scale():
+    """σ дистанции до плоскости берётся ИЗМЕРЕННАЯ, а не опорные 0.4 % п. 6.2.
+
+    `camera_pose` кладёт в `cz` ровно `mm_per_unit`, а `mm_per_unit` задан
+    опорным размером оператора — значит, относительная погрешность дистанции есть
+    в точности `facade.scale.sigma_rel` того же выходного файла. Допущение
+    `parallax.REFERENCE_SIGMA_CZ_REL` (0.4 %) верно В МОДУЛЕ-ИСТОЧНИКЕ, где
+    фактической величины нет; у потребителя, который её знает, оно называло бы
+    слагаемое не своим происхождением.
+
+    Различитель — не два близких числа, а два далёких: источник 1 п. 6.3 даёт
+    σ_rel ≈ 0.2 %, типовая высота этажа (источник 4) — 5 %, то есть σ_Cz
+    отличается в 25 раз. Тот же ракурс, та же разметка, то же разрешение;
+    меняется ровно `sigma_rel`.
+    """
+    sc = make_scene(depth=150.0, **STEEP_VIEW)
+    mark, side = _reveal_mark_for(sc)
+    gsd = 4.0
+    field = np.full(FIELD_SHAPE, gsd)
+
+    measured = _digitize(sc, [mark], gsd_field=field, sigma_rel=SIGMA_REL)[0]
+    assumed_floor = _digitize(sc, [mark], gsd_field=field, sigma_rel=0.05)[0]
+
+    assert measured.recess.value_mm == pytest.approx(assumed_floor.recess.value_mm,
+                                                     rel=1e-12)
+    assert assumed_floor.recess.sigma_mm > measured.recess.sigma_mm + 1.0
+
+    op = sc.openings[0]
+    cam = sc.camera_on_plane()
+    edge_x = op.x if side == "left" else op.x + op.width
+    u_mm = abs(edge_x - cam.cx)
+    depth = measured.recess.value_mm
+    width_mm = depth * u_mm / (cam.cz + depth)
+    phi = math.atan(u_mm / cam.cz)
+    sigma_u = cam.cz / math.cos(phi) ** 2 * math.radians(REFERENCE_SIGMA_THETA_DEG)
+
+    for element, sigma_rel in ((measured, SIGMA_REL), (assumed_floor, 0.05)):
+        expected = reveal_depth_sigma(width_mm, u_mm, cam.cz,
+                                      math.sqrt(2.0) * SIGMA_PX * gsd, sigma_u,
+                                      sigma_rel * cam.cz)
+        assert element.recess.sigma_mm == pytest.approx(expected, rel=2e-3)
+
+    # И не опорное допущение модуля параллакса: на источнике 4 оно вдесятеро мало.
+    from_reference = reveal_depth_sigma(width_mm, u_mm, cam.cz,
+                                        math.sqrt(2.0) * SIGMA_PX * gsd, sigma_u,
+                                        REFERENCE_SIGMA_CZ_REL * cam.cz)
+    assert assumed_floor.recess.sigma_mm != pytest.approx(from_reference, rel=2e-3)
 
 
 def test_recess_threshold_is_computed_not_the_withdrawn_fifteen_degrees():
@@ -636,6 +759,141 @@ def test_recess_on_the_invisible_side_is_marked_unavailable_not_measured():
     assert element.recess is not None
     assert element.recess.origin == "unavailable"
     assert element.recess.reveal_side == wrong_side
+
+
+@pytest.mark.parametrize("edge_type,mounting", [
+    ("sharp_wall_edge", "protruding"),
+    ("cladding_edge", "embedded"),
+    ("surround", "embedded"),
+    ("unknown", "embedded"),
+])
+def test_recess_is_unavailable_when_the_outer_edge_is_not_in_the_wall_plane(
+        edge_type, mounting):
+    """Глубина отсчитывается ОТ НАРУЖНОЙ КРОМКИ — значит, требует её положения.
+
+    `edge_reference` и есть утверждение о том, где та кромка лежит. При
+    `"offset_plane"` п. 5.3 сама объявляет своё допущение нарушенным: элемент
+    обрабатывается как выступающий (п. 5.6), вынос НЕ ИЗМЕРЕН, и `recess`
+    помечается `unavailable` (спецификация, п. 17). При `"unknown"` про кромку не
+    известно ничего.
+
+    Прежде связь существовала только для `edge_reference` и `meets_tolerance`, а
+    `recess` считался безусловно, и один и тот же элемент выходного файла
+    утверждал разом «контур не лежит в плоскости стены»
+    (`edge_reference: "offset_plane"`) и «глубина измерена по откосу до ребра
+    четверти» (`origin: "measured_from_reveal"`, `datum: "quarter_edge"`).
+    Измерено: на всех трёх сочетаниях выдавалось `value_mm = 150.0`.
+    """
+    sc = make_scene(depth=150.0, **STEEP_VIEW)
+    mark, side = _reveal_mark_for(sc, edge_type=edge_type, mounting=mounting)
+    element = _digitize(sc, [mark])[0]
+
+    assert element.edge_reference != "wall_plane"
+    assert element.recess is not None
+    assert element.recess.origin == "unavailable"
+    assert element.recess.value_mm is None
+    assert element.recess.sigma_mm is None
+    assert element.recess.datum is None
+    # Сторона, которую указал оператор, сохраняется: отказ назван, а не безмолвен.
+    assert element.recess.reveal_side == side
+
+
+def test_recess_is_measured_when_the_outer_edge_is_in_the_wall_plane():
+    """Контроль к предыдущему: при `wall_plane` та же разметка даёт число.
+
+    Без него проверка выше зеленела бы и от `recess`, переставшего считаться
+    вообще.
+    """
+    sc = make_scene(depth=150.0, **STEEP_VIEW)
+    mark, _ = _reveal_mark_for(sc, edge_type="sharp_wall_edge", mounting="embedded")
+    element = _digitize(sc, [mark])[0]
+
+    assert element.edge_reference == "wall_plane"
+    assert element.recess.origin == "measured_from_reveal"
+    assert element.recess.value_mm == pytest.approx(150.0, rel=0.05)
+
+
+def test_recess_refuses_a_protruding_element_instead_of_reporting_a_positive_depth():
+    """Выступающий элемент не выдаёт ПОЛОЖИТЕЛЬНОЙ глубины, а отказывает по имени.
+
+    Сцена — тот же проём с `depth = -150` (истинно выступающий), разметка —
+    `mounting = "embedded"`, `edge_type = "sharp_wall_edge"`, то есть оператор
+    ошибся в способе установки. `edge_reference` при такой разметке равен
+    `"wall_plane"`, и охрана предыдущей проверки сюда не дотягивается: решает
+    только НАПРАВЛЕНИЕ смещения внутренней кромки.
+
+    Прежде знак снимался дважды — `abs` у проекции |u| в `parallax.reveal_depth`
+    и `abs(наружная − внутренняя)` здесь, — и вместе это делало отрицательный
+    результат невозможным: измерено, что при истине −150 мм выдавалось уверенное
+    `value_mm = +154.6` с `datum = "quarter_edge"` и без единого признака
+    неисправности, то есть число НЕВЕРНОГО ЗНАКА в поле, несущем главный
+    заявленный вклад работы.
+
+    Отказ, а не отрицательное число: вынос — отдельная величина `offset_mm`
+    следующего этапа (п. 5.6), а не заглубление с другим знаком, и поля под неё
+    в `Recess` нет.
+    """
+    sc = make_scene(depth=-150.0, **STEEP_VIEW)
+    op = sc.openings[0]
+    cam = sc.camera_on_plane()
+    visible_side, _ = visible_reveal_side(cam, op.x, op.x + op.width,
+                                          op.y, op.y + op.height)
+    mark, _ = _reveal_mark_for(sc, side=visible_side, mounting="embedded",
+                               edge_type="sharp_wall_edge")
+    element = _digitize(sc, [mark])[0]
+
+    assert element.edge_reference == "wall_plane"    # охрана выше здесь не работает
+    assert element.recess is not None
+    assert element.recess.origin == "unavailable"
+    assert element.recess.value_mm is None
+    assert element.recess.reveal_side == visible_side
+
+
+def test_signed_reveal_width_changes_sign_with_the_side_the_inner_edge_moved_to():
+    """`signed_reveal_width_mm`: знак задан позой, а не ориентацией нормали.
+
+    Внутренняя кромка, смещённая К опорной точке F, — заглубление (плюс); ОТ неё —
+    вынос (минус). Смена ориентации `edge_normal` меняет знак обоих сомножителей
+    и потому результата не трогает: `(1, 0)` и `(−1, 0)` обязаны дать одно число.
+    """
+    cam = CameraOnPlane(cx=0.0, cy=3000.0, cz=10000.0)
+    edge_x, edge_y = 5000.0, 3000.0          # кромка справа от F
+
+    recessed = signed_reveal_width_mm(cam, edge_x, edge_y, 4950.0, 3000.0, (1.0, 0.0))
+    protruding = signed_reveal_width_mm(cam, edge_x, edge_y, 5050.0, 3000.0, (1.0, 0.0))
+    assert recessed == pytest.approx(50.0)
+    assert protruding == pytest.approx(-50.0)
+
+    # Ориентация нормали безразлична, положение F — нет.
+    assert signed_reveal_width_mm(cam, edge_x, edge_y, 4950.0, 3000.0,
+                                  (-1.0, 0.0)) == pytest.approx(50.0)
+    mirrored = CameraOnPlane(cx=10000.0, cy=3000.0, cz=10000.0)   # F справа от кромки
+    assert signed_reveal_width_mm(mirrored, edge_x, edge_y, 4950.0, 3000.0,
+                                  (1.0, 0.0)) == pytest.approx(-50.0)
+
+
+def test_reveal_points_behind_the_vanishing_line_are_refused_like_the_corners():
+    """Охрана видимости распространяется на точки грани откоса, а не только на углы.
+
+    Точка за линией схода даёт КОНЕЧНЫЕ, но бессмысленные миллиметры, поэтому
+    проверка на `isfinite` внутри `_digitize_recess` её не ловит. Углы контура
+    проверялись `_in_front_of_camera`, `reveal.inner_edge_px` — нет, хотя
+    переводятся тем же `H` и в той же строке смысла.
+
+    Ракурс — `GRAZING_VIEW` (камера в 200 мм от плоскости, 20 м вбок): правая
+    половина кадра лежит за линией схода. Углы ставятся в левой, видимой
+    половине, кромка откоса — в правой.
+    """
+    sc = make_scene(dx=-20000.0, dy=0.0, dist=200.0, depth=150.0)
+    mark = ElementMark.model_validate({
+        "class": "window", "mounting": "embedded", "edge_type": "sharp_wall_edge",
+        "corners_px": [[100.0, 1900.0], [300.0, 1900.0],
+                       [300.0, 2000.0], [100.0, 2000.0]],
+        "reveal": {"side": "right",
+                   "inner_edge_px": [[5279.0, 1900.0], [5279.0, 2000.0]]},
+    })
+    with pytest.raises(ValueError, match="линией схода"):
+        _digitize(sc, [mark])
 
 
 # --- 5a. Кромка, про которую не известно, что она в плоскости стены ---------------
@@ -1021,6 +1279,72 @@ def test_process_feeds_elements_the_geometry_and_the_numbers_it_records(tmp_path
             residual_mm=record.rectification.residual_px * gsd_local,
             focal_rel=focal_rel)
         assert sigma == pytest.approx(expected, rel=1e-9)
+
+
+def test_the_quality_gate_acts_on_its_own_verdict(tmp_path, monkeypatch):
+    """Шлюз качества ВЕТВИТСЯ на вердикт, который сам же и вынес. Спецификация, п. 4.1.
+
+    Прежде `process` считала вердикт, клала его в файл и на него не смотрела, а
+    CLI печатала его и возвращала 0. Базовый кадр этих тестов имеет
+    `verdict = "reject"` (разрешение хуже порога) — и на нём считалось всё, до
+    `meets_tolerance: true` включительно: один файл утверждал разом «кадр не
+    удовлетворяет требованию п. 2.2 к разрешению» и «габарит в допуске того же
+    п. 2.2». На наборе CMP вердикт `ok` не получил ни один снимок из 378, и все
+    378 были обработаны так же, как получившие бы его.
+
+    Проверяется, что решает именно ВЕРДИКТ, а не σ: между двумя проходами
+    меняется ровно порог шлюза, кадр и разметка те же, и σ габарита обязана
+    совпасть до последнего знака. Меняется только право утверждать о ней.
+    """
+    sc, path, _, _ = _cli_scene(tmp_path)
+    reference, _ = _scene_reference(sc)
+    marks = [_window_mark(sc)]
+
+    rejected = process(path, operator_reference=reference, raster_mm_per_px=10.0,
+                       marks=marks)
+    assert rejected.images[0].quality.verdict == "reject"
+    assert rejected.elements[0].meets_tolerance is None
+    assert GATE_REJECT_WITHHOLDS_TOLERANCE in rejected.images[0].quality.reasons
+
+    # Тот же кадр, та же разметка, та же геометрия — меняется ТОЛЬКО порог шлюза.
+    monkeypatch.setattr(quality_gate, "DEFAULT",
+                        quality_gate.Thresholds(gsd_max_mm_px=10.0))
+    accepted = process(path, operator_reference=reference, raster_mm_per_px=10.0,
+                       marks=marks)
+
+    assert accepted.images[0].quality.verdict != "reject"
+    assert accepted.elements[0].meets_tolerance is not None
+    assert GATE_REJECT_WITHHOLDS_TOLERANCE not in accepted.images[0].quality.reasons
+    assert (accepted.elements[0].size_mm.sigma_width
+            == pytest.approx(rejected.elements[0].size_mm.sigma_width, rel=1e-12))
+    assert (accepted.elements[0].size_mm.width
+            == pytest.approx(rejected.elements[0].size_mm.width, rel=1e-12))
+
+
+def test_the_quality_gate_withholds_the_claim_without_erasing_the_measurement(tmp_path):
+    """Отбраковка помечает, а не уничтожает улику: габарит, σ и причины остаются.
+
+    Выбор ветвления обоснован в `run.GATE_REJECT_WITHHOLDS_TOLERANCE`; здесь
+    закрепляется его наблюдаемая часть. Отказ исключением не записал бы выходного
+    файла вовсе, и оператор потерял бы `quality.reasons` — единственное, что
+    называет, ЧТО с кадром не так.
+    """
+    sc, path, _, _ = _cli_scene(tmp_path)
+    reference, _ = _scene_reference(sc)
+    model = process(path, operator_reference=reference, raster_mm_per_px=10.0,
+                    marks=[_window_mark(sc)])
+    element = model.elements[0]
+    op = sc.openings[0]
+
+    assert model.images[0].quality.verdict == "reject"
+    assert element.size_mm.sigma_width > 0.0
+    assert element.size_mm.width == pytest.approx(op.width,
+                                                  abs=3.0 * element.size_mm.sigma_width)
+    assert any("недостаточное разрешение" in r
+               for r in model.images[0].quality.reasons)
+    # `None`, а не `False`: «на таком кадре не проверяем» и «проверили и не
+    # прошло» — разные утверждения, и второе здесь необосновано.
+    assert element.meets_tolerance is not False
 
 
 def test_process_maps_the_recorded_pixels_to_the_recorded_millimetres(tmp_path):

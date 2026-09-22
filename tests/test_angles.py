@@ -3,14 +3,19 @@ from itertools import pairwise
 import numpy as np
 import pytest
 
+from facade_digitizer.geometry import angles
 from facade_digitizer.geometry.angles import (
+    FIELD_SHAPE,
     angle_map,
     local_gsd,
     local_gsd_field,
+    nearest_node,
     usable_mask,
 )
 from facade_digitizer.geometry.camera import CameraOnPlane
 from facade_digitizer.geometry.homography import homography_from_vanishing_points
+from facade_digitizer.pipeline import quality
+from facade_digitizer.pipeline.quality import usable_fraction
 from tests.test_homography import CORNERS, GRAZING_VIEW, apply, exact_vps
 from tests.test_synth import SIZE, K, make_scene
 
@@ -221,3 +226,77 @@ def test_grid_maximum_does_not_converge_when_vanishing_line_crosses_frame():
     maxima = [float(np.nanmax(local_gsd(H, 1.0, SIZE, shape=(n, n))))
               for n in (64, 256, 512)]
     assert max(maxima) / min(maxima) > 100.0
+
+
+# --- Порог углового условия объявлен один раз -------------------------------------
+
+
+@pytest.mark.parametrize("threshold", [10.0, 45.0])
+def test_usable_mask_default_follows_the_declaration(monkeypatch, threshold):
+    """Умолчание `usable_mask` следует за `THETA_MAX_DEG`, а не за своим литералом.
+
+    Прямая сверка умолчания с объявлением ничего не доказывает: CPython делит
+    равные вещественные константы внутри одного кодового объекта, поэтому
+    `usable_mask.__defaults__[0] is THETA_MAX_DEG` истинно и тогда, когда в
+    сигнатуре стоит собственный литерал `30.0`. Единственный различитель —
+    ПОВЕДЕНИЕ при изменённом объявлении: величина, действительно объявленная
+    один раз, следует за ним, а второе объявление — нет.
+
+    То же и у `pipeline.quality.usable_fraction`, посчитанной по тому же полю:
+    маска и доля обязаны говорить об одной и той же пригодной области.
+    """
+    cam = CameraOnPlane(cx=10000.0, cy=7500.0, cz=12000.0)
+    am = angle_map(cam, (0.0, 0.0, 20000.0, 15000.0), (32, 32))
+
+    monkeypatch.setattr(angles, "THETA_MAX_DEG", threshold)
+    monkeypatch.setattr(quality, "THETA_MAX_DEG", threshold)
+
+    assert np.array_equal(usable_mask(am), usable_mask(am, threshold))
+    assert usable_fraction(am.theta_full) == pytest.approx(
+        usable_fraction(am.theta_full, threshold))
+    # Порог здесь действительно что-то режет, иначе равенство выполнялось бы
+    # на любых двух числах сразу.
+    assert 0.0 < float(usable_mask(am).mean()) < 1.0
+
+
+# --- Узел сетки, ближайший к точке кадра ------------------------------------------
+
+
+@pytest.mark.parametrize("value_px,expected", [
+    (0.0, 0), (5279.0, 63), (2639.5, 32), (-100.0, 0), (99999.0, 63),
+])
+def test_nearest_node_maps_the_frame_onto_the_grid(value_px, expected):
+    """Сетка покрывает `[0, extent - 1]` концами включительно, индекс зажат к краю.
+
+    Зажим — последняя охрана, а не проверка входа: точки обязаны лежать в кадре,
+    и это проверяют вызывающие. Без зажима индекс ушёл бы за границу массива, с
+    ним — разрешение «у проёма» бралось бы из края кадра, поэтому обе крайние
+    строки здесь проверяются явно.
+    """
+    assert nearest_node(value_px, 5280, FIELD_SHAPE[0]) == expected
+
+
+def test_nearest_node_degenerates_to_zero_on_a_grid_without_extent():
+    """Сетка из одного узла либо кадр в один пиксель: делить не на что."""
+    assert nearest_node(17.0, 1, 64) == 0
+    assert nearest_node(17.0, 5280, 1) == 0
+
+
+def test_both_consumers_share_one_nearest_node():
+    """`pipeline.run` и `pipeline.elements` берут ЭТУ функцию, а не свою копию.
+
+    Прежде формула была выписана в обоих модулях, и `elements.py` прямо называл
+    причиной цикл импорта. Цикла нет: оба модуля уже импортируют
+    `geometry.angles`, а `geometry.angles` не импортирует ни одного из них. Две
+    копии одной формулы расходятся молча — σ элемента считалась бы по одному узлу
+    поля, а `quality.gsd_mm_px_max` того же файла по другому. Сверяется
+    тождество объектов: совпадение исходного текста двух копий проверкой не
+    является.
+    """
+    from facade_digitizer.pipeline import elements as pipeline_elements
+    from facade_digitizer.pipeline import run as pipeline_run
+
+    assert pipeline_run.nearest_node is nearest_node
+    assert pipeline_elements.nearest_node is nearest_node
+    assert not hasattr(pipeline_run, "_nearest_node")
+    assert not hasattr(pipeline_elements, "_nearest_node")

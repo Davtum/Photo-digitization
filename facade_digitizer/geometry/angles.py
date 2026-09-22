@@ -14,6 +14,48 @@ from .camera import CameraOnPlane
 #: объявляют своё значение рядом.
 FIELD_SHAPE = (64, 64)
 
+#: Порог углового условия п. 2.2: угол визирования на точку не свыше 30°.
+#:
+#: Объявлен ЗДЕСЬ и ровно один раз, как и `FIELD_SHAPE`, и по той же причине.
+#: Это порог ПРИГОДНОСТИ ТОЧКИ, а не порог вердикта: угловое условие
+#: предъявляется элементу, а на уровне кадра выражается долей пригодной области
+#: (`pipeline.quality.Thresholds.usable_min_fraction`). По одной и той же
+#: величине считают `usable_mask` здесь, `pipeline.quality.usable_fraction`,
+#: маска пригодности сборки конвейера (`pipeline.run._frame_fields`) и порог
+#: отказа по элементу (`pipeline.elements.digitize_elements`). Прежде она была
+#: объявлена дважды — числом в умолчании `usable_mask` и константой
+#: `pipeline.quality.THETA_MAX_DEG`, — причём вторая прямо утверждала о себе
+#: «величина живёт здесь, а не в двух местах порознь». `pipeline.quality`
+#: импортирует её отсюда и переэкспортирует под прежним именем: геометрия не
+#: вправе зависеть от конвейера, обратное направление — законно.
+THETA_MAX_DEG = 30.0
+
+
+def nearest_node(value_px: float, extent_px: int, count: int) -> int:
+    """Индекс ближайшего узла сетки, покрывающей `[0, extent_px - 1]` из `count` узлов.
+
+    Объявлена здесь, рядом с `FIELD_SHAPE`, потому что отвечает на вопрос об этой
+    же сетке: какой её узел ближе всего к точке кадра. Прежде функция была
+    продублирована в `pipeline.run` и `pipeline.elements` со ссылкой на цикл
+    импорта как на причину — цикла нет: оба модуля уже импортируют
+    `geometry.angles`, а `geometry.angles` не импортирует ни одного из них.
+    Две копии одной формулы расходятся молча, и расхождение проявилось бы тем,
+    что σ элемента посчитана по одному узлу поля, а `quality.gsd_mm_px_max` того
+    же файла — по другому.
+
+    Зажим индекса к краю сетки — последняя охрана, а не проверка входа: точки
+    обязаны лежать В КАДРЕ, и это проверяют вызывающие
+    (`pipeline.run._points_in_frame`, `pipeline.elements._points_in_frame`) до
+    всякого обращения сюда. Без той проверки зажим брал бы разрешение «у проёма»
+    из совсем другого места кадра, причём молча: измерено, что точка, вышедшая за
+    правый край на 1267 px, получает узел края и вместе с ним правдоподобное
+    конечное значение.
+    """
+    if extent_px <= 1 or count <= 1:
+        return 0
+    idx = round(value_px / (extent_px - 1) * (count - 1))
+    return max(0, min(count - 1, idx))
+
 
 @dataclass(frozen=True)
 class AngleMap:
@@ -44,9 +86,21 @@ def angle_map(cam: CameraOnPlane, bounds_mm: tuple, shape: tuple) -> AngleMap:
                     np.degrees(np.arctan(np.hypot(tan_x, tan_y))), bounds_mm)
 
 
-def usable_mask(am: AngleMap, theta_max_deg: float = 30.0) -> np.ndarray:
-    """Маска пригодной области: полный угол визирования не превосходит порога."""
-    return am.theta_full <= theta_max_deg
+def usable_mask(am: AngleMap, theta_max_deg: float | None = None) -> np.ndarray:
+    """Маска пригодной области: полный угол визирования не превосходит порога.
+
+    Умолчание — `THETA_MAX_DEG` этого модуля, и берётся оно В МОМЕНТ ВЫЗОВА, а не
+    защёлкивается в сигнатуре. Разница не косметическая: записанное в умолчании
+    значение вычисляется один раз при импорте, и проверить, что оно пришло
+    ИМЕННО ОТ объявления, а не от собственного литерала `30.0`, нечем — CPython
+    делит равные вещественные константы внутри одного кодового объекта, поэтому
+    `usable_mask.__defaults__[0] is THETA_MAX_DEG` истинно в обоих случаях. При
+    позднем связывании второе объявление становится наблюдаемым: умолчание
+    следует за `THETA_MAX_DEG`, а литерал — нет
+    (`tests/test_angles.py::test_usable_mask_default_follows_the_declaration`).
+    """
+    threshold = THETA_MAX_DEG if theta_max_deg is None else theta_max_deg
+    return am.theta_full <= threshold
 
 
 class LocalGsdField(NamedTuple):
