@@ -19,8 +19,18 @@
 миллиметры фасада ТОЙ ЖЕ гомографией `H`, что записана в выходной файл
 (`facade_digitizer.geometry.homography.apply_homography`) — второй, независимой
 реализации этого перевода в модуле сознательно нет: разойдись она с первой,
-расхождение было бы невидимо. Растр, который сохраняет CLI (`--save-rectified`),
-служит оператору для ПРОСМОТРА и не является носителем измерения.
+расхождение было бы невидимо. По той же причине модуль НЕ считает поле локального
+разрешения сам: `gsd_field` передаётся вызывающим — тем самым полем, по которому
+он же записал `quality.gsd_mm_px_min/max` этого же файла. Второй, независимо
+посчитанный экземпляр поля совпадал бы с первым ровно до тех пор, пока кто-нибудь
+не изменит сетку у одного из двух. Растр, который сохраняет CLI
+(`--save-rectified`), служит оператору для ПРОСМОТРА и не является носителем
+измерения.
+
+**Точность указания точки здесь СВОЯ.** `sigma_px` этого модуля — точность клика по
+углу проёма, а не по концам опорной базы масштаба: это разные действия оператора,
+выполняемые на разном увеличении, и сливать их в одну величину нельзя (см.
+`run.py:DEFAULT_MARK_SIGMA_PX` против `run.py:DEFAULT_OPERATOR_SIGMA_PX`).
 
 **Откуда берётся σ направления позы для перевода в миллиметры глубины (п. 6.2).**
 Функция `reveal_depth_theta_min_deg` и, вслед за ней, `_recess_sigma_mm` берут
@@ -44,11 +54,17 @@
    −0.37…−0.43). Использовать его как источник σ_θ значило бы выдать заведомо
    слабый предиктор за измерение точности — ровно то, что спецификация запрещает.
 
-Итог: `REFERENCE_SIGMA_THETA_DEG` — консервативная константа, а не переменная по
-доверию. Она завышает σ_u (а с ним и σ_depth) на фасадах с выраженными вертикальными
-членениями примерно в 7.6 раза (0.344° / 0.045°) против достижимого там запаса, но
-не занижает её нигде: ошибка — в БЕЗОПАСНУЮ сторону, как и требует общий принцип
-проекта (`geometry/parallax.py`, докстринг `reveal_depth_sigma`).
+**Чем эта величина является и чем не является.** Доказано следующее:
+`REFERENCE_SIGMA_THETA_DEG` — P95 измеренного распределения ошибки направления на
+разреженной сцене, то есть она мажорирует типичный случай и на обогащённых фасадах
+завышает σ_u (а с ним и σ_depth) примерно в 7.6 раза (0.344° / 0.045°) против
+достижимого там запаса. Границей ошибки она при этом НЕ является: P95 по
+построению оставляет двадцатую часть выборки выше себя, и сама выборка собрана
+ПОСЛЕ отбраковки шлюзом доверия, тогда как п. 4.2 прямо говорит, что доверие
+предсказателем точности не является — то есть шлюз недостающей границы не
+восстанавливает. Утверждение «не занижает нигде» из этого не следует и снято;
+верно лишь то, что величина консервативна в типичном случае и что более сильного
+утверждения измерениями проекта не обеспечено.
 """
 import json
 import math
@@ -58,7 +74,6 @@ from typing import Literal
 import numpy as np
 from pydantic import ConfigDict, Field, model_validator
 
-from facade_digitizer.geometry.angles import local_gsd_field
 from facade_digitizer.geometry.camera import CameraOnPlane
 from facade_digitizer.geometry.homography import apply_homography, rectified_to_facade_mm
 from facade_digitizer.geometry.parallax import (
@@ -71,26 +86,110 @@ from facade_digitizer.geometry.parallax import (
 from facade_digitizer.pipeline.quality import THETA_MAX_DEG
 from facade_digitizer.schema import Element, Point, Recess, SizeMM, Strict, ThetaDeg
 
-#: Сетка узлов для локального разрешения. То же значение, что `run.py:FIELD_SHAPE`,
-#: но совпадение не обязательно: `local_gsd_field` — чистая функция от (H,
-#: mm_per_unit, image_size), и достаточно мелкая сетка даёт устойчивый ближайший
-#: узел у любого угла проёма. Отдельная константа — чтобы `elements.py` оставался
-#: самостоятельным модулем и не зависел от приватных имён `run.py`.
-FIELD_SHAPE = (64, 64)
-
 #: Цель п. 2.2 для режима `assisted`: 1σ ≤ 10 мм на габарит по наружному контуру.
-#: `meets_tolerance` сравнивает с этим значением ПОСЧИТАННУЮ σ (RSS четырёх
-#: слагаемых п. 6.1 при фактических угле и GSD), а не берёт готовый ответ по
-#: режиму — ровно то, что требует спецификация («`meets_tolerance` вычисляется по
-#: фактическому углу, а не по режиму», п. 6.1).
+#: `meets_tolerance` сравнивает с этим значением ПОСЧИТАННУЮ σ (RSS слагаемых
+#: п. 6.1 при фактических угле и GSD), а не берёт готовый ответ по режиму — ровно
+#: то, что требует спецификация («`meets_tolerance` вычисляется по фактическому
+#: углу, а не по режиму», п. 6.1).
 ASSISTED_SIZE_TOLERANCE_MM = 10.0
 
 #: Неплоскостность стены, п. 6.1: диапазон ±20–50 мм, эффект = отклонение·tg θ.
-#: Взята ВЕРХНЯЯ граница диапазона — консервативная оценка, а не «типичное»
-#: значение: недооценка здесь означала бы заниженную σ, то есть ошибку в опасную
-#: сторону (общий принцип проекта). Совпадает с верхней строкой таблицы п. 6.1: при
-#: θ = 30° даёт 50·tg30° ≈ 28.9 мм — ровно верхний край названного там «11.5–29 мм».
-WALL_FLATNESS_DEVIATION_MM = 50.0
+#:
+#: **Это ДОПУЩЕНИЕ, а не измерение**, и поэтому оно названо и перекрывается
+#: (`digitize_elements(wall_flatness_mm=...)`, CLI `--wall-flatness-mm`). Все
+#: прочие слагаемые п. 6.1 берутся по факту: разрешение — измеренное поле, невязка —
+#: измеренная невязка, угол — фактический угол ЭТОГО элемента. Неплоскостность
+#: стены конвейер не измеряет вовсе, и единственное, что он может сделать честно, —
+#: назвать принятую величину и дать её заменить тому, кто про эту стену знает
+#: больше.
+#:
+#: **Умолчание ВЫВЕДЕНО из собственных утверждений п. 6.1**, а не выбрано из
+#: диапазона на глаз. Спецификация делает про этот бюджет два количественных
+#: заявления, и оба обязаны воспроизводиться:
+#:
+#: 1. RSS режима `assisted` равна 6.0–13.7 мм при θ ≤ 8°. Нижний край берётся по
+#:    нижним концам ВСЕХ строк таблицы (σ_px 0.5, σ_rel 0.14 %, невязка 3 мм,
+#:    дисторсия 2.5 мм, неплоскостность 20 мм), верхний — по верхним (σ_px 1,
+#:    σ_rel 0.28 %, невязка 7 мм, дисторсия 5 мм, неплоскостность 50 мм).
+#:    Пересчитано: 6.33 и 13.82 мм — ветви опознаны верно.
+#: 2. «Цель 1σ ≤ 10 мм достижима при θ ≲ 15–20°», и диапазон до 30°
+#:    СОХРАНЯЕТСЯ как рабочий.
+#:
+#: Заявление 2 достижимо только на благоприятной ветви заявления 1 (на
+#: неблагоприятной σ превышает 10 мм уже при θ = 0). Считается эта ветвь
+#: КОНСТАНТАМИ САМОГО МОДУЛЯ, а не нижними концами таблицы: дисторсия у модуля
+#: взята по верхнему краю (`RESIDUAL_DISTORTION_MM` = 5 мм, см. там же), и
+#: выводить отсюда отклонение по её нижнему краю значило бы вывести его из
+#: бюджета, которого модуль не реализует. С σ_px 0.5, GSD 5, σ_rel 0.14 %,
+#: невязкой 3 мм и дисторсией 5 мм остальные слагаемые дают 7.14 мм, на
+#: неплоскостность остаётся 7.01 мм бюджета, и угол переключения равен
+#: `arctg(7.01 / отклонение)`. Отсюда:
+#:
+#:     θ* = 20° требует отклонения 19.25 мм
+#:     θ* = 15° требует отклонения 26.15 мм
+#:
+#: Взято **25 мм** — внутри этого отрезка и строго выше оптимистического края
+#: диапазона ±20–50: угол переключения выходит 15.66°, то есть собственный вывод
+#: п. 6.1 о рабочем диапазоне воспроизводится.
+#:
+#: Почему не 50 мм, как было. Это верхний край диапазона, выбор в безопасную
+#: сторону, и цена его измерена: слагаемое `50·tg θ` даёт 96 % дисперсии на
+#: крутом ракурсе (1.2 % на пологом), то есть `meets_tolerance` переставал
+#: вычисляться «по фактическому углу» и начинал вычисляться по константе модуля,
+#: умноженной на тангенс фактического угла. Угол переключения при 50 мм равен
+#: 7.98° — вне рабочего диапазона, который спецификация прямо сохраняет.
+#: Почему не 20 мм: это оптимистический край, и брать его без измерения значило
+#: бы занижать σ.
+#:
+#: Величина перекрывается, и это существенно: 25 мм — допущение о стене вообще,
+#: а не измерение ЭТОЙ стены. Тому, кто про свою стену знает больше, ключ
+#: `--wall-flatness-mm` даёт подставить измеренное.
+WALL_FLATNESS_DEVIATION_MM = 25.0
+
+#: Остаток бюджета допуска п. 2.2 на слагаемое неплоскостности при благоприятной
+#: ветви остальных диапазонов п. 6.1 и константах этого модуля (вывод — см.
+#: `WALL_FLATNESS_DEVIATION_MM`). Угол переключения `meets_tolerance` равен
+#: `arctg(WALL_FLATNESS_BUDGET_MM / wall_flatness_mm)`. Вынесен в имя, чтобы
+#: проверка воспроизводимости вывода не переписывала число у себя.
+WALL_FLATNESS_BUDGET_MM = 7.0064
+
+#: Остаточная дисторсия, п. 6.1: 2.5–5 мм, одинаково в обеих колонках таблицы.
+#:
+#: Слагаемое называется ОСТАТОЧНЫМ: оно описывает то, что остаётся ПОСЛЕ снятия
+#: дисторсии, и стоит в колонке `assisted`, где калибровка предполагается. Ссылка
+#: на `calib.undistort` его не снимает — тот шаг и есть коррекция, после которой
+#: этот остаток назван; более того, при нулевых коэффициентах `undistort`
+#: возвращает исходный массив, то есть не делает ничего вовсе.
+#:
+#: Взята ВЕРХНЯЯ граница, в отличие от `WALL_FLATNESS_DEVIATION_MM`, и различие не
+#: произвольно: здесь диапазон узок (2.5 мм размаха против 30) и, главное, не
+#: умножается на тангенс угла, поэтому слагаемое не способно ни доминировать в
+#: дисперсии, ни сделать `meets_tolerance` функцией одной константы. Цена
+#: консервативного края — не более 1.9 мм в квадратичной сумме.
+RESIDUAL_DISTORTION_MM = 5.0
+
+#: Относительная ошибка фокусного расстояния без калибровки по мишени, п. 6.1
+#: (ε = 2 %). Эффект `ε·L·sin²θ`: на полутораметровом окне 7.5 мм при θ = 30° и
+#: 15 мм при θ = 45° — ровно те числа, что названы в таблице.
+FOCAL_RELATIVE_ERROR = 0.02
+
+#: Ошибка фокусного по ПРОИСХОЖДЕНИЮ матрицы K (`camera.calibration` выходного
+#: файла). Таблица п. 6.1 различает два состояния — «при калибровке» и «без
+#: калибровки», — и калибровкой она называет разовую калибровку по мишени
+#: (п. 4.2: «камеры собственного парка калибруются по мишени, а не по EXIF»).
+#: Поэтому нулю равна только строка `target`. Фокусное из EXIF — номинальная
+#: величина объектива, а не измеренная у этого экземпляра, и основания считать её
+#: точной у конвейера нет; типовое поле зрения (`database`) тем более. Обе
+#: получают ε таблицы.
+#:
+#: Источник K есть свойство СНИМКА и записан в выход именно затем, чтобы этот
+#: вклад можно было оценить (докстринг `calib.intrinsics_from_meta`). Задача 18 —
+#: первый его потребитель.
+FOCAL_ERROR_BY_CALIBRATION = {
+    "target": 0.0,
+    "exif": FOCAL_RELATIVE_ERROR,
+    "database": FOCAL_RELATIVE_ERROR,
+}
 
 #: Остаточная проективная невязка, когда `residual_px` не измерена (путь
 #: `manual_four_point`: `ManualPlaneConfidence.residual_px is None`, оператор задал
@@ -106,7 +205,17 @@ RESIDUAL_REFERENCE_MM = 5.0
 #: который соответствует тому, что оператор физически видит и кликает.
 MEASURED_DATUM = "quarter_edge"
 
-_ID_PREFIX = {"window": "w", "door": "d", "facade_boundary": "fb"}
+#: Классы `edge_type`, при которых кромка заведомо НЕ лежит в плоскости стены:
+#: спецификация, п. 5.3 — «при значении `surround` или `cladding_edge` элемент
+#: обрабатывается как выступающий (п. 5.6) и требует `offset_mm`».
+_OFFSET_EDGE_TYPES = frozenset({"surround", "cladding_edge"})
+
+#: Способ установки, при котором действует то же правило п. 5.6 независимо от
+#: `edge_type`: «для карниза, цоколя, выступающих окон, подоконников и обрамлений
+#: d < 0 и видимая кромка не лежит в Π».
+_OFFSET_MOUNTING = "protruding"
+
+_ID_PREFIX = {"window": "w", "door": "d"}
 
 
 class RevealMark(Strict):
@@ -148,6 +257,14 @@ class ElementMark(Strict):
     расчёта ширины и высоты по пáрам противоположных сторон
     (`_quad_size_mm`) — определение видимой грани откоса от него не зависит,
     оно берётся по осевым границам контура.
+
+    **`facade_boundary` этот формат не принимает.** Спецификация, п. 2.3 задаёт
+    границу фасада ПОЛИЛИНИЕЙ с атрибутом выноса `offset_mm`, а не
+    четырёхугольником: у вертикального ребра, линии кровли и линии цоколя нет ни
+    ширины, ни высоты. Выпустить её отсюда значило бы приписать полилинии габарит
+    с σ и объявить его в допуске — величины, которых п. 2.3 для этого класса не
+    определяет вовсе, — да ещё и без `offset_mm`, которого нет и в схеме
+    (оценка выноса — следующий этап, см. п. 5.6).
     """
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
@@ -157,6 +274,16 @@ class ElementMark(Strict):
     edge_type: Literal["sharp_wall_edge", "surround", "cladding_edge", "unknown"]
     corners_px: list[Point]
     reveal: RevealMark | None = None
+
+    @model_validator(mode="after")
+    def _openings_only(self):
+        if self.class_ == "facade_boundary":
+            raise ValueError(
+                "класс facade_boundary этой разметкой не оцифровывается: "
+                "спецификация, п. 2.3 задаёт границу фасада полилинией с "
+                "атрибутом выноса offset_mm, а не четырёхугольником, и габарита "
+                "с допуском у неё нет; оценка выноса — следующий этап (п. 5.6)")
+        return self
 
     @model_validator(mode="after")
     def _exactly_four_corners(self):
@@ -173,6 +300,13 @@ def parse_marks(raw) -> list[ElementMark]:
     Лишние поля отвергаются `ElementMark`/`RevealMark` (`extra="forbid"`) — формат
     проверяется на строгость, поэтому подмена поля, которого в нём нет, невозможна
     по построению (спецификация задачи 18, свойство 8).
+
+    Пустой список отвергается отдельно и по имени. Молча приравняв его к
+    отсутствию разметки, конвейер уравнял бы два разных указания оператора: «я
+    ничего не размечал» и «я передал файл разметки». Разница не косметическая —
+    на пути `needs_operator` непустая разметка обязана поднять отказ, а пустая
+    прошла бы насквозь, и оператор получил бы файл без единого элемента и без
+    единого слова о том, почему.
     """
     # ValueError, а не TypeError (вопреки TRY004): негодная разметка --marks
     # обязана ловиться той же веткой, что и остальные отказы валидации входа
@@ -182,6 +316,10 @@ def parse_marks(raw) -> list[ElementMark]:
         raise ValueError(  # noqa: TRY004
             f"разметка --marks обязана быть JSON-списком элементов, получено "
             f"{type(raw).__name__}")
+    if not raw:
+        raise ValueError(
+            "разметка --marks пуста: список без единого элемента неотличим от "
+            "отсутствия разметки; уберите ключ, если размечать нечего")
     return [ElementMark.model_validate(item) for item in raw]
 
 
@@ -201,6 +339,13 @@ def _nearest_node(value_px: float, extent_px: int, count: int) -> int:
     (`run.py` — оркестратор конвейера, `elements.py` — его часть); обе копии
     вычисляют одно и то же по одной и той же формуле и проверены порознь своими
     тестами.
+
+    Зажим индекса к краю сетки — последняя охрана, а не проверка входа: точки
+    разметки обязаны лежать В КАДРЕ, и это проверено до всякого обращения сюда
+    (`_marks_in_frame`). Без той проверки зажим брал бы разрешение «у проёма» из
+    совсем другого места кадра, причём молча — измерено: точка, вышедшая за
+    правый край на 1267 px, получает узел края и вместе с ним правдоподобное
+    конечное значение.
     """
     if extent_px <= 1 or count <= 1:
         return 0
@@ -229,6 +374,29 @@ def _gsd_near(gsd_field: np.ndarray, image_size, points_px, label: str) -> float
             f"{label}: локальное разрешение у контура не определено — узел лежит "
             "за линией схода плоскости фасада")
     return max(values)
+
+
+def _points_in_frame(points_px, image_size, label: str) -> None:
+    """Точки разметки обязаны лежать в кадре. Тот же контракт, что `run._points_in_frame`.
+
+    Оператор кликает ПО СНИМКУ; точка вне кадра означает, что переданы координаты
+    из другой системы либо, что реальнее, от другого снимка — `--marks` читается
+    один раз и подаётся на весь пакет. Перенесённая на чужой кадр разметка без
+    этой охраны даёт уверенные миллиметры для окна, которого там нет: индекс
+    ближайшего узла упирается в край сетки, и ни одна величина не становится ни
+    бесконечной, ни отрицательной.
+    """
+    w_px, h_px = image_size
+    for index, point in enumerate(points_px):
+        x, y = float(point[0]), float(point[1])
+        if not (math.isfinite(x) and math.isfinite(y)):
+            raise ValueError(f"{label}: точка разметки [{index}] не определена "
+                             f"({x}, {y})")
+        if not (0.0 <= x <= w_px - 1 and 0.0 <= y <= h_px - 1):
+            raise ValueError(
+                f"{label}: точка разметки [{index}] = ({x:.1f}, {y:.1f}) лежит "
+                f"вне кадра {w_px}x{h_px}: оператор указывает точки на снимке, и "
+                "разметка привязана к тому снимку, на котором сделана")
 
 
 def _in_front_of_camera(H, image_size, points_px) -> np.ndarray:
@@ -265,18 +433,46 @@ def _quad_size_mm(contour_mm: np.ndarray) -> tuple[float, float]:
     return float(width), float(height)
 
 
-def _size_sigma_mm(size_mm: float, theta_deg: float, gsd_local: float, sigma_px: float,
-                    sigma_rel: float, residual_mm: float, wall_flatness_mm: float) -> float:
-    """σ габарита: сумма RSS четырёх слагаемых п. 6.1 при ФАКТИЧЕСКИХ угле и GSD.
+def _edge_reference(mark: ElementMark) -> str:
+    """К чему отнесён измеренный контур. Спецификация, пп. 5.3, 5.6.
 
-    Слагаемые и их источник в спецификации:
+    Три исхода, и ни один из них не выдумывает выноса:
+
+    * кромка острая и элемент не выступает — п. 5.3 применима, контур лежит в
+      плоскости стены, `"wall_plane"`;
+    * `surround` / `cladding_edge` либо `mounting = "protruding"` — п. 5.3 сама
+      называет эти случаи нарушением своего допущения, элемент обрабатывается как
+      выступающий (п. 5.6), и кромка отстоит от Π на НЕ ИЗМЕРЕННЫЙ вынос:
+      `"offset_plane"`;
+    * `edge_type = "unknown"` — про кромку не известно ничего, и сказать, лежит
+      она в Π или нет, не на чем: `"unknown"`.
+
+    Порядок проверок не произволен: `mounting = "protruding"` решает раньше
+    `edge_type = "unknown"`, потому что «элемент выступает» — утверждение более
+    сильное, чем «род кромки не распознан», и оно верно независимо от рода.
+    """
+    if mark.edge_type in _OFFSET_EDGE_TYPES or mark.mounting == _OFFSET_MOUNTING:
+        return "offset_plane"
+    if mark.edge_type == "unknown":
+        return "unknown"
+    return "wall_plane"
+
+
+def _size_sigma_mm(size_mm: float, theta_deg: float, gsd_local: float, sigma_px: float,
+                    sigma_rel: float, residual_mm: float, wall_flatness_mm: float,
+                    distortion_mm: float, focal_rel: float) -> float:
+    """σ габарита: сумма RSS слагаемых п. 6.1 при ФАКТИЧЕСКИХ угле и GSD.
+
+    Слагаемые и их источник в спецификации — все шесть строк таблицы п. 6.1,
+    кроме последней (параллакс), которая не разброс, а смещение (см. ниже):
 
     1. **Локализация двух кромок** — `√2 · σ_px · GSD_local`. Габарит есть разность
        положений двух независимо кликнутых кромок (левой/правой либо верхней/
        нижней), поэтому несёт множитель √2 правила «двухкромочной величины»
        (п. 6.1, та же логика, что и у ширины откоса в п. 6.2). `GSD_local` —
        измеренное локальное разрешение У ЭТОГО проёма (`_gsd_near`), а не табличное
-       значение режима.
+       значение режима. `σ_px` — точность клика ПО УГЛУ ПРОЁМА, своя величина
+       (докстринг модуля).
     2. **Масштаб** — `size_mm · sigma_rel`. `sigma_rel` уже посчитана СБОРКОЙ
        конвейера из длины опорной базы оператора (`run.py:_scale_sigma_rel`,
        задача 14) и передаётся сюда готовой: пересчитывать её заново значило бы
@@ -285,30 +481,67 @@ def _size_sigma_mm(size_mm: float, theta_deg: float, gsd_local: float, sigma_px:
     3. **Остаточная проективная невязка** — `residual_mm`, уже переведённая в
        миллиметры вызывающим кодом (`residual_px · GSD_local`, либо
        `RESIDUAL_REFERENCE_MM`, когда невязка не измерена).
-    4. **Неплоскостность стены** — `wall_flatness_mm · tg θ` при ФАКТИЧЕСКОМ угле
+    4. **Остаточная дисторсия** — `distortion_mm`, см. `RESIDUAL_DISTORTION_MM`.
+       Строка названа остаточной и описывает то, что остаётся ПОСЛЕ коррекции;
+       шаг `calib.undistort` её не снимает.
+    5. **Ошибка фокусного** — `focal_rel · size_mm · sin²θ` при фактическом угле.
+       `focal_rel` берётся вызывающим по `camera.calibration` того же выходного
+       файла (`FOCAL_ERROR_BY_CALIBRATION`): при калибровке по мишени слагаемое
+       обращается в нуль само, без отдельной ветки.
+    6. **Неплоскостность стены** — `wall_flatness_mm · tg θ` при ФАКТИЧЕСКОМ угле
        визирования ЭТОГО элемента в его собственной точке (не θ_cam и не сводка
-       поля углов кадра — задание 18, требование 3).
+       поля углов кадра — задание 18, требование 3). Сама величина — названное
+       допущение, см. `WALL_FLATNESS_DEVIATION_MM`.
+
+    **Чего здесь нет и почему.** Последняя строка таблицы п. 6.1 — параллакс при
+    ошибке идентификации кромки, 10–45 мм — в эту сумму не входит, и спецификация
+    сама говорит почему: это **смещение, а не разброс**. Складывать систематический
+    сдвиг с квадратичной суммой случайных вкладов нельзя, он бы там растворился.
+    Случай, в котором эта строка не равна нулю, выражается не числом в σ, а полем
+    `edge_reference` (`_edge_reference`) и отсутствием `meets_tolerance`: габарит
+    выдаётся, метрическая интерпретация — нет (п. 5.6).
 
     Сумма — RSS: источники ПРЕДПОЛАГАЮТСЯ независимыми (то же допущение, что и в
     `reveal_depth_sigma`, п. 6.2). Это не консервативно: GSD и невязка происходят
     из одной оценки плоскости и в общем случае коррелированы, а при положительной
     корреляции RSS даёт НИЖНЮЮ оценку σ. Строгий бюджет потребовал бы ковариационной
     матрицы позы (та же оговорка, что в п. 6.2).
-
-    **Что сюда намеренно не входит.** Ошибка фокусного расстояния (`ε·sin²θ`) равна
-    нулю при откалиброванной камере и в остальных случаях требует знания источника
-    K на уровне ЭЛЕМЕНТА, которого эта функция не получает; остаточная дисторсия
-    устраняется шагом `calib.undistort` до всякой разметки. Оба — предмет
-    отдельного уточнения (см. отчёт задачи 18), а не слагаемые, забытые здесь.
     """
+    theta_rad = math.radians(theta_deg)
     localisation = math.sqrt(2.0) * sigma_px * gsd_local
     scale = size_mm * sigma_rel
-    flatness = wall_flatness_mm * math.tan(math.radians(theta_deg))
-    return math.hypot(localisation, scale, residual_mm, flatness)
+    focal = focal_rel * size_mm * math.sin(theta_rad) ** 2
+    flatness = wall_flatness_mm * math.tan(theta_rad)
+    return math.hypot(localisation, scale, residual_mm, distortion_mm, focal, flatness)
 
 
 def _element_id(class_name: str, index: int) -> str:
     return f"{_ID_PREFIX.get(class_name, 'e')}_{index:03d}"
+
+
+def _worst_corner_theta(camera: CameraOnPlane, contour_mm: np.ndarray):
+    """Угол визирования элемента — по ХУДШЕЙ точке контура, а не по центроиду.
+
+    Спецификация, п. 2.2 нормирует пригодную область условием на ТОЧКИ, а не на
+    центр элемента: «требование к GSD относится к худшему локальному значению в
+    пределах пригодной области». Тем же правилом берёт своё значение `_gsd_near`,
+    и брать угол по центроиду рядом с ней было бы непоследовательно: измерено, что
+    центроид даёт 29.66° там, где худший угол контура равен 34.46° при пороге 30°,
+    то есть проём, четверть которого лежит ВНЕ пригодной области, принимался как
+    годный.
+
+    Возвращаются компоненты и полный угол ОДНОЙ И ТОЙ ЖЕ точки: тройка (x, y,
+    full), собранная из разных точек, не была бы углом ни одной из них.
+    """
+    p = np.asarray(contour_mm, dtype=float)
+    worst_index, worst_theta = 0, -1.0
+    for index, (x, y) in enumerate(p):
+        theta = camera.theta_deg(float(x), float(y))
+        if theta > worst_theta:
+            worst_index, worst_theta = index, theta
+    x, y = float(p[worst_index][0]), float(p[worst_index][1])
+    tan_x, tan_y = camera.tan_theta(x, y)
+    return worst_theta, tan_x, tan_y
 
 
 def _digitize_recess(mark: ElementMark, contour_mm: np.ndarray, H, camera: CameraOnPlane,
@@ -402,9 +635,15 @@ def _digitize_recess(mark: ElementMark, contour_mm: np.ndarray, H, camera: Camer
 def _digitize_one(mark: ElementMark, index: int, *, H, camera: CameraOnPlane,
                    mm_per_unit: float, origin_rect, image_size, gsd_field: np.ndarray,
                    sigma_px: float, sigma_rel: float, residual_px, theta_max_deg: float,
-                   wall_flatness_mm: float) -> Element:
+                   wall_flatness_mm: float, distortion_mm: float, focal_rel: float,
+                   image_id: str) -> Element:
     label = f"{mark.class_}[{index}]"
     corners_px = np.asarray(mark.corners_px, dtype=float)
+
+    marked_px = list(mark.corners_px)
+    if mark.reveal is not None:
+        marked_px += list(mark.reveal.inner_edge_px)
+    _points_in_frame(marked_px, image_size, label)
 
     visible = _in_front_of_camera(H, image_size, corners_px)
     if not bool(np.all(visible)):
@@ -417,19 +656,17 @@ def _digitize_one(mark: ElementMark, index: int, *, H, camera: CameraOnPlane,
     if not np.all(np.isfinite(contour_mm)):
         raise ValueError(f"{label}: контур не переводится в миллиметры фасада")
 
-    centroid = contour_mm.mean(axis=0)
-    cx_mm, cy_mm = float(centroid[0]), float(centroid[1])
     # Угол визирования В ТОЧКЕ ЭЛЕМЕНТА, тем же путём, каким сборка конвейера
     # считает поле углов (`run.py:_theta_at`, `camera.theta_deg`). Не θ_cam и не
-    # сводка поля кадра — задание 18, требование 3.
-    theta_full_deg = camera.theta_deg(cx_mm, cy_mm)
+    # сводка поля кадра — задание 18, требование 3. Берётся ХУДШАЯ точка контура,
+    # тем же правилом, каким `_gsd_near` берёт худшее разрешение.
+    theta_full_deg, tan_x, tan_y = _worst_corner_theta(camera, contour_mm)
     if theta_full_deg > theta_max_deg:
         raise ValueError(
             f"{label}: угол визирования {theta_full_deg:.1f}° превышает порог "
             f"{theta_max_deg:.1f}°: элемент вне пригодной области (спецификация, "
             "п. 2.2)")
 
-    tan_x, tan_y = camera.tan_theta(cx_mm, cy_mm)
     theta = ThetaDeg(x_deg=math.degrees(math.atan(tan_x)),
                      y_deg=math.degrees(math.atan(tan_y)),
                      full_deg=theta_full_deg)
@@ -440,10 +677,24 @@ def _digitize_one(mark: ElementMark, index: int, *, H, camera: CameraOnPlane,
                    else RESIDUAL_REFERENCE_MM)
 
     sigma_width = _size_sigma_mm(width_mm, theta_full_deg, gsd_local, sigma_px,
-                                 sigma_rel, residual_mm, wall_flatness_mm)
+                                 sigma_rel, residual_mm, wall_flatness_mm,
+                                 distortion_mm, focal_rel)
     sigma_height = _size_sigma_mm(height_mm, theta_full_deg, gsd_local, sigma_px,
-                                  sigma_rel, residual_mm, wall_flatness_mm)
-    meets_tolerance = max(sigma_width, sigma_height) <= ASSISTED_SIZE_TOLERANCE_MM
+                                  sigma_rel, residual_mm, wall_flatness_mm,
+                                  distortion_mm, focal_rel)
+
+    edge_reference = _edge_reference(mark)
+    # П. 5.6: при отсутствии оценки выноса габарит выдаётся БЕЗ метрической
+    # интерпретации. Признак допуска и есть метрическая интерпретация габарита,
+    # поэтому у кромки, про которую неизвестно, лежит ли она в плоскости стены,
+    # его нет вовсе. Отсутствие, а не `False`: «не проверено» и «проверено и не
+    # прошло» — разные утверждения, и второе из них здесь необоснованно, ведь σ
+    # разброса допуск как раз проходит; не проходит несведённое СМЕЩЕНИЕ, которое
+    # в σ не входит (см. `_size_sigma_mm`).
+    meets_tolerance = None
+    if edge_reference == "wall_plane":
+        meets_tolerance = bool(
+            max(sigma_width, sigma_height) <= ASSISTED_SIZE_TOLERANCE_MM)
 
     recess = None
     if mark.reveal is not None:
@@ -454,45 +705,67 @@ def _digitize_one(mark: ElementMark, index: int, *, H, camera: CameraOnPlane,
         id=_element_id(mark.class_, index),
         class_name=mark.class_,
         mounting=mark.mounting,
-        edge_reference="wall_plane",
+        edge_reference=edge_reference,
         edge_type=mark.edge_type,
         contour_mm=[(float(x), float(y)) for x, y in contour_mm],
+        contour_px=[{"image_id": image_id,
+                     "points": [[float(x), float(y)] for x, y in mark.corners_px]}],
         theta=theta,
         size_mm=SizeMM(width=width_mm, height=height_mm,
                        sigma_width=sigma_width, sigma_height=sigma_height),
         origin="operator",
         recess=recess,
-        meets_tolerance=bool(meets_tolerance),
+        meets_tolerance=meets_tolerance,
     )
 
 
 def digitize_elements(marks: list[ElementMark], *, H, camera: CameraOnPlane,
                        mm_per_unit: float, origin_rect, image_size,
-                       sigma_px: float, sigma_rel: float, residual_px,
+                       gsd_field: np.ndarray, sigma_px: float, sigma_rel: float,
+                       residual_px, calibration: str,
+                       image_id: str = "img_0",
                        theta_max_deg: float = THETA_MAX_DEG,
                        wall_flatness_mm: float = WALL_FLATNESS_DEVIATION_MM,
-                       gsd_shape=FIELD_SHAPE) -> list[Element]:
+                       distortion_mm: float = RESIDUAL_DISTORTION_MM) -> list[Element]:
     """Разметка оператора -> список `Element` с миллиметрами и погрешностью.
 
-    `H`, `camera`, `mm_per_unit`, `origin_rect`, `image_size` — та же геометрия,
-    что сборка конвейера (`pipeline.run.process`) уже вычислила и записала в выход;
-    вызывающий обязан передать ИМЕННО её, а не оценивать заново (докстринг модуля,
-    требование 1 задачи 18). `sigma_px` — точность указания точки оператором,
-    `sigma_rel` — σ масштаба (уже посчитанная сборкой из длины опорной базы),
-    `residual_px` — невязка оценки плоскости в пикселях (`PlaneConfidence.residual_px`
-    либо `None` на ручном пути `manual_four_point`).
+    `H`, `camera`, `mm_per_unit`, `origin_rect`, `image_size`, `gsd_field` — та же
+    геометрия и то же поле разрешения, что сборка конвейера (`pipeline.run.process`)
+    уже вычислила и записала в выход; вызывающий обязан передать ИМЕННО их, а не
+    оценивать заново (докстринг модуля, требование 1 задачи 18). `gsd_field`
+    передаётся, а не считается здесь, по той же причине, по какой здесь нет второй
+    реализации гомографии: два независимо посчитанных поля разошлись бы молча, и
+    σ элементов описывала бы не тот кадр, про который `quality.gsd_mm_px_max`
+    говорит в том же файле.
 
-    Отказ по ОДНОМУ элементу (за линией схода либо вне углового условия,
+    `sigma_px` — точность указания ТОЧКИ ПРОЁМА оператором (не точность указания
+    опорной базы масштаба, см. докстринг модуля), `sigma_rel` — σ масштаба (уже
+    посчитанная сборкой из длины опорной базы), `residual_px` — невязка оценки
+    плоскости в пикселях (`PlaneConfidence.residual_px` либо `None` на ручном пути
+    `manual_four_point` и там, где невязка неконечна).
+
+    `calibration` — происхождение матрицы K этого СНИМКА в терминах схемы
+    (`camera.calibration`). Аргумент обязательный и без умолчания: от него зависит
+    слагаемое ошибки фокусного (п. 6.1), и умолчание здесь означало бы тихо
+    выбранный ответ на вопрос, который знает только вызывающий.
+
+    Отказ по ОДНОМУ элементу (вне кадра, за линией схода либо вне углового условия,
     требование 4 задачи 18) поднимает `ValueError`, называющий этот элемент, и
     останавливает весь вызов: по умолчанию в этом модуле нет частичного пропуска
     негодных меток — оператор поправляет разметку и запускает оцифровку заново
     (тем же принципом, каким `process()` целиком отказывает на негодном входе).
     """
-    gsd_field = local_gsd_field(H, mm_per_unit, image_size, shape=gsd_shape).gsd
+    focal_rel = FOCAL_ERROR_BY_CALIBRATION.get(calibration)
+    if focal_rel is None:
+        raise ValueError(
+            f"неизвестное происхождение внутренних параметров: {calibration!r}; "
+            "слагаемое ошибки фокусного (п. 6.1) по нему не определено")
     return [
         _digitize_one(mark, index, H=H, camera=camera, mm_per_unit=mm_per_unit,
                       origin_rect=origin_rect, image_size=image_size, gsd_field=gsd_field,
                       sigma_px=sigma_px, sigma_rel=sigma_rel, residual_px=residual_px,
-                      theta_max_deg=theta_max_deg, wall_flatness_mm=wall_flatness_mm)
+                      theta_max_deg=theta_max_deg, wall_flatness_mm=wall_flatness_mm,
+                      distortion_mm=distortion_mm, focal_rel=focal_rel,
+                      image_id=image_id)
         for index, mark in enumerate(marks)
     ]

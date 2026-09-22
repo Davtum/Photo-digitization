@@ -1,0 +1,14 @@
+[
+  {
+    "class": "window",
+    "mounting": "embedded",
+    "edge_type": "unknown",
+    "corners_px": [[252.9, 324.9], [343.4, 324.9], [343.4, 262.2], [252.9, 262.2]]
+  },
+  {
+    "class": "window",
+    "mounting": "embedded",
+    "edge_type": "unknown",
+    "corners_px": [[251.9, 539.8], [343.4, 539.8], [343.4, 476.0], [251.9, 476.0]]
+  }
+]

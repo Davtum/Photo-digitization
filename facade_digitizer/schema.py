@@ -148,6 +148,29 @@ class FacadeRecord(Strict):
 
 
 class Element(Strict):
+    """Элемент фасада. Спецификация, раздел 10.
+
+    **`edge_reference` несёт три значения, а не одно.** Спецификация, п. 5.3
+    определяет измеряемую кромку как линию пересечения плоскости стены и
+    плоскости откоса и фиксирует это значением `"wall_plane"`. Она же, тремя
+    абзацами ниже, называет случаи, когда кромка в плоскости стены НЕ лежит:
+    при `edge_type` = `surround` либо `cladding_edge` элемент обрабатывается как
+    выступающий (п. 5.6) и требует `offset_mm`; то же верно для
+    `mounting = "protruding"`. При `edge_type = "unknown"` про кромку не
+    известно ничего. Поле с единственным допустимым значением заставляло бы
+    утверждать `"wall_plane"` и там, где п. 5.3 сам объявляет это утверждение
+    неверным, — а вынос обрамления даёт смещение 10–45 мм (п. 6.1, строка
+    параллакса), то есть больше всего допуска п. 2.2, и «кромка выглядит чёткой,
+    оператор её подтверждает».
+
+    Поэтому: `"wall_plane"` — п. 5.3 применима; `"offset_plane"` — кромка
+    заведомо лежит вне Π на НЕ ИЗМЕРЕННЫЙ вынос (оценка выноса — следующий
+    этап); `"unknown"` — про кромку не известно. Различать `surround` и
+    `cladding_edge` этому полю незачем: их несёт `edge_type`, а `edge_reference`
+    отвечает на другой вопрос — к чему отнесён `contour_mm` и вправе ли
+    потребитель читать его метрически.
+    """
+
     # serialize_by_alias — чтобы model_dump_json() без аргументов давал ключ "class",
     # как требует раздел 10 спецификации; populate_by_name — чтобы вход принимался
     # и по алиасу "class", и по имени поля class_name.
@@ -158,9 +181,14 @@ class Element(Strict):
     # но class — ключевое слово Python, поэтому в коде class_name.
     class_name: Literal["window", "door", "reveal", "facade_boundary"] = Field(alias="class")
     mounting: Literal["embedded", "flush", "protruding"]
-    edge_reference: Literal["wall_plane"]
+    edge_reference: Literal["wall_plane", "offset_plane", "unknown"]
     edge_type: Literal["sharp_wall_edge", "surround", "cladding_edge", "unknown"]
     contour_mm: list[Point]
+    #: Пиксельные клики оператора, раздел 10: список записей `{image_id, points}`.
+    #: Без них измерение невоспроизводимо: `contour_mm` есть результат применения
+    #: `H` к этим точкам, и проверить перевод, не имея исходных кликов, нечем.
+    #: Задача 18 и есть та, что вводит пиксельные клики, поэтому она же их и пишет.
+    contour_px: list[dict] = Field(default_factory=list)
     theta: ThetaDeg | None = None
     size_mm: SizeMM
     origin: Literal["auto", "auto_confirmed", "auto_edited", "operator", "regularized"]

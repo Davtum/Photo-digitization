@@ -2,9 +2,13 @@
 
 Последнее звено ядра. Оно связывает уже проверенные модули и добавляет **ровно одно**
 новое вычисление — пригодность кадра (`_frame_fields`), которую ни один модуль не
-считает целиком. Элементов фасада конвейер не выделяет: `elements` остаётся пустым,
-`coverage` — `"partial"`. Детекция окон и дверей — следующий этап, и делать вид, что
-он уже есть, здесь нечем.
+считает целиком. САМ конвейер элементов фасада не выделяет: детекция окон и дверей —
+следующий этап, и делать вид, что он уже есть, здесь нечем. `elements` наполняется
+только разметкой оператора (`marks`, задача 18), и тогда каждый элемент несёт
+`origin = "operator"`.
+
+`coverage` всегда `"partial"`: п. 7 связывает охват с тем, где лежит начало
+координат, а оно здесь всегда опорная точка оператора.
 
 **Двух «мм на пиксель» здесь действительно два, и смешивать их нельзя.**
 
@@ -35,7 +39,7 @@ from pathlib import Path
 
 import numpy as np
 
-from facade_digitizer.geometry.angles import local_gsd_field
+from facade_digitizer.geometry.angles import FIELD_SHAPE, local_gsd_field
 from facade_digitizer.geometry.homography import (
     apply_homography,
     camera_pose,
@@ -43,7 +47,12 @@ from facade_digitizer.geometry.homography import (
 )
 from facade_digitizer.pipeline import quality as quality_gate
 from facade_digitizer.pipeline.calib import intrinsics_from_meta, load_profile, undistort
-from facade_digitizer.pipeline.elements import ElementMark, digitize_elements, load_marks
+from facade_digitizer.pipeline.elements import (
+    WALL_FLATNESS_DEVIATION_MM,
+    ElementMark,
+    digitize_elements,
+    load_marks,
+)
 from facade_digitizer.pipeline.io import load_image, save_image
 from facade_digitizer.pipeline.plane import estimate_plane
 from facade_digitizer.pipeline.rectify import attainable_mm_per_px, rectify
@@ -62,11 +71,14 @@ try:
 except PackageNotFoundError:          # пакет не установлен — версия неизвестна
     SOFTWARE_VERSION = "facade-digitizer (не установлен)"
 
-#: Сетка узлов КАДРА, общая для поля разрешения и поля углов. Общая обязательно:
-#: два поля, посчитанные на разных сетках, описывают разные точки, и доля пригодных
-#: узлов считалась бы по одной выборке, а признак «за линией схода» — по другой.
-#: Значение совпадает с умолчанием `local_gsd_field` и передаётся туда явно.
-FIELD_SHAPE = (64, 64)
+# `FIELD_SHAPE` — сетка узлов КАДРА, общая для поля разрешения и поля углов. Общая
+# обязательно: два поля, посчитанные на разных сетках, описывают разные точки, и
+# доля пригодных узлов считалась бы по одной выборке, а признак «за линией схода» —
+# по другой. Значение ИМПОРТИРУЕТСЯ у `geometry.angles`, где объявлено один раз и
+# служит умолчанием самой `local_gsd_field`. Своего объявления здесь больше нет:
+# второе такое же было у `pipeline.elements`, которая считала поле заново, и
+# расхождение двух копий развело бы σ элементов и `quality.gsd_mm_px_max` одного
+# файла молча.
 
 #: Верхняя граница σ масштаба для источника 1 (спецификация, п. 6.3: 0.14–0.28 %).
 #: С ней сравнивается ПОСЧИТАННАЯ σ — `meets_tolerance` есть результат сравнения,
@@ -102,7 +114,43 @@ SIGMA_REL_TOLERANCE = 0.0028
 #: так на обеих дистанциях, — 3.45 и 5.60, и 4.5 лежит между ними, а не у края.
 #: Проверка закреплена в
 #: `tests/test_run.py::test_default_sigma_px_agrees_with_the_specification`.
+#:
+#: **Эта величина относится ТОЛЬКО к опорной базе масштаба.** Точность клика по
+#: углу проёма — отдельная величина, `DEFAULT_MARK_SIGMA_PX`; см. её обоснование.
 DEFAULT_OPERATOR_SIGMA_PX = 4.5
+
+#: Точность указания УГЛА ПРОЁМА оператором, в пикселях исходного снимка.
+#:
+#: Это не та же величина, что `DEFAULT_OPERATOR_SIGMA_PX`, и слияние их в одну —
+#: подмена. Разведены они по РЕЖИМУ ПРОСМОТРА, в котором оператор делает клик.
+#:
+#: * Концы опорной базы оператор указывает на кадре целиком: база тянется во всю
+#:   двадцатиметровую сторону фасада, и увидеть её концы одновременно можно только
+#:   при уменьшении 2.75x (кадр 5280 px в окне 1920 px). Один экранный пиксель
+#:   стоит там 2.75 пикселей снимка, отсюда 4.5.
+#: * Угол проёма оператор указывает с УВЕЛИЧЕНИЕМ, и иначе быть не может. При том
+#:   же уменьшении 2.75x полутораметровый проём при локальном GSD 5 мм/px занимает
+#:   на экране около 106 px, попадание по кромке стоит те же ~1.5 экранных пикселя,
+#:   то есть ~4 пикселя снимка, а одно слагаемое локализации п. 6.1 даёт тогда
+#:   √2·4.5·GSD: 31.8 мм при GSD 5 и 12.7 мм при GSD 2 — при допуске п. 2.2 в
+#:   10 мм. То есть на уменьшенном экране допуск недостижим ни при каком угле, и
+#:   инструмент разметки, показывающий проём так, непригоден по построению
+#:   (п. 8.1: разметчик работает в инструменте с увеличением).
+#:
+#: **Значение.** При увеличении 1:1 и выше один экранный пиксель стоит не более
+#: одного пикселя снимка, и точность клика упирается в саму кромку, а не в
+#: масштаб показа. Спецификация называет для этого случая свою строку: п. 6.1,
+#: режим `assisted`, σ_px 0.5–1, где 1.0 — НИЖНЯЯ граница качества режима, то есть
+#: худший случай режима, в котором допуск ещё заявлен достижимым. Берётся она, а
+#: не 0.5: субпиксельное уточнение кромки (п. 6.5) геометрическим ядром не
+#: выполняется, и заявлять его точность было бы нечем. То же значение служит
+#: опорным для порога глубины (`parallax.REFERENCE_SIGMA_PX`), и совпадение здесь
+#: не случайно — обе величины суть точность локализации одной и той же кромки.
+#:
+#: Перекрывается ключом CLI `--mark-sigma-px`: инструмент разметки с
+#: субпиксельным уточнением вправе заявить 0.5, а разметка по мелкому растру —
+#: 2 и выше, и тогда σ вырастет сама.
+DEFAULT_MARK_SIGMA_PX = 1.0
 
 #: σ масштаба для источника 4 п. 6.3 — типового допущения о высоте этажа (~5 %).
 #: Геометрия пути та же, что у источника 1: оператор указывает те же две точки и то же
@@ -508,6 +556,8 @@ def process(image_path, *, operator_reference: OperatorReference,
             scale_source: str = "operator_reference",
             image_id: str = "img_0",
             marks: list[ElementMark] | None = None,
+            mark_sigma_px: float = DEFAULT_MARK_SIGMA_PX,
+            wall_flatness_mm: float = WALL_FLATNESS_DEVIATION_MM,
             save_rectified_to=None) -> FacadeModel:
     """Снимок -> модель фасада. Один проход геометрического ядра.
 
@@ -526,10 +576,26 @@ def process(image_path, *, operator_reference: OperatorReference,
     передан явным действием оператора, и противоречие означает чужой файл.
 
     `marks` — разметка проёмов оператором (задача 18, `pipeline.elements.ElementMark`),
-    необязательная: без неё `elements` остаётся пустым списком, а `coverage` —
-    `"partial"`, ровно как до появления этой задачи. Разметка требует восстановленной
-    плоскости фасада: на пути `needs_operator` она поднимает `ValueError`, а не
-    молча игнорируется — размечать элементы без гомографии нечем.
+    необязательная: без неё `elements` остаётся пустым списком. Разметка требует
+    восстановленной плоскости фасада: на пути `needs_operator` она поднимает
+    `ValueError`, а не молча игнорируется — размечать элементы без гомографии
+    нечем. Различаются `None` (разметки не передавали) и переданный список: пустой
+    список до сюда не доходит, его отвергает `parse_marks`, называя причину.
+
+    `mark_sigma_px` — точность клика ПО УГЛУ ПРОЁМА
+    (`DEFAULT_MARK_SIGMA_PX`). Это не `operator_reference.sigma_px`: та величина
+    описывает клик по концам опорной базы масштаба, выполняемый на уменьшенном
+    экране, и в бюджете габарита она даёт 31.8 мм при GSD 5 — втрое больше
+    допуска п. 2.2. `wall_flatness_mm` — названное допущение о неплоскостности
+    стены (`elements.WALL_FLATNESS_DEVIATION_MM`), тоже перекрываемое: конвейер
+    эту величину не измеряет.
+
+    **`coverage` здесь всегда `"partial"`, и это следствие п. 7.** Начало
+    координат — опорная точка оператора (`facade.origin = "operator_reference"`),
+    а п. 7 сопоставляет ей ровно частичный охват; полному охвату соответствует
+    начало в левом нижнем углу фасада, которого конвейер не знает. Пара
+    согласована, и разметка элементов её не меняет: разметив границу фасада,
+    оператор не переносит начало отсчёта в её нижний левый угол.
 
     `save_rectified_to` — путь для выровненного растра (`--save-rectified` CLI).
     Сохраняется ТОТ ЖЕ объект `Rectified`, что и породил `homography.H` этой же
@@ -548,9 +614,11 @@ def process(image_path, *, operator_reference: OperatorReference,
     image_size = (image.shape[1], image.shape[0])
     _points_in_frame(operator_reference, image_size)
 
+    camera_record = _camera_record(meta, K, source)
+
     plane = estimate_plane(image, K)
     if plane.needs_operator:
-        if marks:
+        if marks is not None:
             raise ValueError(
                 "разметка элементов недоступна: доверие к плоскости ниже порога, "
                 "плоскость не восстановлена, и размечать элементы не на чём "
@@ -650,22 +718,27 @@ def process(image_path, *, operator_reference: OperatorReference,
 
     # Оцифровка проёмов (задача 18). Геометрия передаётся ТА ЖЕ, что уже вычислена
     # выше и записана в выход этой же записи (`plane.H`, `camera`, `mm_per_unit`,
-    # `origin_rect`) — второй, независимой оценки плоскости для разметки нет.
+    # `origin_rect`, `fields.gsd`) — ни второй оценки плоскости, ни второго поля
+    # разрешения для разметки здесь нет. `sigma_px` — СВОЯ величина оцифровки
+    # (`mark_sigma_px`), а не точность указания опорной базы: см.
+    # `DEFAULT_MARK_SIGMA_PX`. `residual_px` проходит через `_finite_or_none` тем
+    # же путём, что и в записи ниже, иначе неконечная невязка дала бы
+    # бесконечную σ у элемента при `null` в `rectification.residual_px` того же
+    # файла — два разных ответа об одной величине.
     elements = []
-    coverage = "partial"
-    if marks:
-        coverage = ("full" if any(m.class_ == "facade_boundary" for m in marks)
-                    else "partial")
+    if marks is not None:
         elements = digitize_elements(
             marks, H=plane.H, camera=camera, mm_per_unit=mm_per_unit,
-            origin_rect=origin_rect, image_size=image_size,
-            sigma_px=operator_reference.sigma_px, sigma_rel=sigma_rel,
-            residual_px=plane.confidence.residual_px)
+            origin_rect=origin_rect, image_size=image_size, gsd_field=fields.gsd,
+            sigma_px=mark_sigma_px, sigma_rel=sigma_rel,
+            residual_px=_finite_or_none(plane.confidence.residual_px),
+            calibration=camera_record.calibration, image_id=image_id,
+            wall_flatness_mm=wall_flatness_mm)
 
     record = ImageRecord(
         id=image_id,
         path=str(path),
-        camera=_camera_record(meta, K, source),
+        camera=camera_record,
         captured_at=meta.captured_at,
         gnss=meta.gnss,
         pose_to_facade={
@@ -700,7 +773,9 @@ def process(image_path, *, operator_reference: OperatorReference,
     )
     return FacadeModel(
         software_version=SOFTWARE_VERSION,
-        coverage=coverage,
+        # См. докстринг: п. 7 связывает охват с тем, где лежит начало координат,
+        # а оно здесь всегда опорная точка оператора.
+        coverage="partial",
         mode="assisted",
         images=[record],
         facade=FacadeRecord(
@@ -735,7 +810,17 @@ def _parse_args(argv):
     parser.add_argument("--span-mm", type=float, required=True,
                         help="истинное расстояние между точками --span-px, мм")
     parser.add_argument("--sigma-px", type=float, default=DEFAULT_OPERATOR_SIGMA_PX,
-                        help="точность указания точки оператором, пикселей снимка")
+                        help="точность указания КОНЦОВ ОПОРНОЙ БАЗЫ масштаба, "
+                             "пикселей снимка (клик по кадру целиком)")
+    parser.add_argument("--mark-sigma-px", type=float, default=DEFAULT_MARK_SIGMA_PX,
+                        help="точность указания УГЛА ПРОЁМА оператором, пикселей "
+                             "снимка (клик с увеличением). Отдельная от --sigma-px "
+                             "величина: разное увеличение — разная точность")
+    parser.add_argument("--wall-flatness-mm", type=float,
+                        default=WALL_FLATNESS_DEVIATION_MM,
+                        help="принимаемое отклонение стены от плоскости, мм "
+                             "(п. 6.1: ±20–50). Допущение, а не измерение: "
+                             "конвейер неплоскостность не измеряет")
     parser.add_argument("--scale-source", default="operator_reference",
                         help="источник масштаба (п. 6.3): operator_reference либо "
                              "assumed_floor_height; photogrammetry и exif_range "
@@ -769,12 +854,26 @@ def main(argv=None) -> int:
     reference = OperatorReference(origin_px=tuple(args.origin_px),
                                   span_px=((x1, y1), (x2, y2)),
                                   span_mm=args.span_mm, sigma_px=args.sigma_px)
-    # Одна и та же разметка передаётся на каждый снимок пакета — тем же соглашением,
-    # что уже действует для `reference` (опорная точка и база берутся общими для
-    # всех `images` командной строки). Файл читается и проверяется на строгость
-    # формата ровно один раз, до цикла: негодный `--marks` должен назвать причину
-    # сразу, а не при обработке первого снимка пакета.
-    marks = load_marks(args.marks) if args.marks else None
+    # `--marks` задаётся в пикселях ОДНОГО снимка, поэтому пакет с разметкой
+    # отвергается целиком и до всякой обработки. Прежде файл читался один раз и
+    # подавался на каждый снимок пакета без сверки чего бы то ни было — даже
+    # размеров кадра: координаты окна с первого снимка давали уверенные
+    # миллиметры на втором, где этого окна нет. Охрана на уровне элемента
+    # (`elements._points_in_frame`) ловит лишь тот случай, когда точка вылезла за
+    # край чужого кадра; совпади размеры — не поймала бы и она.
+    if args.marks and len(args.images) > 1:
+        print("--marks задаётся в пикселях одного снимка и не переносится на "
+              f"пакет из {len(args.images)}: запустите по снимку на разметку",
+              file=sys.stderr)
+        return 1
+    # Файл читается и проверяется на строгость формата ровно один раз, до цикла:
+    # негодный `--marks` должен назвать причину сразу, а не при обработке первого
+    # снимка пакета.
+    try:
+        marks = load_marks(args.marks) if args.marks else None
+    except (ValueError, FileNotFoundError) as error:
+        print(f"--marks {args.marks}: {error}", file=sys.stderr)
+        return 1
     failures = 0
     for index, image in enumerate(args.images):
         source = Path(image)
@@ -793,6 +892,8 @@ def main(argv=None) -> int:
                             scale_source=args.scale_source,
                             image_id=f"img_{index}",
                             marks=marks,
+                            mark_sigma_px=args.mark_sigma_px,
+                            wall_flatness_mm=args.wall_flatness_mm,
                             save_rectified_to=save_rectified_to)
         # Отказ по снимку — свойство этого снимка либо переданных для него
         # аргументов; он называется по имени файла и не прекращает пакет.

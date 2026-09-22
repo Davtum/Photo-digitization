@@ -6,6 +6,14 @@ import numpy as np
 
 from .camera import CameraOnPlane
 
+#: Сетка узлов КАДРА, на которой считаются поля кадра. Объявлена ЗДЕСЬ и ровно
+#: один раз: поле разрешения и поле углов обязаны быть заданы в одних и тех же
+#: точках, а посчитанное дважды по двум независимым объявлениям поле молча
+#: разошлось бы — доля пригодных узлов считалась бы по одной выборке, а σ
+#: элементов по другой. Потребители (`pipeline.run`) импортируют её отсюда, а не
+#: объявляют своё значение рядом.
+FIELD_SHAPE = (64, 64)
+
 
 @dataclass(frozen=True)
 class AngleMap:
@@ -61,7 +69,7 @@ class LocalGsdField(NamedTuple):
 
 
 def local_gsd_field(H: np.ndarray, mm_per_rect_unit: float, image_size: tuple,
-                    shape: tuple = (64, 64),
+                    shape: tuple = FIELD_SHAPE,
                     worst_direction: bool = True) -> LocalGsdField:
     """Локальное разрешение по полю кадра вместе с долей узлов за линией схода.
 
@@ -137,7 +145,7 @@ def local_gsd_field(H: np.ndarray, mm_per_rect_unit: float, image_size: tuple,
 
 
 def local_gsd(H: np.ndarray, mm_per_rect_unit: float, image_size: tuple,
-              shape: tuple = (64, 64), worst_direction: bool = True) -> np.ndarray:
+              shape: tuple = FIELD_SHAPE, worst_direction: bool = True) -> np.ndarray:
     """Одно поле локального разрешения, без доли узлов за линией схода.
 
     Тонкая обёртка над `local_gsd_field`. Узлы за линией схода помечены `nan`,
