@@ -94,10 +94,31 @@ def test_look_at_rejects_degenerate_gaze_direction():
 
 
 def test_look_at_returns_finite_rotation_for_valid_gaze():
-    """Охрана не должна отвергать рабочие ракурсы: матрица конечна и ортонормальна."""
-    R = look_at(np.array([13000.0, 5500.0, 12000.0]), np.array([10000.0, 7500.0, 0.0]))
+    """Охрана не отвергает рабочий ракурс, И ось взгляда указывает НА ЦЕЛЬ.
+
+    Конечности и ортонормальности мало: им удовлетворяет любая матрица поворота,
+    в том числе смотрящая в противоположную сторону или развёрнутая вокруг оси
+    взгляда. Камера смотрит вдоль своего +Z (докстринг `look_at`), поэтому
+    направление на цель в системе камеры обязано быть (0, 0, 1) — это и
+    проверяется. Заодно проверяется правая тройка: `det R = +1`, а не −1, иначе
+    матрица была бы отражением, которое так же ортонормально.
+    """
+    centre = np.array([13000.0, 5500.0, 12000.0])
+    target = np.array([10000.0, 7500.0, 0.0])
+    R = look_at(centre, target)
+
     assert np.all(np.isfinite(R))
     assert R @ R.T == pytest.approx(np.eye(3), abs=1e-9)
+    assert np.linalg.det(R) == pytest.approx(1.0, abs=1e-9)
+
+    gaze = target - centre
+    assert R @ (gaze / np.linalg.norm(gaze)) == pytest.approx(
+        np.array([0.0, 0.0, 1.0]), abs=1e-9)
+    # И цель проецируется в главную точку кадра, то есть взгляд наведён на неё,
+    # а не просто сонаправлен с ней по знаку.
+    in_camera = R @ gaze
+    assert in_camera[2] > 0.0
+    assert in_camera[:2] == pytest.approx(np.zeros(2), abs=1e-6)
 
 
 def make_rich_scene(dx=3000.0, dy=-2000.0, dist=12000.0, depth=150.0,

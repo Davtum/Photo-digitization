@@ -1,5 +1,3 @@
-import math
-
 import pytest
 
 from facade_digitizer.geometry.camera import CameraOnPlane
@@ -31,10 +29,18 @@ def test_tan_theta_uses_depth_in_denominator():
 
 
 def test_theta_deg_is_full_angle():
+    """Полный угол при равных смещениях по обеим осям равен arctg √2 = 54.7356°.
+
+    Ожидание — ЛИТЕРАЛ, а не та же формула, какой считает реализация. Прежде
+    здесь стояло `math.degrees(math.atan(math.hypot(1.0, 1.0)))`, то есть тест
+    подтверждал лишь то, что формулу удалось переписать: подмена `hypot` на
+    что-либо другое сместила бы обе стороны равенства одинаково.
+    """
     cam = CameraOnPlane(cx=0.0, cy=0.0, cz=10000.0)
     got = cam.theta_deg(10000.0, 10000.0)
-    expected = math.degrees(math.atan(math.hypot(1.0, 1.0)))
-    assert got == pytest.approx(expected)
+    assert got == pytest.approx(54.735610317245346, abs=1e-9)
+    # И не 45°: полный угол не равен ни одной из своих компонент.
+    assert got > 45.0 + 1.0
 
 
 def test_camera_must_be_in_front_of_plane():

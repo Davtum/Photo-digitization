@@ -1,5 +1,15 @@
 """Шлюз пригодности снимка. Отбраковывает, но не улучшает. Спецификация, п. 4.1.
 
+**Что значит «отбраковывает» и где это происходит.** Модуль выносит вердикт; ДЕЙСТВИЕ
+по вердикту совершает сборка конвейера, и оно названо по имени:
+`pipeline.run.GATE_REJECT_WITHHOLDS_TOLERANCE`. При `reject` у элементов снимка не
+выпускается `meets_tolerance` — единственное поле выхода, которое утверждает
+соответствие требованиям п. 2.2, — потому что `reject` ставится ровно тогда, когда
+кадр требованию п. 2.2 к разрешению не удовлетворяет. Габарит, σ и причины при этом
+остаются в файле: шлюз помечает, а не уничтожает улику. Без этой ветви слово «шлюз»
+здесь было бы названием без последствий: вердикт считался, записывался и ни на что не
+употреблялся.
+
 Генеративное устранение смаза синтезирует границы, которых в кадре не было, а измерение
 выполняется именно по границам: снимок стал бы визуально убедительным, а миллиметры —
 уверенно неверными. Поэтому модуль только выносит вердикт.
@@ -18,17 +28,48 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
+from facade_digitizer.geometry.angles import THETA_MAX_DEG
 from facade_digitizer.schema import QualityReport
 
-#: Порог углового условия п. 2.2: угол визирования на точку не свыше 30°.
+#: Порог углового условия п. 2.2 переэкспортируется отсюда под прежним именем, а
+#: объявлен в `geometry.angles`.
 #:
 #: Это порог ПРИГОДНОСТИ ТОЧКИ, а не порог вердикта, и в `Thresholds` он не входит
 #: намеренно. Угловое условие предъявляется элементу, а не кадру (спецификация,
 #: п. 4.1); на уровне кадра оно выражается долей пригодной области, и решает в шлюзе
-#: именно она — `usable_min_fraction`. Величина живёт здесь, а не в двух местах
-#: порознь: по ней считают и `usable_fraction`, и маска пригодности в сборке
-#: конвейера.
-THETA_MAX_DEG = 30.0
+#: именно она — `usable_min_fraction`.
+#:
+#: Величина живёт в ОДНОМ месте, и это место — `geometry.angles`, где ею же
+#: пользуется `usable_mask`. Прежде этот модуль объявлял её числом и утверждал о
+#: себе «живёт здесь, а не в двух местах порознь», тогда как `usable_mask`
+#: держала рядом собственный литерал `30.0`, то есть второе объявление всё-таки
+#: существовало. Обратное направление импорта (геометрия берёт величину у
+#: конвейера) недопустимо: `geometry` не зависит от `pipeline` ни в одной точке.
+__all__ = [
+    "DEFAULT",
+    "RESOLUTION_REASON",
+    "SHARPNESS_REASON",
+    "THETA_MAX_DEG",
+    "USABLE_FRACTION_REASON",
+    "Thresholds",
+    "assess",
+    "sharpness",
+    "usable_fraction",
+]
+
+
+#: Шаблоны причин отбраковки. Вынесены в имена, а не вписаны в `assess`, по одной
+#: причине: текст причины не должен решать вердикт. Прежде `reject` выбирался
+#: совпадением по подстроке «разрешение» в уже собранных причинах, то есть
+#: вердикт зависел от формулировки — а `pipeline.run._needs_operator_model`
+#: складывает для `QualityReport` ТОГО ЖЕ типа причину «разрешение оценено по
+#: опорной базе оператора», где то же слово есть, а недостаточного разрешения
+#: нет. Теперь условие и признак стоят рядом, а шаблон можно переписать, не
+#: тронув вердикта; проверка этой независимости — в
+#: `tests/test_quality.py::test_verdict_is_decided_by_the_condition_not_by_the_wording`.
+SHARPNESS_REASON = "недостаточная резкость: {value:.2e} < {threshold:.2e}"
+RESOLUTION_REASON = "недостаточное разрешение: {value:.1f} мм/px > {threshold}"
+USABLE_FRACTION_REASON = "угловому условию удовлетворяет лишь {value:.0%} кадра"
 
 
 @dataclass(frozen=True)
@@ -133,9 +174,15 @@ def sharpness(image: np.ndarray) -> float:
 
 
 def usable_fraction(theta_field_deg: np.ndarray,
-                    theta_max_deg: float = THETA_MAX_DEG) -> float:
-    """Доля кадра, удовлетворяющая угловому условию. Спецификация, п. 4.1."""
-    return float(np.mean(np.asarray(theta_field_deg) <= theta_max_deg))
+                    theta_max_deg: float | None = None) -> float:
+    """Доля кадра, удовлетворяющая угловому условию. Спецификация, п. 4.1.
+
+    Умолчание берётся у `THETA_MAX_DEG` в момент вызова — по той же причине и
+    тем же способом, что у `geometry.angles.usable_mask`: иначе «величина живёт
+    в одном месте» остаётся утверждением, которого нечем проверить.
+    """
+    threshold = THETA_MAX_DEG if theta_max_deg is None else theta_max_deg
+    return float(np.mean(np.asarray(theta_field_deg) <= threshold))
 
 
 def assess(image: np.ndarray, gsd_min: float, gsd_max: float, theta_p95: float,
@@ -171,15 +218,26 @@ def assess(image: np.ndarray, gsd_min: float, gsd_max: float, theta_p95: float,
     if not math.isfinite(sharp):
         raise ValueError(f"изображение: резкость неопределена ({sharp})")
     if sharp < t.sharpness_min:
-        reasons.append(f"недостаточная резкость: {sharp:.2e} < {t.sharpness_min:.2e}")
-    if gsd_max > t.gsd_max_mm_px:
-        reasons.append(f"недостаточное разрешение: {gsd_max:.1f} мм/px > {t.gsd_max_mm_px}")
+        reasons.append(SHARPNESS_REASON.format(value=sharp, threshold=t.sharpness_min))
+    # Признак ставится ТАМ ЖЕ, где проверяется условие, и вердикт решается по
+    # нему, а не по поиску подстроки «разрешение» в готовых причинах. Поиск по
+    # подстроке ставил вердикт в зависимость от текста сообщений: `run.py`
+    # формирует для `QualityReport` того же типа причину «разрешение оценено по
+    # опорной базе оператора», в которой то же слово есть, а недостаточного
+    # разрешения нет, — и инвариант непересечения подстрок, который проверяет
+    # `tests/test_quality.py::test_refusal_messages_do_not_overlap`, к этому
+    # набору строк не относится вовсе: он стережёт сообщения ОБ ОТКАЗАХ
+    # ValueError, а не причины вердикта.
+    resolution_too_coarse = gsd_max > t.gsd_max_mm_px
+    if resolution_too_coarse:
+        reasons.append(RESOLUTION_REASON.format(value=gsd_max,
+                                                threshold=t.gsd_max_mm_px))
     if usable < t.usable_min_fraction:
-        reasons.append(f"угловому условию удовлетворяет лишь {usable:.0%} кадра")
+        reasons.append(USABLE_FRACTION_REASON.format(value=usable))
 
     if not reasons:
         verdict = "ok"
-    elif any("разрешение" in r for r in reasons):
+    elif resolution_too_coarse:
         verdict = "reject"
     else:
         verdict = "degraded"

@@ -1,7 +1,10 @@
+import dataclasses
+
 import numpy as np
 import pytest
 
 from facade_digitizer.metrics import (
+    ErrorStats,
     coverage,
     error_stats,
     interval_score,
@@ -158,3 +161,63 @@ def test_empty_sample_is_rejected():
 def test_mismatched_lengths_are_rejected():
     with pytest.raises(ValueError):
         error_stats(np.array([1.0, 2.0]), np.array([1.0]))
+
+
+# --- Охраны аргументов: каждая испытана, а не только объявлена --------------------
+
+
+def test_coverage_rejects_a_sigma_array_of_another_length():
+    """Массив σ не той длины — поломка вызова, а не свойство выборки.
+
+    Без охраны numpy сравнил бы массивы по правилам вещания: при длине 1 покрытие
+    посчиталось бы по ОДНОЙ σ для всех измерений и вышло бы правдоподобным
+    числом; при прочих длинах отказ пришёл бы из numpy и говорил бы про формы
+    массивов, а не про то, что σ подана не к той выборке.
+    """
+    measured, truth = np.array([1.0, 2.0, 3.0]), np.array([1.0, 2.0, 3.0])
+    with pytest.raises(ValueError, match="массив σ не совпадает по длине"):
+        coverage(measured, truth, np.array([1.0]))
+    with pytest.raises(ValueError, match="массив σ не совпадает по длине"):
+        coverage(measured, truth, np.array([1.0, 1.0, 1.0, 1.0]))
+
+
+def test_interval_score_rejects_a_sigma_array_of_another_length():
+    """Та же охрана у второй метрики: правило одно, и проверено оно порознь."""
+    measured, truth = np.array([1.0, 2.0, 3.0]), np.array([1.0, 2.0, 3.0])
+    with pytest.raises(ValueError, match="массив σ не совпадает по длине"):
+        interval_score(measured, truth, np.array([1.0, 1.0]))
+
+
+@pytest.mark.parametrize("bad_sigma", [0.0, -1.0])
+def test_coverage_rejects_a_non_positive_sigma(bad_sigma):
+    """σ ≤ 0 не бывает заявленной точностью.
+
+    Нулевая σ дала бы интервал нулевой ширины, а покрытие по нему — долю точных
+    попаданий; отрицательная — интервал, в который не попадает ничто. Обе
+    величины конечны и правдоподобны, поэтому отказ обязан быть явным.
+    """
+    measured, truth = np.array([1.0, 2.0]), np.array([1.0, 2.0])
+    with pytest.raises(ValueError, match="σ должна быть положительной"):
+        coverage(measured, truth, np.array([1.0, bad_sigma]))
+
+
+def test_mean_sharpness_rejects_an_empty_array():
+    """Среднее по пустому массиву numpy даёт `nan` и предупреждение, а не отказ.
+
+    Острота сообщается РЯДОМ с покрытием и без неё бессмысленным становится само
+    покрытие; `nan` в этой паре прошёл бы дальше как значение.
+    """
+    with pytest.raises(ValueError, match="пустой массив σ"):
+        mean_sharpness(np.array([]))
+
+
+def test_error_stats_is_frozen():
+    """`ErrorStats` неизменяем: сводка ошибок не правится после того, как посчитана.
+
+    Без `frozen` результат можно было бы подкрутить на месте — и отчёт о точности
+    перестал бы быть отчётом о том, что измерено.
+    """
+    st = error_stats(np.array([1.0, 2.0]), np.array([0.0, 0.0]))
+    assert isinstance(st, ErrorStats)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        st.rmse = 0.0

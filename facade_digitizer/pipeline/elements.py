@@ -74,16 +74,16 @@ from typing import Literal
 import numpy as np
 from pydantic import ConfigDict, Field, model_validator
 
+from facade_digitizer.geometry.angles import THETA_MAX_DEG, nearest_node
 from facade_digitizer.geometry.camera import CameraOnPlane
 from facade_digitizer.geometry.homography import apply_homography, rectified_to_facade_mm
 from facade_digitizer.geometry.parallax import (
-    REFERENCE_SIGMA_CZ_REL,
     REFERENCE_SIGMA_THETA_DEG,
     reveal_depth,
     reveal_depth_sigma,
+    signed_reveal_width_mm,
     visible_reveal_side,
 )
-from facade_digitizer.pipeline.quality import THETA_MAX_DEG
 from facade_digitizer.schema import Element, Point, Recess, SizeMM, Strict, ThetaDeg
 
 #: Цель п. 2.2 для режима `assisted`: 1σ ≤ 10 мм на габарит по наружному контуру.
@@ -329,36 +329,21 @@ def load_marks(path) -> list[ElementMark]:
     return parse_marks(json.loads(text))
 
 
-def _nearest_node(value_px: float, extent_px: int, count: int) -> int:
-    """Индекс ближайшего узла регулярной сетки, покрывающей `[0, extent_px - 1]`.
-
-    Тот же приём, что `pipeline.run._nearest_node` (задача 15): узел сетки
-    `local_gsd_field`, ближайший к точке кадра. Реализация продублирована
-    сознательно, а не импортирована из `run.py` — `elements.py` не зависит от
-    приватных имён модуля, который сам импортирует `elements.py`
-    (`run.py` — оркестратор конвейера, `elements.py` — его часть); обе копии
-    вычисляют одно и то же по одной и той же формуле и проверены порознь своими
-    тестами.
-
-    Зажим индекса к краю сетки — последняя охрана, а не проверка входа: точки
-    разметки обязаны лежать В КАДРЕ, и это проверено до всякого обращения сюда
-    (`_marks_in_frame`). Без той проверки зажим брал бы разрешение «у проёма» из
-    совсем другого места кадра, причём молча — измерено: точка, вышедшая за
-    правый край на 1267 px, получает узел края и вместе с ним правдоподобное
-    конечное значение.
-    """
-    if extent_px <= 1 or count <= 1:
-        return 0
-    idx = round(value_px / (extent_px - 1) * (count - 1))
-    return max(0, min(count - 1, idx))
-
-
 def _gsd_at_point(gsd_field: np.ndarray, image_size, point_px) -> float:
+    """Разрешение в ближайшем к точке узле поля.
+
+    Узел выбирает `geometry.angles.nearest_node` — ТА ЖЕ функция, какой его
+    выбирает сборка конвейера (`pipeline.run._gsd_at`). Прежде формула была
+    выписана здесь вторично, со ссылкой на цикл импорта как на причину; цикла
+    нет — оба модуля уже импортируют `geometry.angles`, — и общее объявление
+    переехало туда, к самой сетке `FIELD_SHAPE`.
+    """
     rows, cols = gsd_field.shape
     w_px, h_px = image_size
-    col = _nearest_node(float(point_px[0]), w_px, cols)
-    row = _nearest_node(float(point_px[1]), h_px, rows)
+    col = nearest_node(float(point_px[0]), w_px, cols)
+    row = nearest_node(float(point_px[1]), h_px, rows)
     return float(gsd_field[row, col])
+
 
 
 def _gsd_near(gsd_field: np.ndarray, image_size, points_px, label: str) -> float:
@@ -546,24 +531,59 @@ def _worst_corner_theta(camera: CameraOnPlane, contour_mm: np.ndarray):
 
 def _digitize_recess(mark: ElementMark, contour_mm: np.ndarray, H, camera: CameraOnPlane,
                       mm_per_unit: float, origin_rect, gsd_field: np.ndarray, image_size,
-                      sigma_px: float) -> Recess:
+                      sigma_px: float, sigma_rel: float, edge_reference: str) -> Recess:
     """Глубина заглубления по разметке внутренней кромки грани откоса. П. 5.4-5.5, 6.2.
 
-    Три исхода, каждый — с названным происхождением, а не тихим числом:
+    Исходы, каждый — с названным происхождением, а не тихим числом:
 
+    * `edge_reference != "wall_plane"` — наружная кромка, от которой отсчитывалась
+      бы глубина, заведомо не лежит в плоскости стены либо про неё не известно
+      ничего. `origin = "unavailable"`;
     * оператор разметил грань, которая по позе камеры НЕ видна (правило п. 5.5:
-      видна дальняя от опорной точки F грань) — `origin = "unavailable"`, задача 3
-      плана («закрой отложенное замечание задачи 3: вертикальный откос виден на
-      дальней от F стороне, размеченная ближняя сторона распознаётся, а не
-      считается по невидимой грани»);
+      видна дальняя от опорной точки F грань) — `origin = "unavailable"`;
+    * внутренняя кромка смещена НЕ В ТУ сторону — `origin = "unavailable"`;
     * грань видна, но фактический θ_⊥ ниже вычисляемого порога применимости
       (`reveal_depth` вызывает `reveal_depth_theta_min_deg` внутри себя, порог не
       константа — п. 6.2) — тоже `"unavailable"`, отказ `reveal_depth` ловится, а
       не роняет весь снимок;
-    * грань видна и выше порога — `origin = "measured_from_reveal"` с `value_mm`,
-      `sigma_mm`, `theta_perp_deg` и `datum = "quarter_edge"`.
+    * всё сошлось — `origin = "measured_from_reveal"` с `value_mm`, `sigma_mm`,
+      `theta_perp_deg` и `datum = "quarter_edge"`.
+
+    **Почему `edge_reference` решает здесь, а не только у габарита.** Глубина
+    отсчитывается ОТ НАРУЖНОЙ КРОМКИ проёма, и `edge_reference` — это и есть
+    утверждение о том, где та кромка лежит. При `"offset_plane"` п. 5.3 сама
+    объявляет своё допущение нарушенным: элемент обрабатывается как выступающий
+    (п. 5.6) и требует НЕ ИЗМЕРЕННОГО выноса, а `recess` помечается
+    `unavailable` (п. 17). При `"unknown"` про кромку не известно ничего, и
+    отсчитывать от неё нечего. Прежде эта связь существовала только для
+    `edge_reference` и `meets_tolerance`, а `recess` считался безусловно — и один
+    и тот же элемент выходного файла утверждал разом «контур не лежит в плоскости
+    стены» (`edge_reference: "offset_plane"`) и «глубина измерена по откосу до
+    ребра четверти» (`origin: "measured_from_reveal"`, `datum: "quarter_edge"`).
+
+    **Направление смещения внутренней кромки проверяется, а не берётся по
+    модулю.** Внутренняя кромка обязана лежать МЕЖДУ наружной кромкой и опорной
+    точкой F: при заглублении параллакс сносит её к F, при выносе — от неё
+    (`signed_reveal_width_mm`). Разметка «с другой стороны» — отказ, а не число:
+    прежде здесь стоял `abs(наружная − внутренняя)`, и истинно выступающий
+    элемент (истина −150 мм) выдавал уверенные +154.6 мм в поле, где числу
+    полагается быть глубиной. Возвращать вместо этого отрицательную глубину
+    нельзя по той же п. 5.6: вынос — отдельная величина `offset_mm` следующего
+    этапа, а не заглубление с другим знаком, и `Recess` поля под неё не имеет.
+    Второй конец того же неравенства (кромка не перешла ЗА F) проверяет сама
+    `reveal_depth` условием `u > w`.
+
+    **Точки грани откоса проходят ту же проверку видимости, что и углы контура.**
+    `_in_front_of_camera` прежде применялась только к `corners_px`; узел за линией
+    схода даёт КОНЕЧНЫЕ, но бессмысленные миллиметры, поэтому проверка на
+    `isfinite` его не ловит.
     """
     reveal = mark.reveal
+    side = reveal.side
+
+    if edge_reference != "wall_plane":
+        return Recess(origin="unavailable", reveal_side=side)
+
     p = np.asarray(contour_mm, dtype=float)
     x_left, x_right = float(p[:, 0].min()), float(p[:, 0].max())
     y_bottom, y_top = float(p[:, 1].min()), float(p[:, 1].max())
@@ -571,7 +591,6 @@ def _digitize_recess(mark: ElementMark, contour_mm: np.ndarray, H, camera: Camer
 
     visible_vertical, visible_horizontal = visible_reveal_side(
         camera, x_left, x_right, y_bottom, y_top)
-    side = reveal.side
     is_vertical = side in ("left", "right")
     expected_side = visible_vertical if is_vertical else visible_horizontal
 
@@ -581,20 +600,27 @@ def _digitize_recess(mark: ElementMark, contour_mm: np.ndarray, H, camera: Camer
     if is_vertical:
         edge_x, edge_y = (x_left if side == "left" else x_right), cy_edge
         normal = (1.0, 0.0)
-        component = 0
     else:
         edge_x, edge_y = cx_edge, (y_bottom if side == "bottom" else y_top)
         normal = (0.0, 1.0)
-        component = 1
 
     inner_rect = apply_homography(H, reveal.inner_edge_px)
     inner_mm = rectified_to_facade_mm(inner_rect, origin_rect, mm_per_unit)
     if not np.all(np.isfinite(inner_mm)):
         return Recess(origin="unavailable", reveal_side=side)
-    inner_component = float(inner_mm[:, component].mean())
-    outer_component = edge_x if component == 0 else edge_y
-    width_mm = abs(outer_component - inner_component)
+    inner_x = float(inner_mm[:, 0].mean())
+    inner_y = float(inner_mm[:, 1].mean())
+
+    try:
+        width_mm = signed_reveal_width_mm(camera, edge_x, edge_y, inner_x, inner_y,
+                                          normal)
+    except ValueError:
+        # Опорная точка села на само ребро откоса: сторона смещения не определена.
+        return Recess(origin="unavailable", reveal_side=side)
     if width_mm <= 0:
+        # Внутренняя кромка смещена ОТ опорной точки либо не смещена вовсе:
+        # элемент не заглублён, и глубины у него нет — есть вынос, величина
+        # следующего этапа (п. 5.6).
         return Recess(origin="unavailable", reveal_side=side)
 
     gsd_local = _gsd_near(gsd_field, image_size,
@@ -617,7 +643,16 @@ def _digitize_recess(mark: ElementMark, contour_mm: np.ndarray, H, camera: Camer
     sigma_width_mm = math.sqrt(2.0) * sigma_px * gsd_local
     phi = math.atan(u_mm / camera.cz)
     sigma_u_mm = camera.cz / math.cos(phi) ** 2 * math.radians(REFERENCE_SIGMA_THETA_DEG)
-    sigma_cz_mm = REFERENCE_SIGMA_CZ_REL * camera.cz
+    # σ дистанции до плоскости берётся ИЗМЕРЕННОЙ, а не по опорному допущению
+    # `parallax.REFERENCE_SIGMA_CZ_REL` (0.4 %). `camera_pose` кладёт в `cz`
+    # ровно `mm_per_unit` (`geometry.homography.camera_pose`), а `mm_per_unit`
+    # задан опорным размером оператора: его относительная погрешность — это и
+    # есть `facade.scale.sigma_rel` того же выходного файла (на рабочем проходе
+    # 0.18-0.23 %). Допущение 0.4 % верно в модуле-источнике, где фактической
+    # величины нет; у потребителя, который её знает, оно названо бы не своим
+    # происхождением. Влияние мало (0.60 мм из 27 на опорной геометрии), но
+    # «мало» — не основание держать в бюджете чужое число.
+    sigma_cz_mm = sigma_rel * camera.cz
     sigma_mm = reveal_depth_sigma(width_mm, u_mm, camera.cz, sigma_width_mm,
                                   sigma_u_mm, sigma_cz_mm)
 
@@ -630,6 +665,7 @@ def _digitize_recess(mark: ElementMark, contour_mm: np.ndarray, H, camera: Camer
         theta_perp_deg=theta_perp_deg,
         consistency="unchecked",
     )
+
 
 
 def _digitize_one(mark: ElementMark, index: int, *, H, camera: CameraOnPlane,
@@ -645,6 +681,12 @@ def _digitize_one(mark: ElementMark, index: int, *, H, camera: CameraOnPlane,
         marked_px += list(mark.reveal.inner_edge_px)
     _points_in_frame(marked_px, image_size, label)
 
+    # Проверяются ВСЕ точки разметки, а не только углы контура. Точки грани
+    # откоса переводятся в миллиметры той же гомографией и той же строкой кода,
+    # что и углы, поэтому за линией схода они так же дают конечные бессмысленные
+    # координаты; охрана на `isfinite` в `_digitize_recess` их не ловит. Набор
+    # точек здесь тот же, что у `_points_in_frame` выше, — два разных набора у
+    # двух охран одного и того же входа расходились бы молча.
     visible = _in_front_of_camera(H, image_size, corners_px)
     if not bool(np.all(visible)):
         raise ValueError(
@@ -699,7 +741,8 @@ def _digitize_one(mark: ElementMark, index: int, *, H, camera: CameraOnPlane,
     recess = None
     if mark.reveal is not None:
         recess = _digitize_recess(mark, contour_mm, H, camera, mm_per_unit, origin_rect,
-                                  gsd_field, image_size, sigma_px)
+                                  gsd_field, image_size, sigma_px, sigma_rel,
+                                  edge_reference)
 
     return Element(
         id=_element_id(mark.class_, index),
@@ -743,6 +786,15 @@ def digitize_elements(marks: list[ElementMark], *, H, camera: CameraOnPlane,
     посчитанная сборкой из длины опорной базы), `residual_px` — невязка оценки
     плоскости в пикселях (`PlaneConfidence.residual_px` либо `None` на ручном пути
     `manual_four_point` и там, где невязка неконечна).
+
+    `sigma_rel` входит в ДВА бюджета, а не в один. В бюджете габарита (п. 6.1) это
+    строка «масштаб», `L · σ_rel`. В бюджете глубины (п. 6.2) — относительная
+    погрешность дистанции до плоскости: `camera_pose` кладёт в `cz` ровно
+    `mm_per_unit`, а `mm_per_unit` задан тем же опорным размером оператора, поэтому
+    σ_Cz / C_z и есть σ_rel. Опорное допущение `parallax.REFERENCE_SIGMA_CZ_REL`
+    (0.4 %) остаётся только там, где фактической величины нет, — во внутреннем
+    расчёте порога применимости `reveal_depth`, где и глубина, и допуск тоже
+    опорные.
 
     `calibration` — происхождение матрицы K этого СНИМКА в терминах схемы
     (`camera.calibration`). Аргумент обязательный и без умолчания: от него зависит

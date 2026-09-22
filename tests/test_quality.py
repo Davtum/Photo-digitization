@@ -2,6 +2,8 @@ import cv2
 import numpy as np
 import pytest
 
+from facade_digitizer.geometry import angles
+from facade_digitizer.pipeline import quality
 from facade_digitizer.pipeline.quality import (
     THETA_MAX_DEG,
     Thresholds,
@@ -207,6 +209,66 @@ def test_valid_frames_of_both_kinds_are_accepted(img):
     """Охрана не должна отвергать рабочий кадр: и uint8, и float проходят."""
     assert assess(img, 3.1, 4.6, 22.0).verdict == "ok"
     assert assess(img.astype(np.float64), 3.1, 4.6, 22.0).verdict == "ok"
+
+
+def test_verdict_is_decided_by_the_condition_not_by_the_wording(img, monkeypatch):
+    """`reject` ставится по ЧИСЛОВОМУ условию, а не по слову в тексте причины.
+
+    Прежде вердикт выбирался совпадением по подстроке: `any("разрешение" in r)`.
+    Охрана, которая вроде бы это стерегла
+    (`test_refusal_messages_do_not_overlap`), относится к СОВСЕМ ДРУГОМУ набору
+    строк — к сообщениям отказов `ValueError`, а не к причинам вердикта, — и
+    непересечения причин между собой не проверяет вовсе. При этом
+    `pipeline.run._needs_operator_model` уже складывает для `QualityReport` того
+    же типа причину «разрешение оценено по опорной базе оператора», где то же
+    слово есть, а недостаточного разрешения нет.
+
+    Здесь переписывается ТОЛЬКО шаблон чужой причины — резкости, — а разрешение
+    остаётся в допуске. Вердикт обязан остаться `degraded`: подстрочный вариант
+    дал бы `reject`, то есть «переснимите, слишком мелко» на кадре, разрешение
+    которого порога не нарушало.
+    """
+    monkeypatch.setattr(quality, "SHARPNESS_REASON",
+                        "разрешение тут ни при чём: {value:.2e} < {threshold:.2e}")
+    report = assess(img, 3.1, 4.6, 22.0,
+                    thresholds=Thresholds(sharpness_min=1.0e9))
+
+    assert any("разрешение" in r for r in report.reasons)
+    assert report.gsd_mm_px_max < Thresholds().gsd_max_mm_px
+    assert report.verdict == "degraded"
+
+
+def test_reject_follows_the_resolution_threshold_on_both_sides():
+    """Тот же признак — и в обратную сторону: у порога вердикт переключается.
+
+    Дополняет проверку выше: та показывает, что чужое слово `reject` не вызывает,
+    эта — что своё условие вызывает его всегда, в том числе когда причина не
+    единственная.
+    """
+    t = Thresholds()
+    frame = scene().render()
+    just_below = assess(frame, 1.0, t.gsd_max_mm_px, 22.0)
+    just_above = assess(frame, 1.0, t.gsd_max_mm_px * 1.001, 22.0)
+
+    assert just_below.verdict == "ok"
+    assert just_above.verdict == "reject"
+    # И при второй, посторонней причине вердикт остаётся `reject`, а не «худшим
+    # из двух по алфавиту»: недостаточное разрешение сильнее деградации.
+    with_two = assess(frame, 1.0, t.gsd_max_mm_px * 1.001, 22.0, usable=0.1)
+    assert with_two.verdict == "reject"
+    assert len(with_two.reasons) == 2
+
+
+def test_the_angle_threshold_has_exactly_one_declaration():
+    """`THETA_MAX_DEG` объявлен один раз, и оба потребителя видят ТОТ ЖЕ объект.
+
+    Прежде их было два: константа этого модуля, утверждавшая о себе «величина
+    живёт здесь, а не в двух местах порознь», и собственный литерал `30.0` в
+    умолчании `geometry.angles.usable_mask`. Совпадение значений проверкой не
+    является — два литерала совпадают ровно до первой правки одного из них.
+    Поэтому сверяется ТОЖДЕСТВО объектов, а не равенство чисел.
+    """
+    assert quality.THETA_MAX_DEG is angles.THETA_MAX_DEG
 
 
 REFUSALS = {
