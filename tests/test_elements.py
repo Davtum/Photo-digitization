@@ -989,7 +989,7 @@ def test_recess_schema_refuses_a_number_under_unavailable_origin():
     assert element.recess.origin == "unavailable"
     # Схема уже это стережёт (tests/test_schema.py); здесь — что сборка её не обходит.
     FacadeModel.model_validate(
-        {"schema_version": "1.1", "software_version": "x", "coverage": "partial",
+        {"schema_version": "1.2", "software_version": "x", "coverage": "partial",
          "mode": "assisted", "images": [], "elements": [],
          "facade": {"origin": "bottom_left", "bounds_mm": [0, 0, 1, 1],
                     "mm_per_rectified_px": 1.0,
@@ -1168,9 +1168,13 @@ def test_cli_digitizes_marked_elements_and_saves_the_raster(tmp_path):
     assert model.elements[0].origin == "operator"
     # `contour_px` раздела 10: пиксельные клики оператора обязаны дойти до выхода —
     # без них демонстрация не воспроизводится, а задача 18 их и вводит.
+    # С версии схемы 1.2 рядом лежит и σ, с которой точки посчитаны (план 3,
+    # задача 6): у разметки без своей σ это умолчание CLI.
+    from facade_digitizer.pipeline.run import DEFAULT_MARK_SIGMA_PX
     assert model.elements[0].contour_px == [
         {"image_id": model.images[0].id,
-         "points": [list(pt) for pt in corners_px]}]
+         "points": [list(pt) for pt in corners_px],
+         "sigma_px": DEFAULT_MARK_SIGMA_PX}]
 
     from facade_digitizer.pipeline.io import load_image
     raster, _ = load_image(out_dir / "facade_rectified.png")

@@ -223,10 +223,6 @@ UNAVAILABLE_SCALE_SOURCES = {
         "нормали не содержит, а вывод дальности из позы сам требует масштаба"),
 }
 
-#: Множитель `sqrt(2)`: оператор указывает ДВЕ точки, и погрешности их указания
-#: независимы, поэтому σ длины базы есть квадратичная сумма двух равных вкладов.
-_TWO_INDEPENDENT_POINTS = math.sqrt(2.0)
-
 #: Источник матрицы K в терминах схемы. `intrinsics_from_meta` уточняет путь через
 #: EXIF ("exif:crop_factor" и подобные), схема же различает лишь три происхождения.
 #: Уточнение отбрасывается ЗДЕСЬ и осознанно, а не теряется по дороге.
@@ -241,12 +237,23 @@ class OperatorReference:
     `span_px` — две точки кадра, между которыми оператор знает истинное расстояние.
     `span_mm` — это расстояние в миллиметрах.
     `sigma_px` — точность указания точки; см. `DEFAULT_OPERATOR_SIGMA_PX`.
+    `end_sigma_px` — точность указания КАЖДОГО конца базы порознь (план 3,
+    задача 6); `None` — оба конца с `sigma_px`. Концы указываются при разном
+    масштабе просмотра, и одна σ на оба приписала бы точному концу промах грубого.
     """
 
     origin_px: tuple
     span_px: tuple
     span_mm: float
     sigma_px: float = DEFAULT_OPERATOR_SIGMA_PX
+    end_sigma_px: tuple | None = None
+
+    @property
+    def end_sigmas(self) -> tuple[float, float]:
+        if self.end_sigma_px is None:
+            return (self.sigma_px, self.sigma_px)
+        first, second = self.end_sigma_px
+        return (first, second)
 
 
 def _finite(name: str, value) -> float:
@@ -345,22 +352,28 @@ def _points_in_frame(reference: "OperatorReference", image_size) -> None:
                 f"{w_px}x{h_px}: оператор указывает точки на снимке")
 
 
-def _scale_sigma_rel(span_mm: float, sigma_px: float, gsd_at_reference: float) -> float:
+def _scale_sigma_rel(span_mm: float, end_sigmas, end_gsds) -> float:
     """σ масштаба из ДЛИНЫ ОПОРНОЙ БАЗЫ и измеренного разрешения при ней.
 
-        sigma_rel = sqrt(2) * sigma_px * gsd_at_reference / span_mm
+        sigma_rel = sqrt((σ1·g1)² + (σ2·g2)²) / span_mm
+
+    Оператор указывает ДВЕ точки, погрешности их указания независимы, и в
+    миллиметрах каждая равна своей σ на своё локальное разрешение. Прежде σ была
+    одна на оба конца и разрешение бралось среднеквадратичным по концам —
+    `sqrt(2)·σ·g_ск`, что есть тот же ответ ровно при равных σ (план 3, задача 6:
+    концы указываются при разном увеличении).
 
     Оговорка задачи 14 о том, что реальный оператор даст базу вдесятеро короче
     двадцатиметровой стороны фасада, перестаёт быть текстом в спецификации и
     становится числом в выходном файле: короткая база сама поднимает σ.
     """
     span_mm = _finite("operator_reference.span_mm", span_mm)
-    sigma_px = _finite("operator_reference.sigma_px", sigma_px)
-    if span_mm <= 0 or sigma_px <= 0:
+    sigmas = [_finite("operator_reference.sigma_px", v) for v in end_sigmas]
+    if span_mm <= 0 or min(sigmas) <= 0:
         raise ValueError("опорная база и точность указания точки должны быть положительны: "
-                         f"span_mm={span_mm}, sigma_px={sigma_px}")
-    gsd_at_reference = _finite("gsd_at_reference", gsd_at_reference)
-    return _TWO_INDEPENDENT_POINTS * sigma_px * gsd_at_reference / span_mm
+                         f"span_mm={span_mm}, sigma_px={sigmas}")
+    gsds = [_finite("gsd_at_reference", g) for g in end_gsds]
+    return math.hypot(sigmas[0] * gsds[0], sigmas[1] * gsds[1]) / span_mm
 
 
 def _checked_scale_source(scale_source: str) -> str:
@@ -581,7 +594,8 @@ def _needs_operator_model(path, image_id, meta, K, dist, source, plane, referenc
                                     needs_operator=True),
         homography=None,
     )
-    sigma_rel = (_scale_sigma_rel(reference.span_mm, reference.sigma_px, gsd_along_base)
+    sigma_rel = (_scale_sigma_rel(reference.span_mm, reference.end_sigmas,
+                                  (gsd_along_base, gsd_along_base))
                  if scale_source == "operator_reference"
                  else SIGMA_REL_ASSUMED_FLOOR_HEIGHT)
     return FacadeModel(
@@ -769,11 +783,10 @@ def scale_stage(fs: FrameStage, operator_reference: OperatorReference, *,
     attainable = attainable_mm_per_px(image, plane.H, mm_per_unit)
 
     if scale_source == "operator_reference":
-        gsd_at_reference = math.sqrt(sum(
-            _finite("gsd_at_reference", _gsd_at(fields.gsd, image_size, point)) ** 2
-            for point in operator_reference.span_px) / 2.0)
+        end_gsds = [_finite("gsd_at_reference", _gsd_at(fields.gsd, image_size, point))
+                    for point in operator_reference.span_px]
         sigma_rel = _scale_sigma_rel(operator_reference.span_mm,
-                                     operator_reference.sigma_px, gsd_at_reference)
+                                     operator_reference.end_sigmas, end_gsds)
     else:
         sigma_rel = SIGMA_REL_ASSUMED_FLOOR_HEIGHT
 

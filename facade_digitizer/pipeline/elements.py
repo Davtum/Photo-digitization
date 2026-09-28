@@ -218,6 +218,16 @@ _OFFSET_MOUNTING = "protruding"
 _ID_PREFIX = {"window": "w", "door": "d"}
 
 
+def _checked_mark_sigma(value, where: str):
+    """σ клика у разметки: конечная и строго положительная либо не задана."""
+    if value is None:
+        return None
+    if not (math.isfinite(value) and value > 0):
+        raise ValueError(f"{where}.sigma_px должна быть конечной и положительной, "
+                         f"получено {value!r}")
+    return float(value)
+
+
 class RevealMark(Strict):
     """Разметка внутренней кромки видимой грани откоса. Спецификация, п. 5.4-5.5.
 
@@ -231,6 +241,14 @@ class RevealMark(Strict):
 
     side: Literal["left", "right", "top", "bottom"]
     inner_edge_px: list[Point]
+    #: Точность указания точек внутренней кромки, px кадра (план 3, задача 6);
+    #: `None` — та же, что у углов своего проёма.
+    sigma_px: float | None = None
+
+    @model_validator(mode="after")
+    def _sigma_is_positive(self):
+        _checked_mark_sigma(self.sigma_px, "reveal")
+        return self
 
     @model_validator(mode="after")
     def _exactly_two_points(self):
@@ -274,6 +292,23 @@ class ElementMark(Strict):
     edge_type: Literal["sharp_wall_edge", "surround", "cladding_edge", "unknown"]
     corners_px: list[Point]
     reveal: RevealMark | None = None
+    #: Идентификатор элемента в выходе (план 3, задача 6). `None` — присваивается
+    #: по номеру в списке (`w_000`, …), как прежде; но такой идентификатор сдвигается
+    #: при удалении любой предыдущей разметки, поэтому интерфейс оператора задаёт
+    #: его явно и хранит в сессии.
+    id: str | None = None
+    #: Точность указания углов этого проёма, px кадра (план 3, задача 6). `None` —
+    #: общее умолчание вызова (`--mark-sigma-px`). Своя у каждого элемента, потому
+    #: что разные проёмы размечаются при разном увеличении, и один размеченный
+    #: грубо не должен портить σ остальных.
+    sigma_px: float | None = None
+
+    @model_validator(mode="after")
+    def _sigma_and_id(self):
+        _checked_mark_sigma(self.sigma_px, "разметка")
+        if self.id is not None and not self.id.strip():
+            raise ValueError("id разметки не может быть пустой строкой")
+        return self
 
     @model_validator(mode="after")
     def _openings_only(self):
@@ -675,6 +710,8 @@ def _digitize_one(mark: ElementMark, index: int, *, H, camera: CameraOnPlane,
                    image_id: str) -> Element:
     label = f"{mark.class_}[{index}]"
     corners_px = np.asarray(mark.corners_px, dtype=float)
+    # Своя σ у каждой разметки (план 3, задача 6); параметр вызова — умолчание.
+    sigma_px = mark.sigma_px if mark.sigma_px is not None else sigma_px
 
     marked_px = list(mark.corners_px)
     if mark.reveal is not None:
@@ -741,19 +778,22 @@ def _digitize_one(mark: ElementMark, index: int, *, H, camera: CameraOnPlane,
 
     recess = None
     if mark.reveal is not None:
+        reveal_sigma = (mark.reveal.sigma_px if mark.reveal.sigma_px is not None
+                        else sigma_px)
         recess = _digitize_recess(mark, contour_mm, H, camera, mm_per_unit, origin_rect,
-                                  gsd_field, image_size, sigma_px, sigma_rel,
+                                  gsd_field, image_size, reveal_sigma, sigma_rel,
                                   edge_reference)
 
     return Element(
-        id=_element_id(mark.class_, index),
+        id=mark.id if mark.id is not None else _element_id(mark.class_, index),
         class_name=mark.class_,
         mounting=mark.mounting,
         edge_reference=edge_reference,
         edge_type=mark.edge_type,
         contour_mm=[(float(x), float(y)) for x, y in contour_mm],
         contour_px=[{"image_id": image_id,
-                     "points": [[float(x), float(y)] for x, y in mark.corners_px]}],
+                     "points": [[float(x), float(y)] for x, y in mark.corners_px],
+                     "sigma_px": float(sigma_px)}],
         theta=theta,
         size_mm=SizeMM(width=width_mm, height=height_mm,
                        sigma_width=sigma_width, sigma_height=sigma_height),
@@ -808,6 +848,17 @@ def digitize_elements(marks: list[ElementMark], *, H, camera: CameraOnPlane,
     негодных меток — оператор поправляет разметку и запускает оцифровку заново
     (тем же принципом, каким `process()` целиком отказывает на негодном входе).
     """
+    ids = [mark.id if mark.id is not None else _element_id(mark.class_, index)
+           for index, mark in enumerate(marks)]
+    seen = set()
+    for element_id in ids:
+        if element_id in seen:
+            raise ValueError(
+                f"идентификатор элемента «{element_id}» повторяется: у двух разметок "
+                "одного снимка он обязан быть разным (явный id мог совпасть с "
+                "присвоенным по номеру)")
+        seen.add(element_id)
+
     focal_rel = FOCAL_ERROR_BY_CALIBRATION.get(calibration)
     if focal_rel is None:
         raise ValueError(

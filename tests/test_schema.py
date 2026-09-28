@@ -69,7 +69,7 @@ def test_element_theta_is_optional_but_validated_when_present():
 
 def test_schema_version_is_pinned():
     m = FacadeModel.model_validate(_minimal_payload())
-    assert m.schema_version == "1.1"
+    assert m.schema_version == "1.2"
 
 
 def test_roundtrip_preserves_values():
@@ -100,7 +100,7 @@ def test_serialised_json_uses_spec_field_name():
 
 def _minimal_payload() -> dict:
     return {
-        "schema_version": "1.1",
+        "schema_version": "1.2",
         "software_version": "facade-digitizer 0.1.0",
         "coverage": "partial",
         "mode": "auto",

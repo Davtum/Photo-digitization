@@ -1,9 +1,10 @@
-"""Выходной формат. Версия схемы 1.1 (спецификация, раздел 10)."""
+"""Выходной формат. Версия схемы 1.2 (спецификация, раздел 10; план 3, задача 6)."""
+import json
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-SCHEMA_VERSION = "1.1"
+SCHEMA_VERSION = "1.2"
 
 Point = tuple[float, float]
 
@@ -81,10 +82,19 @@ class ThetaDeg(Strict):
 
 
 class ScaleEstimate(Strict):
+    """Масштаб фасада и его происхождение (спецификация, п. 6.3).
+
+    `span_sigma_mm` (с версии 1.2) — погрешность САМОЙ измеренной длины опорной
+    базы (рулетка, дальномер), в мм. `null` — погрешность длины не передана, и в
+    `sigma_rel` входит только промах указания концов базы; до задачи 11 плана 3
+    так в каждом файле.
+    """
+
     source: Literal["operator_reference", "photogrammetry", "exif_range",
                     "assumed_floor_height"]
     sigma_rel: float
     meets_tolerance: bool
+    span_sigma_mm: float | None = None
 
 
 class QualityReport(Strict):
@@ -147,6 +157,18 @@ class FacadeRecord(Strict):
     valid_mask: str | None = None
 
 
+class OperatorLog(Strict):
+    """Трудозатраты оператора на элемент (спецификация, раздел 10). С версии 1.2.
+
+    `id` — непрозрачная метка оператора, назначаемая исследованием, а не имя
+    пользователя: она нужна для разбора эффекта обучения (п. 14), имя — нет.
+    """
+
+    id: str
+    edits: int = Field(ge=0)
+    seconds: float = Field(ge=0.0)
+
+
 class Element(Strict):
     """Элемент фасада. Спецификация, раздел 10.
 
@@ -169,6 +191,14 @@ class Element(Strict):
     `cladding_edge` этому полю незачем: их несёт `edge_type`, а `edge_reference`
     отвечает на другой вопрос — к чему отнесён `contour_mm` и вправе ли
     потребитель читать его метрически.
+
+    **Поля версии 1.2** (план 3, задача 6). `contour_px[].sigma_px` — точность
+    указания точек, с которой элемент посчитан, своя у каждого элемента: разные
+    проёмы размечаются при разном увеличении. `position_sigma_mm` и
+    `relative_position_sigma_mm` — σ абсолютного положения и положения
+    относительно соседей (п. 2.2 нормирует обе); `null`, пока погрешности не
+    сводятся в одном месте (`assemble`, п. 4.4, задача 21 плана 3). `operator` —
+    трудозатраты (задача 22); `null`, пока хронометража нет.
     """
 
     # serialize_by_alias — чтобы model_dump_json() без аргументов давал ключ "class",
@@ -195,10 +225,13 @@ class Element(Strict):
     recess: Recess | None = None
     confidence: float | None = None
     meets_tolerance: bool | None = None
+    position_sigma_mm: float | None = None
+    relative_position_sigma_mm: float | None = None
+    operator: OperatorLog | None = None
 
 
 class FacadeModel(Strict):
-    schema_version: Literal["1.1"] = SCHEMA_VERSION
+    schema_version: Literal["1.2"] = SCHEMA_VERSION
     software_version: str
     coverage: Literal["full", "partial"]
     mode: Literal["auto", "assisted"]
@@ -206,3 +239,23 @@ class FacadeModel(Strict):
     facade: FacadeRecord
     elements: list[Element]
     groups: list[dict] = Field(default_factory=list)
+
+
+def migrate_1_1_to_1_2(payload: dict) -> dict:
+    """Файл версии 1.1 → 1.2. Явная миграция, а не молчаливое чтение.
+
+    Все поля версии 1.2 необязательны и получают `null`: σ на точку разметки,
+    σ положения, трудозатраты и погрешность длины базы в файлах 1.1 не записаны, и
+    выдумать их нельзя. Исходный словарь не изменяется.
+
+    **Чего миграция не исправляет.** В файлах 1.1 поле `camera.dist` нулевое при
+    любом профиле калибровки (дефект, исправленный задачей 2 плана 3): по нему
+    нельзя узнать, снималась ли дисторсия. Миграция это поле не трогает — правды о
+    нём в файле 1.1 нет.
+    """
+    version = payload.get("schema_version")
+    if version != "1.1":
+        raise ValueError(f"мигрируется только версия 1.1, получена {version!r}")
+    migrated = json.loads(json.dumps(payload))
+    migrated["schema_version"] = "1.2"
+    return migrated

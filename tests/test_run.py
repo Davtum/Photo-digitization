@@ -134,11 +134,11 @@ def _numbers(node, out):
 
 
 def test_model_survives_round_trip_through_json(workdir):
-    """Схема валидна на обратном разборе, версия схемы — 1.1."""
+    """Схема валидна на обратном разборе, версия схемы — 1.2."""
     data = baseline(workdir)
     payload = data.model.model_dump_json()
     restored = FacadeModel.model_validate_json(payload)
-    assert restored.schema_version == "1.1"
+    assert restored.schema_version == "1.2"
     assert restored.mode == "assisted"
     assert restored.coverage == "partial"
     assert restored.elements == []
