@@ -755,15 +755,7 @@ def scale_stage(fs: FrameStage, operator_reference: OperatorReference, *,
     if not all(math.isfinite(v) for v in origin_rect):
         raise ValueError("начало отсчёта оператора лежит на линии схода плоскости")
 
-    if plane.vh is not None and plane.vv is not None:
-        camera, half_turn = camera_pose(plane.H, plane.vh, plane.vv, K,
-                                        mm_per_unit, origin_rect)
-    else:
-        # Ручная плоскость по отношению сторон или двум размерам (п. 4.2): точек
-        # схода нет, гомография — в единицах самого прямоугольника. Поза —
-        # разложением; ориентацию осей задал оператор порядком углов.
-        camera, half_turn = pose_from_homography(plane.H, K, mm_per_unit, origin_rect,
-                                                 half_turn=HALF_TURN_FROM_OPERATOR_ORDER)
+    camera, half_turn = _pose(plane, K, mm_per_unit, origin_rect)
 
     fields = _frame_fields(plane.H, camera, mm_per_unit, origin_rect, image_size,
                            quality_gate.THETA_MAX_DEG)
@@ -805,6 +797,59 @@ def scale_stage(fs: FrameStage, operator_reference: OperatorReference, *,
                       half_turn=half_turn, fields=fields, quality=report,
                       attainable_mm_per_px=tuple(attainable), sigma_rel=sigma_rel,
                       bounds_mm=bounds_mm, theta_cam_deg=theta_cam)
+
+
+def _pose(plane, K, mm_per_unit, origin_rect):
+    """Поза камеры для любой плоскости. Одно место выбора — для фазы масштаба и
+    для предпросмотра углов, чтобы выбор не разошёлся в двух местах."""
+    if plane.vh is not None and plane.vv is not None:
+        return camera_pose(plane.H, plane.vh, plane.vv, K, mm_per_unit, origin_rect)
+    # Ручная плоскость по отношению сторон или двум размерам (п. 4.2): точек схода
+    # нет, гомография — в единицах самого прямоугольника. Поза — разложением;
+    # ориентацию осей задал оператор порядком углов.
+    return pose_from_homography(plane.H, K, mm_per_unit, origin_rect,
+                                half_turn=HALF_TURN_FROM_OPERATOR_ORDER)
+
+
+@dataclass(frozen=True)
+class ThetaPreview:
+    """Поле углов визирования до опорной базы. План 3, задачи 9 и 12.
+
+    `theta_deg` и `usable_mask` — на сетке узлов кадра (`FIELD_SHAPE`), как у фазы
+    масштаба; просмотрщик растягивает маску на кадр.
+    """
+
+    theta_deg: np.ndarray
+    usable_mask: np.ndarray
+    usable_fraction: float
+    theta_p95: float
+    half_turn: object             # HalfTurnAmbiguity: от масштаба не зависит
+
+
+#: Условный масштаб предпросмотра: 1 мм на ректифицированную единицу, начало — нуль.
+#: Значение не важно по построению — см. `theta_preview`.
+_PREVIEW_MM_PER_UNIT = 1.0
+
+
+def theta_preview(fs: FrameStage) -> ThetaPreview:
+    """Углы визирования и пригодная зона θ ≤ 30° БЕЗ опорной базы.
+
+    Оператор должен видеть, где проём мерить можно, до разметки (п. 2.4), а база к
+    тому времени может быть не указана. Углы от масштаба и начала отсчёта не зависят:
+    равномерное растяжение сцены и сдвиг начала углов не меняют (проверено: θ_cam и
+    θ_p95 при длинах базы 20 000 и 15 000 мм совпадают до шестого знака). Поэтому
+    поле считается при условном масштабе тем же `_frame_fields`, что и в фазе
+    масштаба, и совпадает с ним (тест).
+    """
+    if fs.plane.needs_operator:
+        raise ValueError(SCALE_NEEDS_PLANE)
+    origin = (0.0, 0.0)
+    camera, half_turn = _pose(fs.plane, fs.frame.K, _PREVIEW_MM_PER_UNIT, origin)
+    fields = _frame_fields(fs.plane.H, camera, _PREVIEW_MM_PER_UNIT, origin,
+                           fs.image_size, quality_gate.THETA_MAX_DEG)
+    return ThetaPreview(theta_deg=fields.theta_deg, usable_mask=fields.usable_mask,
+                        usable_fraction=fields.usable,
+                        theta_p95=fields.theta_field_deg["p95"], half_turn=half_turn)
 
 
 def auto_raster_mm_per_px(fs: FrameStage, ss: ScaleStage) -> float:
