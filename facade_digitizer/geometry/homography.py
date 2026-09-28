@@ -1,4 +1,5 @@
 """Гомография приведения к плоскости фасада и восстановление позы камеры."""
+import math
 from dataclasses import dataclass
 from typing import NamedTuple
 
@@ -355,16 +356,110 @@ def homography_from_four_points(image_pts, aspect_ratio=None, size_mm=None,
     if assume_calibrated:
         if K is None or image_size is None:
             raise ValueError("для assume_calibrated нужны K и image_size")
-        src = np.asarray(image_pts, dtype=float)
-        l_top = np.cross(np.append(src[0], 1.0), np.append(src[1], 1.0))
-        l_bot = np.cross(np.append(src[3], 1.0), np.append(src[2], 1.0))
-        l_lft = np.cross(np.append(src[0], 1.0), np.append(src[3], 1.0))
-        l_rgt = np.cross(np.append(src[1], 1.0), np.append(src[2], 1.0))
-        vh = np.cross(l_top, l_bot)
-        vv = np.cross(l_lft, l_rgt)
+        vh, vv = quad_vanishing_points(image_pts)
         return homography_from_vanishing_points(vh, vv, K, image_size)
 
     w, h = size_mm if size_mm is not None else (float(aspect_ratio), 1.0)
     src = np.asarray(image_pts, dtype=np.float32)
     dst = np.array([[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]], dtype=np.float32)
     return cv2.getPerspectiveTransform(src, dst).astype(float)
+
+
+
+def quad_vanishing_points(image_pts):
+    """Точки схода противоположных сторон четырёхугольника (однородные).
+
+    Порядок углов — оператора: верхний левый, верхний правый, нижний правый, нижний
+    левый. `vh` — пересечение верхней и нижней сторон, `vv` — левой и правой.
+    """
+    src = np.asarray(image_pts, dtype=float)
+    l_top = np.cross(np.append(src[0], 1.0), np.append(src[1], 1.0))
+    l_bot = np.cross(np.append(src[3], 1.0), np.append(src[2], 1.0))
+    l_lft = np.cross(np.append(src[0], 1.0), np.append(src[3], 1.0))
+    l_rgt = np.cross(np.append(src[1], 1.0), np.append(src[2], 1.0))
+    return np.cross(l_top, l_bot), np.cross(l_lft, l_rgt)
+
+
+#: Ориентация осей, заданная оператором порядком углов. План 3, задача 5.
+#:
+#: Гомография по четырём точкам и известной форме прямоугольника отображает
+#: первую указанную точку в начало, а обход — в заданном порядке: оператор тем
+#: самым назвал, где у фасада верх. Двузначность поворота на полкруга, которую
+#: две точки схода разрешить не могут (`HALF_TURN_FROM_PLANE_VANISHING_POINTS`),
+#: здесь снята — ровно в той мере, в какой оператор не перепутал порядок.
+HALF_TURN_FROM_OPERATOR_ORDER = HalfTurnAmbiguity(
+    resolved=True,
+    assumption="верх фасада — там, где его указал оператор порядком углов: "
+               "верхний левый, верхний правый, нижний правый, нижний левый",
+    reason="ориентацию осей задал оператор; точки схода для этого не требовались",
+    resolver="порядок углов, указанный оператором",
+)
+
+
+def pose_from_homography(H, K, mm_per_rect_unit, origin_rect,
+                         half_turn: HalfTurnAmbiguity = HALF_TURN_FROM_PLANE_VANISHING_POINTS
+                         ) -> RecoveredPose:
+    """Поза камеры разложением гомографии при известной K. План 3, задача 5.
+
+    Обобщение `camera_pose`: та требует гомографии в соглашении «ректифицированная
+    единица равна расстоянию до плоскости» и точек схода, а ручная плоскость по
+    отношению сторон или двум размерам (п. 4.2) даёт гомографию в единицах самого
+    прямоугольника и точек схода не даёт. Разложение работает для любой
+    невырожденной H:
+
+        K⁻¹ H⁻¹ = λ [r1 r2 t],
+
+    где r1, r2 — оси плоскости в системе камеры, t — начало ректифицированных
+    координат. Знак λ выбирается так, чтобы плоскость лежала перед камерой (t_z > 0);
+    столбцы [r1 r2 r1×r2] приводятся к ближайшему повороту (SVD): при неточной K
+    они не ортонормированы, и это отклонение меряет `homography_axes_consistency`.
+    Центр камеры в системе плоскости — C = −Rᵀt; опорная точка — (C_u, C_v),
+    расстояние — |C_w|, оба в ректифицированных единицах, затем в миллиметрах.
+
+    На гомографии из точек схода результат совпадает с `camera_pose` (проверено
+    тестом): там H⁻¹ = K [d1 d2 n], λ = 1, и центр камеры лежит на единичном
+    расстоянии над началом координат — ровно то, что `camera_pose` утверждает.
+
+    Поза при этом опирается на K. Выпрямление по отношению сторон или двум размерам
+    от K не зависит — в этом смысл этих вариантов п. 4.2, — а поза зависит, и K из
+    таблицы моделей даёт её с той же ошибкой, что и автоматический путь.
+    """
+    Hm = np.asarray(H, dtype=float)
+    Km = np.asarray(K, dtype=float)
+    if not (np.all(np.isfinite(Hm)) and np.all(np.isfinite(Km))):
+        raise ValueError("поза не восстановима: гомография или K содержат нечисловые элементы")
+    A = np.linalg.inv(Km) @ np.linalg.inv(Hm)
+    a1, a2, a3 = A[:, 0], A[:, 1], A[:, 2]
+    n1, n2 = float(np.linalg.norm(a1)), float(np.linalg.norm(a2))
+    if not (n1 > 0 and n2 > 0):
+        raise ValueError("поза не восстановима: гомография вырождена")
+    lam = math.sqrt(n1 * n2)
+    if a3[2] / lam < 0:
+        lam = -lam
+    r1, r2, t = a1 / lam, a2 / lam, a3 / lam
+    U, _S, Vt = np.linalg.svd(np.column_stack([r1, r2, np.cross(r1, r2)]))
+    R = U @ Vt
+    if np.linalg.det(R) < 0:
+        U[:, -1] = -U[:, -1]
+        R = U @ Vt
+    C = -R.T @ t
+    foot_mm = rectified_to_facade_mm([(float(C[0]), float(C[1]))], origin_rect,
+                                     mm_per_rect_unit)[0]
+    camera = CameraOnPlane(cx=float(foot_mm[0]), cy=float(foot_mm[1]),
+                           cz=float(abs(C[2]) * mm_per_rect_unit))
+    return RecoveredPose(camera=camera, half_turn=half_turn)
+
+
+def homography_axes_consistency(H, K) -> tuple[float, float]:
+    """Насколько оси плоскости, вычитанные из H при этой K, ортонормированы.
+
+    Возвращает (угол между осями в градусах, отношение их длин). У верной K и
+    верной формы прямоугольника — (90°, 1). Отклонение говорит об ошибке K,
+    неверно заданном отношении сторон или промахе указания углов, но не о том,
+    какая из трёх причин действует.
+    """
+    A = np.linalg.inv(np.asarray(K, dtype=float)) @ np.linalg.inv(np.asarray(H, dtype=float))
+    a1, a2 = A[:, 0], A[:, 1]
+    cos = float(a1 @ a2 / (np.linalg.norm(a1) * np.linalg.norm(a2)))
+    return math.degrees(math.acos(max(-1.0, min(1.0, cos)))), float(
+        np.linalg.norm(a1) / np.linalg.norm(a2))

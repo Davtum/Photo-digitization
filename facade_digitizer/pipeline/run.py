@@ -42,8 +42,10 @@ import numpy as np
 from facade_digitizer.geometry.angles import FIELD_SHAPE, local_gsd_field, nearest_node
 from facade_digitizer.geometry.camera import CameraOnPlane
 from facade_digitizer.geometry.homography import (
+    HALF_TURN_FROM_OPERATOR_ORDER,
     apply_homography,
     camera_pose,
+    pose_from_homography,
     rectified_to_facade_mm,
 )
 from facade_digitizer.pipeline import quality as quality_gate
@@ -55,7 +57,11 @@ from facade_digitizer.pipeline.elements import (
 )
 from facade_digitizer.pipeline.frame import Frame, load_frame
 from facade_digitizer.pipeline.io import save_image
-from facade_digitizer.pipeline.plane import estimate_plane
+from facade_digitizer.pipeline.plane import (
+    ManualPlane,
+    estimate_plane,
+    estimate_plane_manual,
+)
 from facade_digitizer.pipeline.rectify import (
     RasterGeometry,
     Rectified,
@@ -666,21 +672,51 @@ class ScaleStage:
 
 
 def frame_stage(image_path, *, profile_path=None, with_color: bool = False,
-                operator_reference: OperatorReference | None = None) -> FrameStage:
+                operator_reference: OperatorReference | None = None,
+                plane_override: ManualPlane | None = None, roi=None) -> FrameStage:
     """Кадр, внутренние параметры, плоскость, резкость.
 
     `operator_reference`, если передан, проверяется на попадание в кадр ДО оценки
     плоскости: опечатка в координатах не должна стоить двух секунд расчёта, а
     `process()` проверяла её именно в этом месте.
+
+    `plane_override` — плоскость, заданная оператором (п. 4.2, план 3, задача 5):
+    точки схода тогда не оцениваются вовсе, и путь `needs_operator` получает выход.
+    `roi` — область кадра, по отрезкам которой оцениваются точки схода. Вместе они
+    не передаются: области оценки у ручной плоскости нет, и молча проигнорированный
+    аргумент выглядел бы применённым.
     """
     path = Path(image_path)
     frame = load_frame(path, profile_path, with_color=with_color)
     if operator_reference is not None:
         _points_in_frame(operator_reference, frame.size)
     camera_record = _camera_record(frame.meta, frame.K, frame.source, frame.dist)
-    plane = estimate_plane(frame.gray, frame.K)
+    if plane_override is not None:
+        if roi is not None:
+            raise ValueError("область оценки точек схода (roi) к ручной плоскости не "
+                             "применяется: точки схода при ней не оцениваются")
+        _manual_points_in_frame(plane_override.image_pts, frame.size)
+        plane = estimate_plane_manual(
+            plane_override.image_pts, aspect_ratio=plane_override.aspect_ratio,
+            size_mm=plane_override.size_mm,
+            assume_calibrated=plane_override.assume_calibrated,
+            K=frame.K, image_size=frame.size)
+    else:
+        plane = estimate_plane(frame.gray, frame.K, roi=roi)
     return FrameStage(path=path, frame=frame, camera_record=camera_record, plane=plane,
                       sharpness=float(quality_gate.sharpness(frame.gray)))
+
+
+def _manual_points_in_frame(points, image_size) -> None:
+    """Углы ручной плоскости — ровно четыре конечные точки в кадре `[0, w−1]×[0, h−1]`."""
+    pts = np.asarray(points, dtype=float)
+    if pts.shape != (4, 2) or not np.all(np.isfinite(pts)):
+        raise ValueError("ручная плоскость: нужны ровно четыре конечные точки (x, y)")
+    w, h = image_size
+    for i, (x, y) in enumerate(pts):
+        if not (0.0 <= x <= w - 1 and 0.0 <= y <= h - 1):
+            raise ValueError(f"ручная плоскость: угол {i + 1} ({x:.1f}, {y:.1f}) лежит "
+                             f"вне кадра {w}x{h}: оператор указывает точки на снимке")
 
 
 def scale_stage(fs: FrameStage, operator_reference: OperatorReference, *,
@@ -705,8 +741,15 @@ def scale_stage(fs: FrameStage, operator_reference: OperatorReference, *,
     if not all(math.isfinite(v) for v in origin_rect):
         raise ValueError("начало отсчёта оператора лежит на линии схода плоскости")
 
-    camera, half_turn = camera_pose(plane.H, plane.vh, plane.vv, K,
-                                    mm_per_unit, origin_rect)
+    if plane.vh is not None and plane.vv is not None:
+        camera, half_turn = camera_pose(plane.H, plane.vh, plane.vv, K,
+                                        mm_per_unit, origin_rect)
+    else:
+        # Ручная плоскость по отношению сторон или двум размерам (п. 4.2): точек
+        # схода нет, гомография — в единицах самого прямоугольника. Поза —
+        # разложением; ориентацию осей задал оператор порядком углов.
+        camera, half_turn = pose_from_homography(plane.H, K, mm_per_unit, origin_rect,
+                                                 half_turn=HALF_TURN_FROM_OPERATOR_ORDER)
 
     fields = _frame_fields(plane.H, camera, mm_per_unit, origin_rect, image_size,
                            quality_gate.THETA_MAX_DEG)
@@ -869,7 +912,8 @@ def process(image_path, *, operator_reference: OperatorReference,
             marks: list[ElementMark] | None = None,
             mark_sigma_px: float = DEFAULT_MARK_SIGMA_PX,
             wall_flatness_mm: float = WALL_FLATNESS_DEVIATION_MM,
-            save_rectified_to=None) -> FacadeModel:
+            save_rectified_to=None, plane_override: ManualPlane | None = None,
+            roi=None) -> FacadeModel:
     """Снимок -> модель фасада. Один проход геометрического ядра.
 
     `operator_reference` обязателен: без опорного размера расстояние до плоскости
@@ -924,7 +968,8 @@ def process(image_path, *, operator_reference: OperatorReference,
     """
     scale_source = _checked_scale_source(scale_source)
     fs = frame_stage(image_path, profile_path=profile_path,
-                     operator_reference=operator_reference)
+                     operator_reference=operator_reference,
+                     plane_override=plane_override, roi=roi)
     if fs.plane.needs_operator:
         if marks is not None:
             raise ValueError(
@@ -997,7 +1042,45 @@ def _parse_args(argv):
                              "снимку (спецификация, п. 6.5)")
     parser.add_argument("--out-dir", default=None,
                         help="каталог для выходных JSON; по умолчанию рядом со снимком")
-    return parser.parse_args(argv)
+    manual = parser.add_argument_group(
+        "ручная плоскость (спецификация, п. 4.2; план 3, задача 5)",
+        "Четыре угла заведомого прямоугольника в плоскости стены — верхний левый, "
+        "верхний правый, нижний правый, нижний левый, в пикселях кадра — и РОВНО одно "
+        "доопределение. Точки схода тогда не оцениваются.")
+    manual.add_argument("--manual-plane", type=float, nargs=8, default=None,
+                        metavar=("X1", "Y1", "X2", "Y2", "X3", "Y3", "X4", "Y4"))
+    manual.add_argument("--manual-aspect", type=float, default=None,
+                        help="отношение сторон прямоугольника, ширина / высота")
+    manual.add_argument("--manual-size-mm", type=float, nargs=2, default=None,
+                        metavar=("W", "H"), help="ширина и высота прямоугольника, мм")
+    manual.add_argument("--manual-calibrated", action="store_true",
+                        help="камера откалибрована, стороны прямоугольника ортогональны")
+    parser.add_argument("--roi", type=float, nargs="+", default=None,
+                        help="область кадра для оценки точек схода: x1 y1 x2 y2 x3 y3 ... "
+                             "(не менее трёх точек) — для снимка угла здания")
+    args = parser.parse_args(argv)
+    constraints = (args.manual_aspect is not None, args.manual_size_mm is not None,
+                   args.manual_calibrated)
+    if args.manual_plane is None and any(constraints):
+        parser.error("доопределение ручной плоскости задано без --manual-plane")
+    if args.manual_plane is not None and sum(constraints) != 1:
+        parser.error("к --manual-plane нужно РОВНО одно из: --manual-aspect, "
+                     "--manual-size-mm, --manual-calibrated")
+    if args.roi is not None and (len(args.roi) < 6 or len(args.roi) % 2):
+        parser.error("--roi: чётное число координат, не менее трёх точек")
+    if args.roi is not None and args.manual_plane is not None:
+        parser.error("--roi к ручной плоскости не применяется: точки схода при ней не "
+                     "оцениваются")
+    return args
+
+
+def _manual_plane_from_args(args) -> ManualPlane | None:
+    if args.manual_plane is None:
+        return None
+    pts = np.asarray(args.manual_plane, dtype=float).reshape(4, 2)
+    return ManualPlane(image_pts=pts, aspect_ratio=args.manual_aspect,
+                       size_mm=tuple(args.manual_size_mm) if args.manual_size_mm else None,
+                       assume_calibrated=bool(args.manual_calibrated))
 
 
 def main(argv=None) -> int:
@@ -1052,7 +1135,10 @@ def main(argv=None) -> int:
                             marks=marks,
                             mark_sigma_px=args.mark_sigma_px,
                             wall_flatness_mm=args.wall_flatness_mm,
-                            save_rectified_to=save_rectified_to)
+                            save_rectified_to=save_rectified_to,
+                            plane_override=_manual_plane_from_args(args),
+                            roi=(np.asarray(args.roi, dtype=float).reshape(-1, 2)
+                                 if args.roi is not None else None))
         # Отказ по снимку — свойство этого снимка либо переданных для него
         # аргументов; он называется по имени файла и не прекращает пакет.
         except (ValueError, FileNotFoundError) as error:

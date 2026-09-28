@@ -25,6 +25,7 @@ import numpy as np
 from facade_digitizer.geometry.homography import (
     homography_from_four_points,
     homography_from_vanishing_points,
+    quad_vanishing_points,
 )
 from facade_digitizer.geometry.vanishing import (
     CONFIDENCE_THRESHOLD,
@@ -101,7 +102,8 @@ class PlaneResult:
     vv: np.ndarray | None = None
 
 
-def estimate_plane(image, K, min_confidence: float = CONFIDENCE_THRESHOLD) -> PlaneResult:
+def estimate_plane(image, K, min_confidence: float = CONFIDENCE_THRESHOLD, *,
+                   roi=None) -> PlaneResult:
     """Плоскость фасада по точкам схода, с отказом вместо догадки.
 
     Порог `min_confidence` решает, а не украшает: при доверии ниже порога гомография
@@ -115,8 +117,17 @@ def estimate_plane(image, K, min_confidence: float = CONFIDENCE_THRESHOLD) -> Pl
     центр кадра за линией схода) намеренно НЕ превращаются в `needs_operator`: это
     отказ с названной причиной, а не низкое доверие, и заглушить его признаком
     доверия значило бы выдать геометрическое вырождение за нехватку измерений.
+
+    `roi` — многоугольник в пикселях кадра (план 3, задача 5): точки схода
+    оцениваются только по отрезкам, оба конца которых лежат внутри. Нужен для
+    снимка угла здания, где второй фасад даёт свои точки схода, и оценка по всему
+    кадру уверенно выбирает не ту плоскость. Отрезки вне области отбрасываются ДО
+    оценки, поэтому поддержка, покрытие и доверие считаются по тому, что осталось:
+    пустая область даёт `needs_operator`, а не догадку.
     """
     segments = detect_segments(image)          # он же проверяет вид изображения
+    if roi is not None:
+        segments = _segments_inside(segments, roi)
     image_size = (image.shape[1], image.shape[0])
 
     vh, vv, confidence = estimate_vanishing_points(segments, image_size, K)
@@ -128,6 +139,40 @@ def estimate_plane(image, K, min_confidence: float = CONFIDENCE_THRESHOLD) -> Pl
     H = homography_from_vanishing_points(vh.point, vv.point, K, image_size)
     return PlaneResult(H=H, confidence=confidence, method=METHOD_VANISHING_POINTS,
                        needs_operator=False, vh=vh.point, vv=vv.point)
+
+
+def _segments_inside(segments: np.ndarray, roi) -> np.ndarray:
+    """Отрезки, оба конца которых лежат в многоугольнике `roi` (включая границу)."""
+    import cv2
+
+    poly = np.asarray(roi, dtype=np.float32).reshape(-1, 1, 2)
+    if poly.shape[0] < 3 or not np.all(np.isfinite(poly)):
+        raise ValueError("область оценки плоскости (roi) — не менее трёх конечных точек")
+    segs = np.asarray(segments, dtype=float).reshape(-1, 4)
+
+    def inside(x, y):
+        return cv2.pointPolygonTest(poly, (float(x), float(y)), False) >= 0
+
+    keep = [i for i, (x1, y1, x2, y2) in enumerate(segs) if inside(x1, y1) and inside(x2, y2)]
+    return segs[keep]
+
+
+@dataclass(frozen=True)
+class ManualPlane:
+    """Плоскость, заданная оператором (спецификация, п. 4.2). План 3, задача 5.
+
+    Четыре угла заведомого прямоугольника в плоскости стены — в порядке верхний
+    левый, верхний правый, нижний правый, нижний левый, в пикселях кадра — и ровно
+    одно доопределение: отношение сторон (ширина / высота), два размера в мм
+    (ширина, высота) либо подтверждение, что камера откалибрована и стороны
+    ортогональны. Подставлять доопределение по умолчанию запрещено: оператор, не
+    задавший размер, получил бы выдуманный вместо вопроса.
+    """
+
+    image_pts: object
+    aspect_ratio: float | None = None
+    size_mm: tuple | None = None
+    assume_calibrated: bool = False
 
 
 def estimate_plane_manual(image_pts, aspect_ratio=None, size_mm=None,
@@ -148,5 +193,14 @@ def estimate_plane_manual(image_pts, aspect_ratio=None, size_mm=None,
                                     size_mm=size_mm,
                                     assume_calibrated=assume_calibrated,
                                     K=K, image_size=image_size)
+    # При подтверждённой калибровке гомография построена по точкам схода сторон —
+    # они и возвращаются: без них `camera_pose` отказывает (план 3, задача 5;
+    # прежде ручной путь их терял, и поза по нему не восстанавливалась никак). При
+    # отношении сторон и двух размерах точек схода нет: гомография в единицах
+    # самого прямоугольника, и поза берётся разложением (`pose_from_homography`).
+    vh = vv = None
+    if assume_calibrated:
+        vh, vv = quad_vanishing_points(image_pts)
     return PlaneResult(H=H, confidence=_manual_confidence(),
-                       method=METHOD_MANUAL_FOUR_POINT, needs_operator=False)
+                       method=METHOD_MANUAL_FOUR_POINT, needs_operator=False,
+                       vh=vh, vv=vv)
