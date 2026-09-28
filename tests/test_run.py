@@ -408,7 +408,14 @@ def test_camera_record_rejects_a_non_finite_k(workdir):
     _, meta = load_image(baseline(workdir).path)
     bad_K = np.array([[3600.0, 0.0, 2640.0], [0.0, float("nan"), 1978.0], [0.0, 0.0, 1.0]])
     with pytest.raises(ValueError, match=r"camera\.K\[1\]\[1\]"):
-        _camera_record(meta, bad_K, "database")
+        _camera_record(meta, bad_K, "database", [0.0] * 5)
+
+
+def test_camera_record_rejects_a_non_finite_distortion(workdir):
+    """Коэффициенты дисторсии теперь попадают в выход и проверяются так же, как K."""
+    _, meta = load_image(baseline(workdir).path)
+    with pytest.raises(ValueError, match=r"camera\.dist\[2\]"):
+        _camera_record(meta, K, "target", [0.0, 0.0, float("inf"), 0.0, 0.0])
 
 
 def test_unreachable_raster_scale_is_rejected_by_naming_the_range(workdir):
@@ -826,6 +833,41 @@ def test_field_grid_covers_the_frame_with_both_ends_included():
     gx, gy = _field_grid((5, 3), (3, 2))
     assert gx.tolist() == [[0.0, 4.0], [0.0, 4.0], [0.0, 4.0]]
     assert gy.tolist() == [[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]]
+
+
+def test_output_carries_the_profile_distortion(workdir, tmp_path):
+    """`camera.dist` в выходе — коэффициенты, которые конвейер действительно снял.
+
+    Прежде `_camera_record` писал `[0.0]*5` при любом профиле: файл утверждал, что
+    дисторсии не было, тогда как координаты в нём уже лежат в исправленном кадре, и
+    обратная связь с исходным снимком (спецификация, п. 7) была разорвана.
+    """
+    data = baseline(workdir)
+    dist = [-0.01, 0.002, 0.0, 0.0, 0.0]
+    profile_path = tmp_path / "profile.json"
+    save_profile(CalibrationProfile(model="unknown", K=K.tolist(), dist=dist,
+                                    rms_px=0.3, image_size=SIZE), profile_path)
+    model = process(data.path, operator_reference=data.reference,
+                    raster_mm_per_px=RASTER_MM_PER_PX, profile_path=profile_path)
+    camera = model.images[0].camera
+    assert camera.calibration == "target"
+    assert camera.dist == pytest.approx(dist)
+
+
+def test_output_without_profile_declares_zero_distortion(workdir):
+    """Без профиля дисторсия не снимается, и выход говорит ровно это — нули."""
+    data = baseline(workdir)
+    camera = data.model.images[0].camera
+    assert camera.calibration != "target"
+    assert camera.dist == [0.0] * 5
+
+
+def test_missing_profile_file_is_refused_by_process(workdir, tmp_path):
+    data = baseline(workdir)
+    with pytest.raises(FileNotFoundError, match="missing_profile"):
+        process(data.path, operator_reference=data.reference,
+                raster_mm_per_px=RASTER_MM_PER_PX,
+                profile_path=tmp_path / "missing_profile.json")
 
 
 def test_incompatible_profile_is_rejected_per_file_and_the_batch_goes_on(workdir, tmp_path, capsys):

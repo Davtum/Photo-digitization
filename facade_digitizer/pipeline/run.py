@@ -478,7 +478,7 @@ def _theta_at(H, camera, mm_per_unit, origin_rect, point_px) -> float:
                                                      float(facade_mm[1])))
 
 
-def _camera_record(meta, K, source) -> CameraIntrinsics:
+def _camera_record(meta, K, source, dist) -> CameraIntrinsics:
     """Внутренние параметры с происхождением. Источник обязан дойти до выхода.
 
     `K` проверяется поэлементно на конечность, как и практически все прочие числа
@@ -486,6 +486,11 @@ def _camera_record(meta, K, source) -> CameraIntrinsics:
     `camera_pose`, где нечисловой элемент упал бы раньше и без этой проверки —
     но это страховка по совпадению, а не по контракту: K читается из EXIF или из
     файла профиля калибровки, и обе цепочки не гарантируют конечность на входе сюда.
+
+    `dist` — коэффициенты, которые конвейер ДЕЙСТВИТЕЛЬНО снял со снимка (`undistort`
+    в `process`), а не константа. Прежде здесь стояло `[0.0]*5` при любом профиле:
+    файл утверждал, что дисторсии не было, тогда как координаты в нём уже лежат в
+    исправленном кадре, и обратная связь с исходным снимком (п. 7) была разорвана.
     """
     calibration = _CALIBRATION_BY_SOURCE.get(source)
     if calibration is None:
@@ -494,11 +499,12 @@ def _camera_record(meta, K, source) -> CameraIntrinsics:
         calibration = "exif"
     K_checked = [[_finite(f"camera.K[{row}][{col}]", v) for col, v in enumerate(values)]
                 for row, values in enumerate(K)]
+    dist_checked = [_finite(f"camera.dist[{i}]", v) for i, v in enumerate(dist)]
     return CameraIntrinsics(model=meta.model, K=K_checked,
-                            dist=[0.0] * 5, calibration=calibration)
+                            dist=dist_checked, calibration=calibration)
 
 
-def _needs_operator_model(path, image_id, meta, K, source, plane, reference, image,
+def _needs_operator_model(path, image_id, meta, K, dist, source, plane, reference, image,
                           raster_mm_per_px, scale_source) -> FacadeModel:
     """Модель отказа: плоскость не восстановлена, управление у оператора.
 
@@ -542,7 +548,7 @@ def _needs_operator_model(path, image_id, meta, K, source, plane, reference, ima
     record = ImageRecord(
         id=image_id,
         path=str(path),
-        camera=_camera_record(meta, K, source),
+        camera=_camera_record(meta, K, source, dist),
         captured_at=meta.captured_at,
         gnss=meta.gnss,
         pose_to_facade=None,
@@ -652,7 +658,7 @@ def process(image_path, *, operator_reference: OperatorReference,
     image_size = (image.shape[1], image.shape[0])
     _points_in_frame(operator_reference, image_size)
 
-    camera_record = _camera_record(meta, K, source)
+    camera_record = _camera_record(meta, K, source, dist)
 
     plane = estimate_plane(image, K)
     if plane.needs_operator:
@@ -665,7 +671,7 @@ def process(image_path, *, operator_reference: OperatorReference,
             raise ValueError(
                 "растр нечего сохранять: плоскость фасада не восстановлена "
                 "(needs_operator), ректификация не выполнялась")
-        return _needs_operator_model(path, image_id, meta, K, source, plane,
+        return _needs_operator_model(path, image_id, meta, K, dist, source, plane,
                                      operator_reference, image, raster_mm_per_px,
                                      scale_source)
 

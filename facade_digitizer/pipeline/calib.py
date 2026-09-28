@@ -62,6 +62,18 @@ def calibrate_from_chessboard(
     image_size: tuple[int, int],
     model: str,
 ) -> CalibrationProfile:
+    """Калибровка по снимкам шахматной мишени; см. `calibrate_views`."""
+    profile, _accepted = calibrate_views(images, pattern, square_mm, image_size, model)
+    return profile
+
+
+def calibrate_views(
+    images: list[np.ndarray],
+    pattern: tuple[int, int],
+    square_mm: float,
+    image_size: tuple[int, int],
+    model: str,
+) -> tuple[CalibrationProfile, int]:
     """Калибровка по снимкам шахматной мишени. Выполняется один раз на аппарат.
 
     Ошибка фокусного расстояния при наклоне искажает отношение сторон как ε·sin²θ:
@@ -71,6 +83,10 @@ def calibrate_from_chessboard(
     Число поданных снимков проверяется до всякой обработки: меньше
     MIN_CALIBRATION_VIEWS видов — отказ с отдельным сообщением, не смешиваемым
     с сообщением о нераспознанной мишени.
+
+    Возвращает профиль и число видов, на которых мишень распознана: команда
+    `facade-calibrate` печатает его, потому что профиль по пяти видам из двадцати
+    — не то же, что по двадцати, а сам профиль числа видов не хранит.
     """
     if len(images) < MIN_CALIBRATION_VIEWS:
         raise ValueError("для устойчивой калибровки нужно не менее 5 снимков мишени")
@@ -95,8 +111,9 @@ def calibrate_from_chessboard(
         raise ValueError(f"мишень распознана лишь на {len(obj_points)} снимках из {len(images)}")
 
     rms, K, dist, _, _ = cv2.calibrateCamera(obj_points, img_points, image_size, None, None)
-    return CalibrationProfile(model=model, K=K.tolist(), dist=dist.ravel().tolist(),
-                              rms_px=float(rms), image_size=image_size)
+    profile = CalibrationProfile(model=model, K=K.tolist(), dist=dist.ravel().tolist(),
+                                 rms_px=float(rms), image_size=tuple(image_size))
+    return profile, len(obj_points)
 
 
 def _normalized_model(model) -> str:
@@ -121,10 +138,21 @@ def intrinsics_from_meta(meta: CameraMeta, profile_path=None) -> tuple[np.ndarra
     означает чужой файл, то есть систематически неверные внутренние параметры без
     единого признака неисправности. Кому нужен запасной источник — тот просто не
     передаёт profile_path.
+
+    По той же причине переданный, но ОТСУТСТВУЮЩИЙ файл — отказ, а не переход к
+    EXIF. Прежде здесь стояла проверка `Path(profile_path).exists()`, и
+    переименованный или удалённый профиль молча превращал калибровку в `"exif"` или
+    `"database"` — то есть делал ровно то, что предыдущий абзац запрещает для
+    чужого файла (план 3, задача 2).
     """
     w, h = meta.image_size
 
-    if profile_path is not None and Path(profile_path).exists():
+    if profile_path is not None:
+        if not Path(profile_path).is_file():
+            raise FileNotFoundError(
+                f"профиль калибровки не найден: {profile_path}. Профиль передан явно, "
+                "и продолжить без него значило бы молча сменить происхождение "
+                "внутренних параметров; чтобы работать без профиля, не передавайте его")
         prof = load_profile(profile_path)
         if _normalized_model(prof.model) != _normalized_model(meta.model):
             raise ValueError(
