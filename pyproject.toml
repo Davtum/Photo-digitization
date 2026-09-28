@@ -12,6 +12,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "ruff>=0.4"]
+ui = ["PySide6>=6.6"]
 
 [build-system]
 requires = ["setuptools>=69"]
@@ -22,9 +23,11 @@ include = ["facade_digitizer*"]
 
 [project.scripts]
 facade-digitize = "facade_digitizer.pipeline.run:main"
+facade-digitize-ui = "facade_digitizer.ui.__main__:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-p pytester"
 
 [tool.ruff]
 line-length = 100
