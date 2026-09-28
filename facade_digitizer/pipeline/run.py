@@ -40,6 +40,7 @@ from pathlib import Path
 import numpy as np
 
 from facade_digitizer.geometry.angles import FIELD_SHAPE, local_gsd_field, nearest_node
+from facade_digitizer.geometry.camera import CameraOnPlane
 from facade_digitizer.geometry.homography import (
     apply_homography,
     camera_pose,
@@ -52,10 +53,16 @@ from facade_digitizer.pipeline.elements import (
     digitize_elements,
     load_marks,
 )
-from facade_digitizer.pipeline.frame import load_frame
+from facade_digitizer.pipeline.frame import Frame, load_frame
 from facade_digitizer.pipeline.io import save_image
 from facade_digitizer.pipeline.plane import estimate_plane
-from facade_digitizer.pipeline.rectify import attainable_mm_per_px, rectify
+from facade_digitizer.pipeline.rectify import (
+    RasterGeometry,
+    Rectified,
+    attainable_mm_per_px,
+    raster_geometry,
+    warp,
+)
 from facade_digitizer.schema import (
     CameraIntrinsics,
     FacadeModel,
@@ -504,7 +511,8 @@ def _camera_record(meta, K, source, dist) -> CameraIntrinsics:
                             dist=dist_checked, calibration=calibration)
 
 
-def _needs_operator_model(path, image_id, meta, K, dist, source, plane, reference, image,
+def _needs_operator_model(path, image_id, meta, K, dist, source, plane, reference,
+                          sharpness_raw,
                           raster_mm_per_px, scale_source) -> FacadeModel:
     """Модель отказа: плоскость не восстановлена, управление у оператора.
 
@@ -537,7 +545,9 @@ def _needs_operator_model(path, image_id, meta, K, dist, source, plane, referenc
     reasons.append("угол визирования не измерен: поза требует плоскости; записано "
                    "предельное значение 90°")
 
-    sharpness = _finite("quality.sharpness", quality_gate.sharpness(image))
+    # Резкость посчитана фазой кадра (план 3, задача 4): от опорной базы она не
+    # зависит, и считать её второй раз — до 0.7 с на снимке 20 Мп без пользы.
+    sharpness = _finite("quality.sharpness", sharpness_raw)
     if sharpness < quality_gate.DEFAULT.sharpness_min:
         reasons.append(f"недостаточная резкость: {sharpness:.2e} < "
                        f"{quality_gate.DEFAULT.sharpness_min:.2e}")
@@ -586,6 +596,269 @@ def _needs_operator_model(path, image_id, meta, K, dist, source, plane, referenc
             plane_residual_mm=None,
         ),
         elements=[],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Фазы конвейера. План 3, задача 4.
+#
+# Граница проведена по ЗАВИСИМОСТЯМ, а не по шагам алгоритма. Замер на снимке
+# 20.9 Мп: оценка плоскости 1.7-4.1 с и резкость 0.3-0.7 с от опорной базы не
+# зависят; поза, поля разрешения и углов и вердикт — 6-44 мс, зависят; пиксели
+# растра — 34-48 мс при 10 мм/px и до 4 с при наибольшем разрешении; разметка —
+# около 0.5 мс на элемент. Прежде всё это было одним проходом `process()`, и
+# интерфейс оператора пересчитывал бы оценку плоскости при каждом вводе длины
+# опорной базы и растр — при каждом сдвиге угла проёма.
+#
+# `process()` осталась фасадом над фазами с прежними подписью и поведением;
+# совпадение её выхода с выходом до распила проверено побайтно на пяти сценариях.
+# ---------------------------------------------------------------------------
+
+#: Отказ фазы масштаба на кадре без восстановленной плоскости. Путь `process()`
+#: на таком кадре выдаёт модель отказа (`_needs_operator_model`), а фаза масштаба
+#: отказывает по имени: считать масштаб без гомографии не на чем. Ручное задание
+#: плоскости (п. 4.2) — план 3, задача 5.
+SCALE_NEEDS_PLANE = (
+    "масштаб не вычисляется: плоскость фасада не восстановлена (needs_operator), "
+    "гомографии нет; нужна плоскость, заданная оператором (спецификация, п. 4.2)")
+
+
+@dataclass(frozen=True)
+class FrameStage:
+    """Фаза кадра: всё, что от опорной базы НЕ зависит. Секунды; в фоне.
+
+    `sharpness` хранится сырой, без проверки конечности: проверяют её потребители —
+    `quality.assess` и модель отказа, — каждый со своей прежней формулировкой.
+    """
+
+    path: Path
+    frame: Frame
+    camera_record: CameraIntrinsics
+    plane: object                 # PlaneResult: H, vh, vv, confidence, needs_operator, method
+    sharpness: float
+
+    @property
+    def image_size(self) -> tuple[int, int]:
+        return self.frame.size
+
+
+@dataclass(frozen=True)
+class ScaleStage:
+    """Фаза масштаба: всё, что зависит от опорной базы. Миллисекунды.
+
+    Вердикт `quality` здесь — окончательный и единственный экземпляр: от длины базы
+    он зависит (разрешение считается от `mm_per_unit`), поэтому живёт в этой фазе,
+    а не в фазе кадра.
+    """
+
+    reference: OperatorReference
+    scale_source: str
+    mm_per_unit: float
+    origin_rect: tuple
+    camera: CameraOnPlane
+    half_turn: object
+    fields: object                # _FrameFields
+    quality: QualityReport
+    attainable_mm_per_px: tuple
+    sigma_rel: float
+    bounds_mm: list
+    theta_cam_deg: float
+
+
+def frame_stage(image_path, *, profile_path=None, with_color: bool = False,
+                operator_reference: OperatorReference | None = None) -> FrameStage:
+    """Кадр, внутренние параметры, плоскость, резкость.
+
+    `operator_reference`, если передан, проверяется на попадание в кадр ДО оценки
+    плоскости: опечатка в координатах не должна стоить двух секунд расчёта, а
+    `process()` проверяла её именно в этом месте.
+    """
+    path = Path(image_path)
+    frame = load_frame(path, profile_path, with_color=with_color)
+    if operator_reference is not None:
+        _points_in_frame(operator_reference, frame.size)
+    camera_record = _camera_record(frame.meta, frame.K, frame.source, frame.dist)
+    plane = estimate_plane(frame.gray, frame.K)
+    return FrameStage(path=path, frame=frame, camera_record=camera_record, plane=plane,
+                      sharpness=float(quality_gate.sharpness(frame.gray)))
+
+
+def scale_stage(fs: FrameStage, operator_reference: OperatorReference, *,
+                scale_source: str = "operator_reference") -> ScaleStage:
+    """Масштаб, поза, поля разрешения и углов, окончательный вердикт, σ масштаба."""
+    scale_source = _checked_scale_source(scale_source)
+    image = fs.frame.gray
+    image_size = fs.image_size
+    _points_in_frame(operator_reference, image_size)
+    plane = fs.plane
+    if plane.needs_operator:
+        raise ValueError(SCALE_NEEDS_PLANE)
+    K = fs.frame.K
+
+    span_rect = _apply(plane.H, np.asarray(operator_reference.span_px, dtype=float))
+    span_units = float(np.linalg.norm(span_rect[1] - span_rect[0]))
+    if not math.isfinite(span_units) or span_units <= 0:
+        raise ValueError("опорная база оператора вырождена в ректифицированных "
+                         f"координатах: длина {span_units}")
+    mm_per_unit = _finite("mm_per_unit", operator_reference.span_mm / span_units)
+    origin_rect = tuple(_apply(plane.H, [operator_reference.origin_px])[0])
+    if not all(math.isfinite(v) for v in origin_rect):
+        raise ValueError("начало отсчёта оператора лежит на линии схода плоскости")
+
+    camera, half_turn = camera_pose(plane.H, plane.vh, plane.vv, K,
+                                    mm_per_unit, origin_rect)
+
+    fields = _frame_fields(plane.H, camera, mm_per_unit, origin_rect, image_size,
+                           quality_gate.THETA_MAX_DEG)
+
+    report = quality_gate.assess(image, fields.gsd_min, fields.gsd_max,
+                                 fields.theta_field_deg["p95"], fields.usable,
+                                 sharpness_value=fs.sharpness)
+    # Доля кадра за линией схода — причина деградации, а не повод молча усреднить.
+    if fields.behind_vanishing_line > 1.0 - quality_gate.DEFAULT.usable_min_fraction:
+        report = report.model_copy(update={
+            "verdict": "degraded" if report.verdict == "ok" else report.verdict,
+            "reasons": [*report.reasons,
+                        (f"за линией схода оказалось {fields.behind_vanishing_line:.0%} "
+                         "кадра: эта часть на плоскость фасада не смотрит")],
+        })
+
+    attainable = attainable_mm_per_px(image, plane.H, mm_per_unit)
+
+    if scale_source == "operator_reference":
+        gsd_at_reference = math.sqrt(sum(
+            _finite("gsd_at_reference", _gsd_at(fields.gsd, image_size, point)) ** 2
+            for point in operator_reference.span_px) / 2.0)
+        sigma_rel = _scale_sigma_rel(operator_reference.span_mm,
+                                     operator_reference.sigma_px, gsd_at_reference)
+    else:
+        sigma_rel = SIGMA_REL_ASSUMED_FLOOR_HEIGHT
+
+    h_px, w_px = image.shape[:2]
+    corners_mm = rectified_to_facade_mm(
+        _apply(plane.H, [[0, 0], [w_px, 0], [w_px, h_px], [0, h_px]]),
+        origin_rect, mm_per_unit)
+    bounds_mm = [_finite("facade.bounds_mm", v) for v in
+                 (corners_mm[:, 0].min(), corners_mm[:, 1].min(),
+                  corners_mm[:, 0].max(), corners_mm[:, 1].max())]
+
+    theta_cam = _theta_at(plane.H, camera, mm_per_unit, origin_rect,
+                          (float(K[0, 2]), float(K[1, 2])))
+    return ScaleStage(reference=operator_reference, scale_source=scale_source,
+                      mm_per_unit=mm_per_unit, origin_rect=origin_rect, camera=camera,
+                      half_turn=half_turn, fields=fields, quality=report,
+                      attainable_mm_per_px=tuple(attainable), sigma_rel=sigma_rel,
+                      bounds_mm=bounds_mm, theta_cam_deg=theta_cam)
+
+
+def auto_raster_mm_per_px(fs: FrameStage, ss: ScaleStage) -> float:
+    """Разрешение растра, при котором в нём примерно столько пикселей, сколько в кадре.
+
+    `raster_mm_per_px` у CLI обязателен и ограничен `attainable_mm_per_px`, а
+    интерфейсу оператора его взять неоткуда. Площадь растра обратна квадрату
+    разрешения, поэтому оно подбирается по площади образа кадра на фасаде и
+    зажимается в достижимые границы: растр не бывает ни больше `MAX_SIDE_PX`, ни
+    меньше пикселя.
+    """
+    lo, hi = ss.attainable_mm_per_px
+    x0, y0, x1, y1 = ss.bounds_mm
+    area_mm2 = abs((x1 - x0) * (y1 - y0))
+    w, h = fs.image_size
+    guess = math.sqrt(area_mm2 / float(w * h)) if area_mm2 > 0 else hi
+    return float(min(max(guess, lo), hi))
+
+
+def raster_geometry_for(fs: FrameStage, ss: ScaleStage,
+                        mm_per_px: float | None = None) -> RasterGeometry:
+    """Геометрия растра (дёшево). `None` — разрешение подбирается автоматически."""
+    if mm_per_px is None:
+        mm_per_px = auto_raster_mm_per_px(fs, ss)
+    return raster_geometry(fs.frame.gray, fs.plane.H, ss.mm_per_unit, mm_per_px,
+                           origin_rect_units=ss.origin_rect)
+
+
+def raster_stage(fs: FrameStage, geometry: RasterGeometry, *,
+                 color: bool = False) -> Rectified:
+    """Пиксели растра по готовой геометрии — той же, что уйдёт в выходной файл."""
+    source = fs.frame.color if color else fs.frame.gray
+    if source is None:
+        raise ValueError("цветной кадр не загружен: frame_stage(..., with_color=True)")
+    return warp(source, geometry)
+
+
+def elements_stage(fs: FrameStage, ss: ScaleStage, geometry: RasterGeometry,
+                   marks: list[ElementMark] | None = None, *, image_id: str = "img_0",
+                   mark_sigma_px: float = DEFAULT_MARK_SIGMA_PX,
+                   wall_flatness_mm: float = WALL_FLATNESS_DEVIATION_MM) -> FacadeModel:
+    """Разметка → модель фасада. Не вызывает ни оценки плоскости, ни растра."""
+    plane, camera = fs.plane, ss.camera
+    report = ss.quality
+    elements = []
+    if marks is not None:
+        elements = digitize_elements(
+            marks, H=plane.H, camera=camera, mm_per_unit=ss.mm_per_unit,
+            origin_rect=ss.origin_rect, image_size=fs.image_size, gsd_field=ss.fields.gsd,
+            sigma_px=mark_sigma_px, sigma_rel=ss.sigma_rel,
+            residual_px=_finite_or_none(plane.confidence.residual_px),
+            calibration=fs.camera_record.calibration, image_id=image_id,
+            wall_flatness_mm=wall_flatness_mm)
+
+    # Шлюз качества ветвится на собственный вердикт. Обоснование выбора из трёх
+    # возможных ветвлений — в `GATE_REJECT_WITHHOLDS_TOLERANCE`. Причина
+    # дописывается в тот же `quality.reasons` только вместе с самим действием:
+    # без элементов утверждать о них нечего.
+    if report.verdict == "reject" and elements:
+        elements = [element.model_copy(update={"meets_tolerance": None})
+                    for element in elements]
+        report = report.model_copy(update={
+            "reasons": [*report.reasons, GATE_REJECT_WITHHOLDS_TOLERANCE]})
+
+    meta, half_turn = fs.frame.meta, ss.half_turn
+    record = ImageRecord(
+        id=image_id,
+        path=str(fs.path),
+        camera=fs.camera_record,
+        captured_at=meta.captured_at,
+        gnss=meta.gnss,
+        pose_to_facade={
+            "cx": _finite("pose_to_facade.cx", camera.cx),
+            "cy": _finite("pose_to_facade.cy", camera.cy),
+            "cz": _finite("pose_to_facade.cz", camera.cz),
+            "units": "mm",
+            "half_turn": {"resolved": bool(half_turn.resolved),
+                          "assumption": half_turn.assumption,
+                          "reason": half_turn.reason,
+                          "resolver": half_turn.resolver},
+        },
+        theta_cam_deg=ss.theta_cam_deg,
+        theta_field_deg=ss.fields.theta_field_deg,
+        quality=report,
+        rectification=Rectification(
+            method=plane.method,
+            confidence=_finite("rectification.confidence", plane.confidence.value),
+            residual_px=_finite_or_none(plane.confidence.residual_px),
+            needs_operator=False),
+        homography={"from": "image_px", "to": "rectified_px",
+                    "H": [[_finite("homography.H", v) for v in row]
+                          for row in geometry.H],
+                    "origin_rect_px": [_finite("homography.origin_rect_px", v)
+                                       for v in geometry.origin_rect_px],
+                    "attainable_mm_per_px": [_finite("attainable_mm_per_px", v)
+                                             for v in ss.attainable_mm_per_px]},
+    )
+    return FacadeModel(
+        software_version=SOFTWARE_VERSION,
+        coverage="partial",
+        mode="assisted",
+        images=[record],
+        facade=FacadeRecord(
+            origin="operator_reference",
+            bounds_mm=ss.bounds_mm,
+            mm_per_rectified_px=_finite("facade.mm_per_rectified_px", geometry.mm_per_px),
+            scale=_scale_estimate(ss.scale_source, ss.sigma_rel),
+            plane_residual_mm=None,
+        ),
+        elements=elements,
     )
 
 
@@ -650,19 +923,9 @@ def process(image_path, *, operator_reference: OperatorReference,
     разметка выполняется по ИСХОДНОМУ снимку (п. 6.5).
     """
     scale_source = _checked_scale_source(scale_source)
-    path = Path(image_path)
-    # Единый кадр (план 3, задача 3): тот же поворот по EXIF, та же K и та же
-    # дисторсия, что у кадра, который показывает оператору интерфейс. Цвет
-    # конвейеру не нужен и не декодируется.
-    frame = load_frame(path, profile_path, with_color=False)
-    image, meta, K, source, dist = frame.gray, frame.meta, frame.K, frame.source, frame.dist
-    image_size = (image.shape[1], image.shape[0])
-    _points_in_frame(operator_reference, image_size)
-
-    camera_record = _camera_record(meta, K, source, dist)
-
-    plane = estimate_plane(image, K)
-    if plane.needs_operator:
+    fs = frame_stage(image_path, profile_path=profile_path,
+                     operator_reference=operator_reference)
+    if fs.plane.needs_operator:
         if marks is not None:
             raise ValueError(
                 "разметка элементов недоступна: доверие к плоскости ниже порога, "
@@ -672,199 +935,21 @@ def process(image_path, *, operator_reference: OperatorReference,
             raise ValueError(
                 "растр нечего сохранять: плоскость фасада не восстановлена "
                 "(needs_operator), ректификация не выполнялась")
-        return _needs_operator_model(path, image_id, meta, K, dist, source, plane,
-                                     operator_reference, image, raster_mm_per_px,
-                                     scale_source)
+        frame = fs.frame
+        return _needs_operator_model(fs.path, image_id, frame.meta, frame.K, frame.dist,
+                                     frame.source, fs.plane, operator_reference,
+                                     fs.sharpness, raster_mm_per_px, scale_source)
 
-    # Масштаб и начало отсчёта — из указаний оператора. Обе точки базы и точка
-    # начала отсчёта переводятся гомографией в ректифицированные единицы.
-    span_rect = _apply(plane.H, np.asarray(operator_reference.span_px, dtype=float))
-    span_units = float(np.linalg.norm(span_rect[1] - span_rect[0]))
-    if not math.isfinite(span_units) or span_units <= 0:
-        raise ValueError("опорная база оператора вырождена в ректифицированных "
-                         f"координатах: длина {span_units}")
-    mm_per_unit = _finite("mm_per_unit", operator_reference.span_mm / span_units)
-    origin_rect = tuple(_apply(plane.H, [operator_reference.origin_px])[0])
-    if not all(math.isfinite(v) for v in origin_rect):
-        raise ValueError("начало отсчёта оператора лежит на линии схода плоскости")
-
-    camera, half_turn = camera_pose(plane.H, plane.vh, plane.vv, K,
-                                    mm_per_unit, origin_rect)
-
-    fields = _frame_fields(plane.H, camera, mm_per_unit, origin_rect, image_size,
-                           quality_gate.THETA_MAX_DEG)
-
-    report = quality_gate.assess(image, fields.gsd_min, fields.gsd_max,
-                                 fields.theta_field_deg["p95"], fields.usable)
-    # Доля кадра за линией схода — причина деградации, а не повод молча усреднить.
-    # Порог не выдуман: за линией схода узел непригоден по определению, поэтому
-    # доля, превысившая допустимую долю НЕпригодных узлов, отвергает кадр и так —
-    # здесь она лишь называется по имени. Вердикт при этом пересчитывается явно,
-    # а не выводится из этой импликации.
-    #
-    # **Достижимость этой ветки через `process()` проверена, а не предположена.**
-    # Пройдено систематически 585 сочетаний ракурса и дистанции (dx от -60000 до
-    # 25000 мм, dy до ±7000 мм, dist от 200 до 25000 мм), каждое — полным проходом
-    # `estimate_plane` по отрезкам, найденным на РЕНДЕРЕННОМ кадре, тем же путём,
-    # каким сборка получает K (без EXIF, типовое поле зрения). Итог: доля узлов за
-    # линией схода растёт вместе с тем, насколько ракурс близок к рёберному, но
-    # доверие к плоскости падает вместе с ней же — оценка точек схода на таких
-    # ракурсах хуже обусловлена (меньше устойчивость направления, ближе к порогу
-    # ортогональности). Максимум, полученный при доверии ещё НЕ ниже
-    # `CONFIDENCE_THRESHOLD` (0.5) и потому дошедший до этой строки: доля 0.453 при
-    # доверии 0.515 (dx=-38000, dist=2500). Ни одно из 585 сочетаний не дало доли
-    # свыше 0.5 — порога, по которому решает эта ветка. Это не доказательство
-    # недостижимости: подобранного контрпримера может не быть только потому, что
-    # его не нашли. Но граница подходит вплотную с обеих сторон синхронно, а не
-    # порознь, и это довод не в пользу случайности. Ветка испытана напрямую, в
-    # обход шлюза доверия, в `tests/test_angles.py::
-    # test_nodes_behind_vanishing_line_are_excluded_and_counted` (там же и мера
-    # `GRAZING_BEHIND_FRACTION`) — то есть поведение `behind_vanishing_line` само по
-    # себе проверено, а недостающая часть — именно проход ОТСЮДА, из `process()`.
-    if fields.behind_vanishing_line > 1.0 - quality_gate.DEFAULT.usable_min_fraction:
-        report = report.model_copy(update={
-            "verdict": "degraded" if report.verdict == "ok" else report.verdict,
-            "reasons": [*report.reasons,
-                        (f"за линией схода оказалось {fields.behind_vanishing_line:.0%} "
-                         "кадра: эта часть на плоскость фасада не смотрит")],
-        })
-
-    attainable = attainable_mm_per_px(image, plane.H, mm_per_unit)
-    rectified = rectify(image, plane.H, mm_per_unit, raster_mm_per_px,
-                        origin_rect_units=origin_rect)
-
+    ss = scale_stage(fs, operator_reference, scale_source=scale_source)
+    geometry = raster_geometry_for(fs, ss, raster_mm_per_px)
     if save_rectified_to is not None:
+        rectified = raster_stage(fs, geometry)
         raster_path = Path(save_rectified_to)
         save_image(raster_path, rectified.image)
         mask_path = raster_path.with_name(f"{raster_path.stem}_mask{raster_path.suffix}")
         save_image(mask_path, (rectified.valid_mask.astype(np.uint8) * 255))
-
-    if scale_source == "operator_reference":
-        gsd_at_reference = math.sqrt(sum(
-            _finite("gsd_at_reference", _gsd_at(fields.gsd, image_size, point)) ** 2
-            for point in operator_reference.span_px) / 2.0)
-        sigma_rel = _scale_sigma_rel(operator_reference.span_mm,
-                                     operator_reference.sigma_px, gsd_at_reference)
-    else:
-        # Типовая высота этажа: длина базы не измерена, поэтому σ из неё не
-        # выводится — считать её по формуле источника 1 значило бы выдать за
-        # измерение допущение.
-        sigma_rel = SIGMA_REL_ASSUMED_FLOOR_HEIGHT
-
-    # Габарит ОХВАЧЕННОЙ части фасада: углы образа кадра в миллиметрах. Не размер
-    # снимка в миллиметрах и не габарит здания.
-    h_px, w_px = image.shape[:2]
-    corners_mm = rectified_to_facade_mm(
-        _apply(plane.H, [[0, 0], [w_px, 0], [w_px, h_px], [0, h_px]]),
-        origin_rect, mm_per_unit)
-    bounds_mm = [_finite("facade.bounds_mm", v) for v in
-                 (corners_mm[:, 0].min(), corners_mm[:, 1].min(),
-                  corners_mm[:, 0].max(), corners_mm[:, 1].max())]
-
-    # Оцифровка проёмов (задача 18). Геометрия передаётся ТА ЖЕ, что уже вычислена
-    # выше и записана в выход этой же записи (`plane.H`, `camera`, `mm_per_unit`,
-    # `origin_rect`, `fields.gsd`) — ни второй оценки плоскости, ни второго поля
-    # разрешения для разметки здесь нет. `sigma_px` — СВОЯ величина оцифровки
-    # (`mark_sigma_px`), а не точность указания опорной базы: см.
-    # `DEFAULT_MARK_SIGMA_PX`. `residual_px` проходит через `_finite_or_none` тем
-    # же путём, что и в записи ниже, иначе неконечная невязка дала бы
-    # бесконечную σ у элемента при `null` в `rectification.residual_px` того же
-    # файла — два разных ответа об одной величине.
-    elements = []
-    if marks is not None:
-        elements = digitize_elements(
-            marks, H=plane.H, camera=camera, mm_per_unit=mm_per_unit,
-            origin_rect=origin_rect, image_size=image_size, gsd_field=fields.gsd,
-            sigma_px=mark_sigma_px, sigma_rel=sigma_rel,
-            residual_px=_finite_or_none(plane.confidence.residual_px),
-            calibration=camera_record.calibration, image_id=image_id,
-            wall_flatness_mm=wall_flatness_mm)
-
-    # Шлюз качества ветвится на собственный вердикт. Обоснование выбора из трёх
-    # возможных ветвлений — в `GATE_REJECT_WITHHOLDS_TOLERANCE`. Причина
-    # дописывается в тот же `quality.reasons` только вместе с самим действием:
-    # без элементов утверждать о них нечего.
-    if report.verdict == "reject" and elements:
-        elements = [element.model_copy(update={"meets_tolerance": None})
-                    for element in elements]
-        report = report.model_copy(update={
-            "reasons": [*report.reasons, GATE_REJECT_WITHHOLDS_TOLERANCE]})
-
-    record = ImageRecord(
-        id=image_id,
-        path=str(path),
-        camera=camera_record,
-        captured_at=meta.captured_at,
-        gnss=meta.gnss,
-        pose_to_facade={
-            "cx": _finite("pose_to_facade.cx", camera.cx),
-            "cy": _finite("pose_to_facade.cy", camera.cy),
-            "cz": _finite("pose_to_facade.cz", camera.cz),
-            "units": "mm",
-            "half_turn": {"resolved": bool(half_turn.resolved),
-                          "assumption": half_turn.assumption,
-                          "reason": half_turn.reason,
-                          "resolver": half_turn.resolver},
-        },
-        theta_cam_deg=_theta_at(plane.H, camera, mm_per_unit, origin_rect,
-                                (float(K[0, 2]), float(K[1, 2]))),
-        theta_field_deg=fields.theta_field_deg,
-        quality=report,
-        rectification=Rectification(
-            method=plane.method,
-            confidence=_finite("rectification.confidence", plane.confidence.value),
-            residual_px=_finite_or_none(plane.confidence.residual_px),
-            needs_operator=False),
-        homography={"from": "image_px", "to": "rectified_px",
-                    "H": [[_finite("homography.H", v) for v in row]
-                          for row in rectified.H],
-                    # Без начала отсчёта в пикселях растра измерение в нём в
-                    # миллиметры фасада не переводится вовсе: `H` доводит до
-                    # пикселей растра, но не говорит, где в нём нуль фасада.
-                    "origin_rect_px": [_finite("homography.origin_rect_px", v)
-                                       for v in rectified.origin_rect_px],
-                    "attainable_mm_per_px": [_finite("attainable_mm_per_px", v)
-                                             for v in attainable]},
-    )
-    return FacadeModel(
-        software_version=SOFTWARE_VERSION,
-        # См. докстринг: п. 7 связывает охват с тем, где лежит начало координат,
-        # а оно здесь всегда опорная точка оператора.
-        coverage="partial",
-        mode="assisted",
-        images=[record],
-        facade=FacadeRecord(
-            origin="operator_reference",
-            bounds_mm=bounds_mm,
-            mm_per_rectified_px=_finite("facade.mm_per_rectified_px",
-                                        rectified.mm_per_px),
-            scale=_scale_estimate(scale_source, sigma_rel),
-            # Невязка подгонки плоскости в миллиметрах не измеряется, и причина
-            # НЕ в том, что перевод пикселей в миллиметры был бы незаконен.
-            #
-            # `plane_residual_mm` (раздел 10, пример «{rms: 18, max: 41}») —
-            # отклонение восстановленных ТОЧЕК ФАСАДА от подогнанной плоскости:
-            # мера того, насколько стена не плоская и насколько точно она
-            # восстановлена в пространстве. Точек в пространстве у ядра нет —
-            # оно работает по одиночному снимку и получает плоскость из двух
-            # точек схода, а не из облака. Отсутствие честнее выдуманного числа.
-            #
-            # `confidence.residual_px` — ДРУГАЯ величина: среднее отклонение
-            # концов отрезков-инлайеров от направления на точку схода, в
-            # настоящих пикселях кадра (`geometry.vanishing.endpoint_deviation_px`:
-            # для отрезка длиной L при угловом промахе α это (L/2)·sin α — то есть
-            # смещение точки кадра, а не угол). Такое смещение переводится в
-            # миллиметры фасада умножением на локальное разрешение, и именно так
-            # `pipeline.elements._size_sigma_mm` получает слагаемое «остаточная
-            # проективная невязка» п. 6.1 (3-7 мм в колонке `assisted`).
-            # Прежняя редакция этого комментария объявляла тот же перевод
-            # недопустимым («выдало бы угловую величину за метрическую»), тогда
-            # как он выполняется в `elements.py` на том же проходе и входит в σ
-            # каждого элемента того же файла. Неверным было утверждение здесь.
-            plane_residual_mm=None,
-        ),
-        elements=elements,
-    )
+    return elements_stage(fs, ss, geometry, marks, image_id=image_id,
+                          mark_sigma_px=mark_sigma_px, wall_flatness_mm=wall_flatness_mm)
 
 
 def _parse_args(argv):

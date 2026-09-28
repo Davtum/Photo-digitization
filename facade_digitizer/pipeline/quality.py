@@ -186,7 +186,8 @@ def usable_fraction(theta_field_deg: np.ndarray,
 
 
 def assess(image: np.ndarray, gsd_min: float, gsd_max: float, theta_p95: float,
-           usable: float = 1.0, thresholds: Thresholds | None = None) -> QualityReport:
+           usable: float = 1.0, thresholds: Thresholds | None = None,
+           sharpness_value: float | None = None) -> QualityReport:
     """Вердикт о пригодности снимка. Возвращает QualityReport (схема, раздел 10).
 
     Поднимает ValueError, если аргументы — числовые или сам кадр — не описывают реальный
@@ -214,7 +215,9 @@ def assess(image: np.ndarray, gsd_min: float, gsd_max: float, theta_p95: float,
     image = _image(image)
 
     reasons: list[str] = []
-    sharp = sharpness(image)
+    # Резкость от опорной базы не зависит и стоит до 0.7 с на 20 Мп, поэтому
+    # фаза кадра (план 3, задача 4) считает её один раз и передаёт сюда.
+    sharp = sharpness(image) if sharpness_value is None else float(sharpness_value)
     if not math.isfinite(sharp):
         raise ValueError(f"изображение: резкость неопределена ({sharp})")
     if sharp < t.sharpness_min:

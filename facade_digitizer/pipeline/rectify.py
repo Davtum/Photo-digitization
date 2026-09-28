@@ -149,6 +149,33 @@ def rectify(image, H_units, mm_per_rect_unit, mm_per_px, origin_rect_units=(0.0,
     отказ, называющий достижимый диапазон.
     """
     image = _grayscale(image)
+    geometry = raster_geometry(image, H_units, mm_per_rect_unit, mm_per_px,
+                               origin_rect_units)
+    return warp(image, geometry)
+
+
+
+@dataclass(frozen=True)
+class RasterGeometry:
+    """Всё о растре, кроме его пикселей. План 3, задача 4.
+
+    `H`, размер, масштаб и начало отсчёта растра получаются из образа четырёх углов
+    кадра — микросекунды; дороги только сами пиксели (`warp`): до 4 с на снимке
+    20 Мп при наибольшем разрешении. Выходной файл ссылается на геометрию, а не на
+    пиксели, поэтому геометрия считается сразу, а растр — в фоне, когда он нужен
+    для показа.
+    """
+
+    H: np.ndarray                 # изображение -> ректифицированные ПИКСЕЛИ
+    size: tuple                   # (ширина, высота) растра
+    mm_per_px: float
+    origin_rect_px: tuple
+
+
+def raster_geometry(image, H_units, mm_per_rect_unit, mm_per_px,
+                    origin_rect_units=(0.0, 0.0)) -> RasterGeometry:
+    """Геометрия растра с той же проверкой масштаба, что у `rectify` (см. её докстринг)."""
+    image = _grayscale(image)
     mm_per_rect_unit = _positive_finite("mm_per_rect_unit", mm_per_rect_unit)
     mm_per_px = _positive_finite("mm_per_px", mm_per_px)
 
@@ -173,11 +200,21 @@ def rectify(image, H_units, mm_per_rect_unit, mm_per_px, origin_rect_units=(0.0,
     out_h = round((y1 - y0) * scale)
 
     S = np.array([[scale, 0.0, -x0 * scale], [0.0, scale, -y0 * scale], [0.0, 0.0, 1.0]])
-    H_total = S @ H_units
-
-    warped = cv2.warpPerspective(image, H_total, (out_w, out_h), flags=cv2.INTER_LINEAR)
-    mask = cv2.warpPerspective(np.full_like(image, 255), H_total, (out_w, out_h),
-                               flags=cv2.INTER_NEAREST) > 0
     ox, oy = origin_rect_units
-    return Rectified(warped, H_total, mask, mm_per_px,
-                     ((ox - x0) * scale, (oy - y0) * scale))
+    return RasterGeometry(S @ H_units, (out_w, out_h), mm_per_px,
+                          ((ox - x0) * scale, (oy - y0) * scale))
+
+
+def warp(image, geometry: RasterGeometry) -> Rectified:
+    """Пиксели растра по готовой геометрии. Та же `H`, что уйдёт в выходной файл.
+
+    Кадр может быть и цветным: маска охвата строится по одному каналу и остаётся
+    двумерной, как требует `Rectified.valid_mask`.
+    """
+    if not isinstance(image, np.ndarray) or image.size == 0 or image.ndim not in (2, 3):
+        raise ValueError("изображение: ожидался непустой двумерный или трёхканальный кадр")
+    out_w, out_h = geometry.size
+    warped = cv2.warpPerspective(image, geometry.H, (out_w, out_h), flags=cv2.INTER_LINEAR)
+    mask = cv2.warpPerspective(np.full(image.shape[:2], 255, np.uint8), geometry.H,
+                               (out_w, out_h), flags=cv2.INTER_NEAREST) > 0
+    return Rectified(warped, geometry.H, mask, geometry.mm_per_px, geometry.origin_rect_px)
