@@ -23,6 +23,10 @@ SENSOR_WIDTH_MM_BY_MODEL = {
 #: Множитель перевода единицы FocalPlaneResolutionUnit в миллиметры.
 _RESOLUTION_UNIT_MM = {2: 25.4, 3: 10.0, 4: 1.0}
 
+#: Значения EXIF Orientation, при которых оси кадра переставлены относительно осей
+#: матрицы (поворот на 90° или 270°, с отражением или без).
+AXES_SWAPPED = frozenset({5, 6, 7, 8})
+
 
 @dataclass(frozen=True)
 class CameraMeta:
@@ -53,6 +57,11 @@ class CameraMeta:
     captured_at: str | None
     gnss: dict | None
     sensor_width_source: str | None = None   # "focal_plane" | "crop_factor" | "model_table"
+    #: Тег EXIF Orientation, УЖЕ применённый декодером (`cv2.imdecode` поворачивает
+    #: кадр сам). 1 — поворота нет либо тега нет. Нужен затем, что при 5–8 оси кадра
+    #: переставлены относительно осей матрицы, и ширину сенсора в пикселях надо брать
+    #: по сырому, неповёрнутому кадру (план 3, задача 3).
+    orientation: int = 1
 
 
 def load_image(path: str | Path):
@@ -71,19 +80,29 @@ def load_image(path: str | Path):
     отличить опечатку в пути от битого снимка.
     """
     path = Path(path)
-    try:
-        raw = np.fromfile(str(path), dtype=np.uint8)
-    except OSError as error:
-        raise FileNotFoundError(f"изображение не найдено: {path}") from error
-
-    img = cv2.imdecode(raw, cv2.IMREAD_GRAYSCALE) if raw.size else None
-    if img is None:
-        raise ValueError("не удалось прочитать изображение (файл испорчен либо "
-                         f"формат не распознан): {path}")
-
+    raw = read_bytes(path)
+    img = decode(raw, cv2.IMREAD_GRAYSCALE, path)
     h, w = img.shape[:2]
     meta = _read_exif(path, (w, h))
     return img, meta
+
+
+def read_bytes(path: Path) -> np.ndarray:
+    """Байты файла в обход кодовой страницы Windows (см. `load_image`)."""
+    try:
+        return np.fromfile(str(path), dtype=np.uint8)
+    except OSError as error:
+        raise FileNotFoundError(f"изображение не найдено: {path}") from error
+
+
+def decode(raw: np.ndarray, flag: int, path: Path) -> np.ndarray:
+    """Декодирование с поворотом по EXIF (так делает `cv2.imdecode` без
+    `IMREAD_IGNORE_ORIENTATION`). Пустой или испорченный файл — `ValueError`."""
+    img = cv2.imdecode(raw, flag) if raw.size else None
+    if img is None:
+        raise ValueError("не удалось прочитать изображение (файл испорчен либо "
+                         f"формат не распознан): {path}")
+    return img
 
 
 def save_image(path: str | Path, image: np.ndarray) -> Path:
@@ -131,14 +150,17 @@ def _decode(value):
     return str(value)
 
 
-def _sensor_width(exif_ifd, model, focal_mm, piexif, image_size):
+def _sensor_width(exif_ifd, model, focal_mm, piexif, raw_width_px):
     """Ширина матрицы и происхождение этого значения.
 
     Порядок: явное значение из EXIF (FocalPlaneXResolution); затем кроп-фактор по
     35-мм эквиваленту; затем таблица по моделям. Ничего не нашлось — (None, None),
     и вызывающий уйдёт на типовое поле зрения.
+
+    Ширина в пикселях — СЫРОГО, неповёрнутого кадра: `FocalPlaneXResolution`
+    отсчитывается вдоль оси X матрицы, а не вдоль оси X кадра после поворота по EXIF.
     """
-    width_px = image_size[0]
+    width_px = raw_width_px
 
     x_res = _rational(exif_ifd, piexif.ExifIFD.FocalPlaneXResolution)
     unit = exif_ifd.get(piexif.ExifIFD.FocalPlaneResolutionUnit)
@@ -206,10 +228,14 @@ def _read_exif(path: Path, image_size: tuple[int, int]) -> CameraMeta:
     focal = _rational(exif_ifd, piexif.ExifIFD.FocalLength)
     captured = _decode(exif_ifd.get(piexif.ExifIFD.DateTimeOriginal))
 
+    orientation = zeroth.get(piexif.ImageIFD.Orientation, 1)
+    if orientation not in range(1, 9):
+        orientation = 1
+    raw_width = image_size[1] if orientation in AXES_SWAPPED else image_size[0]
     sensor_width, sensor_width_source = _sensor_width(
-        exif_ifd, model, focal, piexif, image_size
+        exif_ifd, model, focal, piexif, raw_width
     )
     gnss = _read_gnss(gps_ifd, piexif)
 
     return CameraMeta(model, focal, sensor_width, image_size, captured, gnss,
-                      sensor_width_source)
+                      sensor_width_source, orientation)

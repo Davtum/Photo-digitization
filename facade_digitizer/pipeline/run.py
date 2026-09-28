@@ -46,14 +46,14 @@ from facade_digitizer.geometry.homography import (
     rectified_to_facade_mm,
 )
 from facade_digitizer.pipeline import quality as quality_gate
-from facade_digitizer.pipeline.calib import intrinsics_from_meta, load_profile, undistort
 from facade_digitizer.pipeline.elements import (
     WALL_FLATNESS_DEVIATION_MM,
     ElementMark,
     digitize_elements,
     load_marks,
 )
-from facade_digitizer.pipeline.io import load_image, save_image
+from facade_digitizer.pipeline.frame import load_frame
+from facade_digitizer.pipeline.io import save_image
 from facade_digitizer.pipeline.plane import estimate_plane
 from facade_digitizer.pipeline.rectify import attainable_mm_per_px, rectify
 from facade_digitizer.schema import (
@@ -651,10 +651,11 @@ def process(image_path, *, operator_reference: OperatorReference,
     """
     scale_source = _checked_scale_source(scale_source)
     path = Path(image_path)
-    image, meta = load_image(path)
-    K, source = intrinsics_from_meta(meta, profile_path)
-    dist = load_profile(profile_path).dist if source == "target" else [0.0] * 5
-    image = undistort(image, K, dist)
+    # Единый кадр (план 3, задача 3): тот же поворот по EXIF, та же K и та же
+    # дисторсия, что у кадра, который показывает оператору интерфейс. Цвет
+    # конвейеру не нужен и не декодируется.
+    frame = load_frame(path, profile_path, with_color=False)
+    image, meta, K, source, dist = frame.gray, frame.meta, frame.K, frame.source, frame.dist
     image_size = (image.shape[1], image.shape[0])
     _points_in_frame(operator_reference, image_size)
 

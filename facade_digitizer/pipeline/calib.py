@@ -7,7 +7,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .io import CameraMeta
+from .io import AXES_SWAPPED, CameraMeta
 
 DEFAULT_DIAGONAL_FOV_DEG = 84.0  # типично для DJI Zenmuse L2 и Mavic 3
 
@@ -168,7 +168,13 @@ def intrinsics_from_meta(meta: CameraMeta, profile_path=None) -> tuple[np.ndarra
         return np.array(prof.K, dtype=float), "target"
 
     if meta.focal_mm and meta.sensor_width_mm:
-        fx = fy = w * meta.focal_mm / meta.sensor_width_mm
+        # Ширина матрицы измерена вдоль оси X СЕНСОРА. После поворота по EXIF на 90°
+        # (теги 5–8) это ось Y кадра, и делить надо сырую ширину, а не ширину
+        # повёрнутого кадра: иначе fx занижается в отношении сторон, на кадре
+        # 5280×3956 — на 25 %, и только у снимков, снятых «портретом» (план 3,
+        # задача 3). Главная точка остаётся центром повёрнутого кадра.
+        raw_w = h if meta.orientation in AXES_SWAPPED else w
+        fx = fy = raw_w * meta.focal_mm / meta.sensor_width_mm
         source = SOURCE_BY_SENSOR_WIDTH_SOURCE[meta.sensor_width_source]
     else:
         diag_px = math.hypot(w, h)
