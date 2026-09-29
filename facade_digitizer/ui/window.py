@@ -11,6 +11,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction, QActionGroup, QKeySequence
 from PySide6.QtWidgets import QDockWidget, QFileDialog, QLabel, QMainWindow
 
+from facade_digitizer.pipeline import quality as quality_gate
 from facade_digitizer.pipeline import run
 from facade_digitizer.ui.canvas import FrameCanvas
 from facade_digitizer.ui.panels import SidePanel
@@ -192,6 +193,11 @@ class MainWindow(QMainWindow):
         else:
             preview = run.theta_preview(fs)
             self.canvas.set_usable_mask(preview.usable_mask)
+            pre = quality_gate.assess_preliminary(fs.sharpness, preview.usable_fraction)
+            self.side.quality.show_preliminary(
+                pre.verdict, pre.reasons,
+                "плоскость задана оператором" if plane.method == "manual_four_point"
+                else f"доверие к плоскости {plane.confidence.value:.2f}")
             half = preview.half_turn
             manual = plane.method == "manual_four_point"
             parts.append("плоскость задана оператором" if manual
@@ -297,7 +303,8 @@ class MainWindow(QMainWindow):
         self.scale_ready(ss)
 
     def scale_ready(self, ss) -> None:
-        """Точка расширения для задач 12–15: масштаб посчитан."""
+        """Масштаб посчитан: окончательный вердикт — задача 12."""
+        self.side.quality.show_final(ss.quality.verdict, ss.quality.reasons)
 
     def _show_scale(self, *_):
         self.scale_label.setText(self.canvas.scale_text())

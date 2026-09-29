@@ -51,8 +51,10 @@ __all__ = [
     "SHARPNESS_REASON",
     "THETA_MAX_DEG",
     "USABLE_FRACTION_REASON",
+    "PreliminaryVerdict",
     "Thresholds",
     "assess",
+    "assess_preliminary",
     "sharpness",
     "usable_fraction",
 ]
@@ -253,3 +255,34 @@ def assess(image: np.ndarray, gsd_min: float, gsd_max: float, theta_p95: float,
         theta_field_deg_p95=theta_p95,
         reasons=reasons,
     )
+
+
+@dataclass(frozen=True)
+class PreliminaryVerdict:
+    """Вердикт ДО опорной базы. План 3, задача 12.
+
+    Окончательный вердикт решается разрешением (`gsd_max_mm_px`), а разрешение
+    считается от введённой длины опорной базы: одна плоскость даёт `reject` при
+    базе 20 000 мм и `ok` при 15 000 мм. Без базы честно известно только то, что
+    от неё не зависит: резкость и доля пригодной по углу области (углы от масштаба
+    не зависят). Поэтому `verdict` здесь — `"ok"` либо `"degraded"`, но никогда
+    `"reject"`: отказ по разрешению до базы утверждать нечем.
+    """
+
+    verdict: str
+    reasons: list
+
+
+def assess_preliminary(sharpness_value: float, usable: float,
+                       thresholds: Thresholds | None = None) -> PreliminaryVerdict:
+    """Предварительный вердикт: те же пороги и те же строки причин, что у `assess`."""
+    t = thresholds or DEFAULT
+    sharp = float(sharpness_value)
+    if not math.isfinite(sharp):
+        raise ValueError(f"изображение: резкость неопределена ({sharp})")
+    reasons = []
+    if sharp < t.sharpness_min:
+        reasons.append(SHARPNESS_REASON.format(value=sharp, threshold=t.sharpness_min))
+    if usable < t.usable_min_fraction:
+        reasons.append(USABLE_FRACTION_REASON.format(value=usable))
+    return PreliminaryVerdict(verdict="degraded" if reasons else "ok", reasons=reasons)

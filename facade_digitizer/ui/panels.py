@@ -196,6 +196,49 @@ class BasePanel(QGroupBox):
             self.corner_origin.setChecked(origin_is_facade_corner)
 
 
+class QualityPanel(QGroupBox):
+    """Шлюз качества в две ступени. План 3, задача 12; спецификация, п. 4.1.
+
+    Причины показываются ТЕМИ ЖЕ строками, что попадают в `quality.reasons`
+    выходного файла: вторая формулировка одной причины разошлась бы с первой.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__("Качество снимка", parent)
+        self.stage = QLabel("—")
+        self.verdict = QLabel("—")
+        self.reasons = QLabel("")
+        self.note = QLabel("")
+        for label in (self.stage, self.verdict, self.reasons, self.note):
+            label.setWordWrap(True)
+        layout = QVBoxLayout(self)
+        for label in (self.stage, self.verdict, self.reasons, self.note):
+            layout.addWidget(label)
+        self.reason_list: list[str] = []
+
+    def _show(self, verdict: str, reasons: list[str]) -> None:
+        self.verdict.setText(f"Вердикт: {verdict}")
+        self.reason_list = list(reasons)
+        self.reasons.setText("\n".join(f"— {r}" for r in reasons) or "причин нет")
+
+    def show_preliminary(self, verdict: str, reasons: list[str], confidence: str) -> None:
+        self.stage.setText("Предварительный: до опорной базы")
+        self._show(verdict, reasons)
+        self.note.setText(f"{confidence}. Вердикт по разрешению будет после ввода "
+                          "опорной базы: разрешение считается от её длины.")
+
+    def show_final(self, verdict: str, reasons: list[str]) -> None:
+        self.stage.setText("Окончательный: зависит от введённой длины опорной базы")
+        self._show(verdict, reasons)
+        if verdict == "reject":
+            self.note.setText("Кадр отбракован по разрешению. Разметка разрешена, но "
+                              "признак соответствия допуску у элементов выпущен не будет. "
+                              "Проверьте длину базы: опечатка в ней меняет вердикт.")
+        else:
+            self.note.setText("Вердикт зависит от длины опорной базы: опечатка в ней "
+                              "меняет его и признак допуска у всех элементов.")
+
+
 class SidePanel(QWidget):
     """Правая колонка окна: панели сверху вниз в порядке работы оператора."""
 
@@ -203,7 +246,9 @@ class SidePanel(QWidget):
         super().__init__(parent)
         self.plane = PlanePanel(self)
         self.base = BasePanel(self)
+        self.quality = QualityPanel(self)
         self.layout_ = QVBoxLayout(self)
         self.layout_.addWidget(self.plane)
+        self.layout_.addWidget(self.quality)
         self.layout_.addWidget(self.base)
         self.layout_.addStretch(1)
