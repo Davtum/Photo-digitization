@@ -645,12 +645,12 @@ SIGMA_EDGE_PX = 1.0
 дефект, от которого надо уберечься (расхождение с полным пересчётом), вместе с ловушкой
 глобальной ветви `reject` (`run.py:780` снимает признак со всех элементов сразу).
 
-- [ ] **Шаг 1: Падающие тесты**
+- [x] **Шаг 1: Падающие тесты**
   1. `test_edit_recount_within_budget_on_100_elements` — замер; результат записывается в отчёт
   2. `test_edit_calls_neither_frame_nor_scale_stage`
   3. `test_ids_are_stable_after_deleting_a_mark`
   4. `test_reject_branch_is_applied_after_every_edit`
-- [ ] **Шаг 2–5:** падают → реализация → проходят → коммит
+- [x] **Шаг 2–5:** падают → реализация → проходят → коммит
 
 ---
 

@@ -95,6 +95,9 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.scale_label)
         self.canvas.scaleChanged.connect(self._show_scale)
         self.canvas.pointClicked.connect(self.handle_click)
+        self.canvas.editable_points = self.session_editable_points
+        self.canvas.pointDragged.connect(self.drag_point)
+        self.canvas.pointDropped.connect(self.drop_point)
         self._job = None
         self.current_mark: str | None = None
         self.mode = "navigate"
@@ -497,6 +500,31 @@ class MainWindow(QMainWindow):
 
     def center_frame_on(self, x: float, y: float) -> None:
         self.canvas.centerOn(x + 0.5, y + 0.5)
+
+    # --- правка разметки (задача 16) ------------------------------------------------
+
+    def session_editable_points(self):
+        return self.session.editable_points() if self.mode == "navigate" else []
+
+    def drag_point(self, key: str, x: float, y: float, view_scale: float) -> None:
+        """Во время перетаскивания двигается только рисунок; пересчёт — при отпускании."""
+        self.session.move_point(key, ClickedPoint(x, y, view_scale))
+        self._draw_marks()
+
+    def drop_point(self, key: str, x: float, y: float, view_scale: float) -> None:
+        """Отпускание — ПОЛНЫЙ пересчёт всех элементов через фазу элементов.
+
+        Покомпонентного кэша нет намеренно: запас по времени велик (0.5 мс на
+        элемент), а кэш добавил бы ровно тот дефект, от которого надо уберечься, —
+        расхождение с полным пересчётом, — вместе с ловушкой глобальной ветви
+        `reject` (признак допуска снимается со ВСЕХ элементов сразу, `run.py`).
+        """
+        point = ClickedPoint(x, y, view_scale)
+        self.session.move_point(key, point)
+        self._warn_scale(point)
+        self._draw_marks()
+        if self.session.ready_to_measure()[0]:
+            self.compute()
 
     def closeEvent(self, event):
         """Закрытие окна отменяет фоновые задачи: их результат доставлять некуда."""

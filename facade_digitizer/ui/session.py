@@ -309,6 +309,27 @@ class OperatorSession:
         mark.reveal_points.append(point)
         self.model = None
 
+    def editable_points(self) -> list[tuple[str, float, float]]:
+        """Точки разметки, которые можно перетаскивать: (ключ, x, y кадра).
+
+        Ключ — «идентификатор:вид:номер»; идентификатор устойчив к удалению других
+        разметок (задача 6), поэтому ключ не сдвигается от правки соседей.
+        """
+        out = []
+        for m in self.marks:
+            out += [(f"{m.id}:corner:{i}", *p.xy) for i, p in enumerate(m.corners)]
+            out += [(f"{m.id}:reveal:{i}", *p.xy) for i, p in enumerate(m.reveal_points)]
+        return out
+
+    def move_point(self, key: str, point: ClickedPoint) -> None:
+        """Перенести точку разметки. Масштаб — тот, при котором её поставили заново:
+        σ точки следует за последним действием оператора над ней."""
+        mark_id, kind, index = key.rsplit(":", 2)
+        mark = self.mark(mark_id)
+        points = mark.corners if kind == "corner" else mark.reveal_points
+        points[int(index)] = point
+        self.model = None
+
     def undo_last_point(self, mark: MarkDraft) -> None:
         """Отменить последнюю точку разметки: сперва кромки откоса, затем углов."""
         if mark.reveal_points:

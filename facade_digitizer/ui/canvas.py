@@ -51,6 +51,12 @@ class FrameCanvas(QGraphicsView):
     pointClicked = Signal(float, float, float)
     #: Масштаб изменился: новое значение.
     scaleChanged = Signal(float)
+    #: Перетаскивание точки разметки: ключ точки, x, y кадра, масштаб (задача 16).
+    pointDragged = Signal(str, float, float, float)
+    pointDropped = Signal(str, float, float, float)
+
+    #: Радиус захвата точки разметки, экранных пикселей.
+    GRAB_RADIUS_PX = 8.0
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -64,6 +70,9 @@ class FrameCanvas(QGraphicsView):
         self.frame_size: tuple[int, int] | None = None
         self._press_pos = None
         self.overlays: dict[str, list] = {}
+        #: Точки, которые можно перетаскивать: функция → [(ключ, x, y)] кадра.
+        self.editable_points = list
+        self._dragging: str | None = None
 
     # --- кадр -----------------------------------------------------------------
 
@@ -202,11 +211,45 @@ class FrameCanvas(QGraphicsView):
     def frame_point_at(self, viewport_pos) -> tuple[float, float] | None:
         return self.scene_to_frame(self.mapToScene(viewport_pos))
 
+    def _grab_key(self, viewport_pos) -> str | None:
+        """Ключ ближайшей точки разметки в радиусе захвата (в ЭКРАННЫХ пикселях)."""
+        best, best_d = None, self.GRAB_RADIUS_PX
+        for key, x, y in self.editable_points():
+            p = self.mapFromScene(QPointF(x + 0.5, y + 0.5))
+            d = ((p.x() - viewport_pos.x()) ** 2 + (p.y() - viewport_pos.y()) ** 2) ** 0.5
+            if d <= best_d:
+                best, best_d = key, d
+        return best
+
     def mousePressEvent(self, event) -> None:
         self._press_pos = event.position().toPoint()
+        if event.button() == Qt.LeftButton:
+            self._dragging = self._grab_key(self._press_pos)
+            if self._dragging is not None:
+                self.setDragMode(QGraphicsView.NoDrag)     # не панорама, а правка
+                event.accept()
+                return
         super().mousePressEvent(event)
 
+    def mouseMoveEvent(self, event) -> None:
+        if self._dragging is not None:
+            point = self.frame_point_at(event.position().toPoint())
+            if point is not None:
+                self.pointDragged.emit(self._dragging, point[0], point[1], self.view_scale())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
     def mouseReleaseEvent(self, event) -> None:
+        if self._dragging is not None:
+            key, self._dragging = self._dragging, None
+            self.setDragMode(QGraphicsView.ScrollHandDrag)
+            point = self.frame_point_at(event.position().toPoint())
+            if point is not None:
+                self.pointDropped.emit(key, point[0], point[1], self.view_scale())
+            self._press_pos = None
+            event.accept()
+            return
         super().mouseReleaseEvent(event)
         pos = event.position().toPoint()
         moved = (self._press_pos is not None
