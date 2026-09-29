@@ -16,8 +16,15 @@
 """
 import numpy as np
 from PySide6.QtCore import QPointF, Qt, Signal
-from PySide6.QtGui import QImage, QPainter, QPixmap, QTransform
-from PySide6.QtWidgets import QGraphicsPixmapItem, QGraphicsScene, QGraphicsView
+from PySide6.QtGui import QBrush, QColor, QImage, QPainter, QPainterPath, QPen, QPixmap, QTransform
+from PySide6.QtWidgets import (
+    QGraphicsEllipseItem,
+    QGraphicsItem,
+    QGraphicsPathItem,
+    QGraphicsPixmapItem,
+    QGraphicsScene,
+    QGraphicsView,
+)
 
 #: Шаг колеса мыши: один щелчок меняет масштаб в 1.25 раза.
 WHEEL_STEP = 1.25
@@ -56,12 +63,14 @@ class FrameCanvas(QGraphicsView):
         self.usable_item: QGraphicsPixmapItem | None = None
         self.frame_size: tuple[int, int] | None = None
         self._press_pos = None
+        self.overlays: dict[str, list] = {}
 
     # --- кадр -----------------------------------------------------------------
 
     def set_frame(self, image: np.ndarray) -> None:
         self.scene().clear()
         self.usable_item = None
+        self.overlays = {}
         pixmap = QPixmap.fromImage(to_qimage(image))
         self.frame_item = self.scene().addPixmap(pixmap)
         self.frame_item.setPos(0, 0)
@@ -92,6 +101,54 @@ class FrameCanvas(QGraphicsView):
                                              Qt.SmoothTransformation)
         self.usable_item = self.scene().addPixmap(pix)
         self.usable_item.setZValue(1)
+
+    # --- наложения ------------------------------------------------------------
+
+    def set_overlay(self, key: str, points, *, closed: bool = False,
+                    color: str = "#e53935", markers: bool = True) -> None:
+        """Точки и ломаная в координатах КАДРА (соглашение OpenCV) поверх снимка.
+
+        Толщина линий и размер меток — в экранных пикселях (косметическое перо и
+        метки, не масштабируемые с видом): при 1:8 и при 8:1 разметку видно
+        одинаково, и она не закрывает кромку, по которой оператор целится.
+        """
+        self.clear_overlay(key)
+        pts = [(float(x) + 0.5, float(y) + 0.5) for x, y in points]
+        items = []
+        pen = QPen(QColor(color))
+        pen.setCosmetic(True)
+        pen.setWidthF(2.0)
+        if len(pts) >= 2:
+            path = QPainterPath(QPointF(*pts[0]))
+            for pt in pts[1:]:
+                path.lineTo(QPointF(*pt))
+            if closed and len(pts) >= 3:
+                path.closeSubpath()
+            line = QGraphicsPathItem(path)
+            line.setPen(pen)
+            line.setZValue(2)
+            self.scene().addItem(line)
+            items.append(line)
+        if markers:
+            for x, y in pts:
+                dot = QGraphicsEllipseItem(-4, -4, 8, 8)
+                dot.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
+                dot.setPos(x, y)
+                dot.setPen(pen)
+                dot.setBrush(QBrush(QColor(color)))
+                dot.setZValue(3)
+                self.scene().addItem(dot)
+                items.append(dot)
+        self.overlays[key] = items
+
+    def clear_overlay(self, key: str) -> None:
+        for item in self.overlays.pop(key, []):
+            if item.scene() is self.scene():
+                self.scene().removeItem(item)
+
+    def clear_overlays(self, prefix: str = "") -> None:
+        for key in [k for k in self.overlays if k.startswith(prefix)]:
+            self.clear_overlay(key)
 
     # --- масштаб --------------------------------------------------------------
 

@@ -118,10 +118,18 @@ def test_mark_drafts_validate_through_element_mark_in_any_click_order(processed,
     s.delete_mark(mark.id)
 
 
-def test_order_corners_handles_a_perspective_quad():
-    bl, br, tr, tl = (100, 900), (700, 1000), (720, 300), (90, 150)
-    shuffled = [tr, bl, tl, br]
-    assert [tuple(p) for p in order_corners(shuffled)] == [bl, br, tr, tl]
+@pytest.mark.parametrize("bl, br, tr, tl", [
+    ((100, 900), (700, 1000), (720, 300), (90, 150)),
+    # Фасад целиком на косом кадре задачи 18: нижний левый угол лежит на 145° от
+    # центра. Первая версия сортировки отсчитывала от 135° и сдвигала обход на одну
+    # позицию; поймано тестом окна задачи 10, а не этим тестом.
+    ((949.6, 3278.8), (4606.1, 3432.8), (4457.9, 579.2), (1060.3, 809.1)),
+])
+def test_order_corners_handles_a_perspective_quad(bl, br, tr, tl):
+    import itertools
+
+    for shuffled in itertools.permutations([bl, br, tr, tl]):
+        assert [tuple(p) for p in order_corners(shuffled)] == [bl, br, tr, tl]
 
 
 def test_mark_ids_are_never_reused(processed):

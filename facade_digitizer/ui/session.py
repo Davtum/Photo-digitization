@@ -78,8 +78,13 @@ def order_corners(points) -> np.ndarray:
     верхний левый — при любом порядке кликов.
 
     Углы сортируются по направлению от центра четырёхугольника в координатах кадра
-    (ось y вниз): нижний левый лежит около 135°, нижний правый около 45°, верхний
-    правый около −45°, верхний левый около −135°. Порядок кликов оператору поэтому
+    (ось y вниз): нижний левый лежит в (90°, 180°), нижний правый — в (0°, 90°),
+    верхний правый — в (−90°, 0°), верхний левый — в (−180°, −90°). Отсчёт ведётся
+    от 180° — от направления влево, между верхним левым и нижним левым углами, где
+    угла выпуклого четырёхугольника без сильного крена не бывает. Первая версия
+    отсчитывала от 135° и на сильной перспективе ошибалась: нижний левый угол
+    косого фасада лежал на 145°, «перескакивал» в конец, и обход сдвигался на одну
+    позицию (найдено тестом окна задачи 10). Порядок кликов оператору поэтому
     безразличен, и расхождение обходов двух форматов ядра (`ElementMark` — от
     нижнего левого, ручная плоскость — от верхнего левого) до оператора не доходит.
     Предполагается снимок без крена больше 45° — кадр уже повёрнут по EXIF.
@@ -89,7 +94,7 @@ def order_corners(points) -> np.ndarray:
         raise ValueError(f"у проёма четыре угла, передано {pts.shape[0]}")
     cx, cy = pts.mean(axis=0)
     angles = np.degrees(np.arctan2(pts[:, 1] - cy, pts[:, 0] - cx))
-    return pts[np.argsort((135.0 - angles) % 360.0)]
+    return pts[np.argsort((180.0 - angles) % 360.0)]
 
 
 def _file_hash(path) -> str:
@@ -113,6 +118,8 @@ class OperatorSession:
         self.reference = ReferenceDraft()
         self.marks: list[MarkDraft] = []
         self._next_mark = 0
+        self.plane_points: list[ClickedPoint] = []      # углы ручной плоскости
+        self.roi_points: list[ClickedPoint] = []        # область оценки точек схода
         self.frame = None            # run.FrameStage
         self.scale = None            # run.ScaleStage
         self.model: FacadeModel | None = None
@@ -121,8 +128,9 @@ class OperatorSession:
     # --- снимок и профиль -------------------------------------------------------
 
     def has_clicks(self) -> bool:
-        return bool(self.reference.ends) or any(m.corners or m.reveal_points
-                                                for m in self.marks)
+        return (bool(self.reference.ends) or bool(self.plane_points)
+                or bool(self.roi_points)
+                or any(m.corners or m.reveal_points for m in self.marks))
 
     def open_image(self, path) -> None:
         """Новый снимок — новая сессия: клики по прежнему снимку к нему не относятся."""
@@ -146,6 +154,8 @@ class OperatorSession:
                 f"({clicks}): подтвердите сброс")
         self.reference = ReferenceDraft()
         self.marks = []
+        self.plane_points, self.roi_points = [], []
+        self.plane_override, self.roi = None, None
         self.frame = self.scale = self.model = None
         self.error = None
         self.profile_path = Path(path) if path is not None else None
@@ -154,6 +164,38 @@ class OperatorSession:
     def set_plane_override(self, override: ManualPlane | None, roi=None) -> None:
         self.plane_override, self.roi = override, roi
         self.frame = self.scale = self.model = None
+
+    # --- ручная плоскость и область оценки (задача 10) ----------------------------
+
+    def add_plane_point(self, point: ClickedPoint) -> None:
+        if len(self.plane_points) >= 4:
+            raise ValueError("у ручной плоскости четыре угла, все уже указаны")
+        self.plane_points.append(point)
+
+    def manual_plane(self, *, aspect_ratio=None, size_mm=None,
+                     assume_calibrated: bool = False) -> ManualPlane:
+        """Четыре указанных угла в порядке ядра (верхний левый, верхний правый, нижний
+        правый, нижний левый) — при любом порядке кликов — и одно доопределение."""
+        if len(self.plane_points) != 4:
+            raise ValueError(f"ручная плоскость: углов {len(self.plane_points)} из 4")
+        bl, br, tr, tl = order_corners([p.xy for p in self.plane_points])
+        return ManualPlane(image_pts=np.array([tl, tr, br, bl]), aspect_ratio=aspect_ratio,
+                           size_mm=size_mm, assume_calibrated=assume_calibrated)
+
+    def add_roi_point(self, point: ClickedPoint) -> None:
+        self.roi_points.append(point)
+
+    def roi_polygon(self) -> np.ndarray:
+        if len(self.roi_points) < 3:
+            raise ValueError(f"область оценки: точек {len(self.roi_points)}, нужно не менее 3")
+        return np.array([p.xy for p in self.roi_points])
+
+    def accept_frame(self, fs, *, plane_override=None, roi=None) -> None:
+        """Новая фаза кадра (в том числе с заменённой плоскостью): масштаб и модель,
+        посчитанные по прежней плоскости, недействительны."""
+        self.frame, self.plane_override, self.roi = fs, plane_override, roi
+        self.scale = self.model = None
+        self.error = None
 
     def compute_frame(self):
         """Фаза кадра (секунды): кадр, K, плоскость, резкость. Цветной — для показа."""

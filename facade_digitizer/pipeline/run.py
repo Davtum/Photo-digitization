@@ -31,6 +31,7 @@
 геометрическое ядро не получает (см. `UNAVAILABLE_SCALE_SOURCES`).
 """
 import argparse
+import dataclasses
 import math
 import sys
 from dataclasses import dataclass
@@ -705,20 +706,36 @@ def frame_stage(image_path, *, profile_path=None, with_color: bool = False,
     if operator_reference is not None:
         _points_in_frame(operator_reference, frame.size)
     camera_record = _camera_record(frame.meta, frame.K, frame.source, frame.dist)
+    plane = _plane_for(frame, plane_override, roi)
+    return FrameStage(path=path, frame=frame, camera_record=camera_record, plane=plane,
+                      sharpness=float(quality_gate.sharpness(frame.gray)))
+
+
+def _plane_for(frame: Frame, plane_override, roi):
+    """Плоскость кадра: ручная (мгновенно) либо по точкам схода (секунды)."""
     if plane_override is not None:
         if roi is not None:
             raise ValueError("область оценки точек схода (roi) к ручной плоскости не "
                              "применяется: точки схода при ней не оцениваются")
         _manual_points_in_frame(plane_override.image_pts, frame.size)
-        plane = estimate_plane_manual(
+        return estimate_plane_manual(
             plane_override.image_pts, aspect_ratio=plane_override.aspect_ratio,
             size_mm=plane_override.size_mm,
             assume_calibrated=plane_override.assume_calibrated,
             K=frame.K, image_size=frame.size)
-    else:
-        plane = estimate_plane(frame.gray, frame.K, roi=roi)
-    return FrameStage(path=path, frame=frame, camera_record=camera_record, plane=plane,
-                      sharpness=float(quality_gate.sharpness(frame.gray)))
+    return estimate_plane(frame.gray, frame.K, roi=roi)
+
+
+def replace_plane(fs: FrameStage, *, plane_override: ManualPlane | None = None,
+                  roi=None) -> FrameStage:
+    """Та же фаза кадра с другой плоскостью — без повторного чтения снимка и резкости.
+
+    Нужна интерфейсу оператора (план 3, задача 10): ручная плоскость считается
+    мгновенно, и перечитывать ради неё снимок и резкость (до 0.7 с на 20 Мп) незачем.
+    С `roi` точки схода оцениваются заново — это секунды, и вызывающий делает это в
+    фоне. Без обоих аргументов — снова автоматическая плоскость по всему кадру.
+    """
+    return dataclasses.replace(fs, plane=_plane_for(fs.frame, plane_override, roi))
 
 
 def _manual_points_in_frame(points, image_size) -> None:
