@@ -681,11 +681,11 @@ SIGMA_EDGE_PX = 1.0
 система координат — фасада. σ и происхождение — атрибутами (XDATA), чтобы не терялись в CAD.
 Доступно и из CLI (`--dxf`).
 
-- [ ] **Шаг 1: Падающие тесты** `tests/test_export_dxf.py`
+- [x] **Шаг 1: Падающие тесты** `tests/test_export_dxf.py`
   1. `test_dxf_reopens_and_contains_every_element` — чтение `ezdxf` обратно
   2. `test_dxf_coordinates_match_contour_mm`
   3. `test_dxf_keeps_sigma_as_xdata`
-- [ ] **Шаг 2–5:** падают → `pipeline/export_dxf.py` → проходят → коммит
+- [x] **Шаг 2–5:** падают → `pipeline/export_dxf.py` → проходят → коммит
 
 ---
 

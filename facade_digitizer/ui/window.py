@@ -116,7 +116,7 @@ class MainWindow(QMainWindow):
                 (menu, "Открыть снимок…", QKeySequence.Open, self._ask_open),
                 (menu, "Открыть сессию…", "Ctrl+Shift+O", self._ask_open_session),
                 (menu, "Сохранить сессию…", QKeySequence.Save, self._ask_save_session),
-                (menu, "Экспорт JSON…", "Ctrl+E", self._ask_export),
+                (menu, "Экспорт JSON и DXF…", "Ctrl+E", self._ask_export),
                 (view, "Масштаб 1:1", "Ctrl+1", self.canvas.one_to_one),
                 (view, "Вписать в окно", "Ctrl+0", self.canvas.fit_to_window)):
             action = QAction(text, self)
@@ -299,8 +299,9 @@ class MainWindow(QMainWindow):
             return None
         if self.session.model is not None:
             self.model_ready(self.session.model)
-        self.status_label.setText(f"Экспорт: {out.json_path}; команда CLI — "
-                                  f"{out.json_path.with_suffix('.command.txt').name}")
+        self.status_label.setText(
+            f"Экспорт: {out.json_path}, {out.dxf_path.name}; команда CLI — "
+            f"{out.json_path.with_suffix('.command.txt').name}")
         return out
 
     def _ask_save_session(self) -> None:

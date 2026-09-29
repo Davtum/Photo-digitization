@@ -150,6 +150,7 @@ class Exported:
     json_path: Path
     marks_path: Path | None
     cli_args: list[str]
+    dxf_path: Path | None = None
 
     @property
     def cli_line(self) -> str:
@@ -197,8 +198,10 @@ def cli_args(session: OperatorSession, sigma_of: SigmaOf, raster_mm_per_px: floa
     return args
 
 
-def export(session: OperatorSession, out_dir, sigma_of: SigmaOf) -> Exported:
-    """Выходной JSON, `marks.json` и строка CLI — из одного и того же состояния.
+def export(session: OperatorSession, out_dir, sigma_of: SigmaOf, *,
+           dxf: bool = True) -> Exported:
+    """Выходной JSON, `marks.json` и строка CLI — из одного и того же состояния;
+    с `dxf` — и чертёж (задача 18), и тогда строка CLI несёт `--dxf`.
 
     Разрешение растра берётся тем же автоподбором, каким его берёт окно
     (`run.auto_raster_mm_per_px`), и передаётся CLI явно: у CLI оно обязательно.
@@ -220,6 +223,13 @@ def export(session: OperatorSession, out_dir, sigma_of: SigmaOf) -> Exported:
     json_path = out_dir / f"{stem}.json"
     json_path.write_text(model.model_dump_json(indent=2), encoding="utf-8")
     args = cli_args(session, sigma_of, mm_per_px, out_dir, marks_path)
+    dxf_path = None
+    if dxf:
+        from facade_digitizer.pipeline.export_dxf import to_dxf
+
+        dxf_path = to_dxf(model, json_path.with_suffix(".dxf"))
+        args.insert(args.index("--out-dir"), "--dxf")
     (out_dir / f"{stem}.command.txt").write_text(
         shlex.join(["facade-digitize", *args]) + "\n", encoding="utf-8")
-    return Exported(json_path=json_path, marks_path=marks_path, cli_args=args)
+    return Exported(json_path=json_path, marks_path=marks_path, cli_args=args,
+                    dxf_path=dxf_path)

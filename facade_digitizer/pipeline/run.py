@@ -1170,6 +1170,9 @@ def _parse_args(argv):
                              "Растр — для просмотра оператором и работы с ним, а НЕ "
                              "носитель измерения: сама разметка — по исходному "
                              "снимку (спецификация, п. 6.5)")
+    parser.add_argument("--dxf", action="store_true",
+                        help="записать рядом с JSON чертёж <имя>.dxf: контуры в мм "
+                             "фасада, откосы на глубине, σ — атрибутами XDATA (п. 10)")
     parser.add_argument("--out-dir", default=None,
                         help="каталог для выходных JSON; по умолчанию рядом со снимком")
     manual = parser.add_argument_group(
@@ -1282,6 +1285,10 @@ def main(argv=None) -> int:
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / f"{source.stem}.json"
         out_path.write_text(model.model_dump_json(indent=2), encoding="utf-8")
+        if args.dxf:
+            from facade_digitizer.pipeline.export_dxf import to_dxf
+
+            to_dxf(model, out_path.with_suffix(".dxf"))
         verdict = model.images[0].quality.verdict if model.images[0].quality else "—"
         print(f"{source.name}: {out_path} ({verdict})")
     return 1 if failures else 0
