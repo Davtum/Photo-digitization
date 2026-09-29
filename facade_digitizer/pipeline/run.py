@@ -7,8 +7,9 @@
 только разметкой оператора (`marks`, задача 18), и тогда каждый элемент несёт
 `origin = "operator"`.
 
-`coverage` всегда `"partial"`: п. 7 связывает охват с тем, где лежит начало
-координат, а оно здесь всегда опорная точка оператора.
+`coverage` следует из начала координат (п. 7): `"full"`, когда оператор указал
+началом левый нижний угол фасада (`OperatorReference.origin_is_facade_corner`), и
+`"partial"`, когда начало — его произвольная точка (план 3, задача 11).
 
 **Двух «мм на пиксель» здесь действительно два, и смешивать их нельзя.**
 
@@ -248,6 +249,12 @@ class OperatorReference:
     span_mm: float
     sigma_px: float = DEFAULT_OPERATOR_SIGMA_PX
     end_sigma_px: tuple | None = None
+    #: Погрешность САМОЙ длины базы в мм — рулетки, дальномера (план 3, задача 11).
+    #: `None` — не передана: в σ масштаба входит только промах указания концов.
+    span_sigma_mm: float | None = None
+    #: Начало отсчёта — левый нижний угол фасада, а не произвольная точка (п. 7):
+    #: тогда `facade.origin = "bottom_left"` и `coverage = "full"`.
+    origin_is_facade_corner: bool = False
 
     @property
     def end_sigmas(self) -> tuple[float, float]:
@@ -353,7 +360,8 @@ def _points_in_frame(reference: "OperatorReference", image_size) -> None:
                 f"{w_px}x{h_px}: оператор указывает точки на снимке")
 
 
-def _scale_sigma_rel(span_mm: float, end_sigmas, end_gsds) -> float:
+def _scale_sigma_rel(span_mm: float, end_sigmas, end_gsds,
+                     span_sigma_mm: float | None = None) -> float:
     """σ масштаба из ДЛИНЫ ОПОРНОЙ БАЗЫ и измеренного разрешения при ней.
 
         sigma_rel = sqrt((σ1·g1)² + (σ2·g2)²) / span_mm
@@ -363,6 +371,11 @@ def _scale_sigma_rel(span_mm: float, end_sigmas, end_gsds) -> float:
     одна на оба конца и разрешение бралось среднеквадратичным по концам —
     `sqrt(2)·σ·g_ск`, что есть тот же ответ ровно при равных σ (план 3, задача 6:
     концы указываются при разном увеличении).
+
+    `span_sigma_mm` — погрешность самой измеренной длины (план 3, задача 11):
+    независима от промаха указания и складывается с ним квадратично. Прежде она не
+    учитывалась вовсе, и σ масштаба при рулетке с погрешностью 5 мм на базе 3 м
+    занижалась ровно на это слагаемое.
 
     Оговорка задачи 14 о том, что реальный оператор даст базу вдесятеро короче
     двадцатиметровой стороны фасада, перестаёт быть текстом в спецификации и
@@ -374,7 +387,13 @@ def _scale_sigma_rel(span_mm: float, end_sigmas, end_gsds) -> float:
         raise ValueError("опорная база и точность указания точки должны быть положительны: "
                          f"span_mm={span_mm}, sigma_px={sigmas}")
     gsds = [_finite("gsd_at_reference", g) for g in end_gsds]
-    return math.hypot(sigmas[0] * gsds[0], sigmas[1] * gsds[1]) / span_mm
+    click = math.hypot(sigmas[0] * gsds[0], sigmas[1] * gsds[1]) / span_mm
+    if span_sigma_mm is None:
+        return click
+    span_sigma_mm = _finite("operator_reference.span_sigma_mm", span_sigma_mm)
+    if span_sigma_mm < 0:
+        raise ValueError(f"погрешность длины базы не может быть отрицательной: {span_sigma_mm}")
+    return math.hypot(click, span_sigma_mm / span_mm)
 
 
 def _checked_scale_source(scale_source: str) -> str:
@@ -389,8 +408,29 @@ def _checked_scale_source(scale_source: str) -> str:
     return scale_source
 
 
+def _origin(reference: OperatorReference) -> str:
+    """Начало отсчёта (п. 7): угол фасада, если оператор его указал, иначе его точка."""
+    return "bottom_left" if reference.origin_is_facade_corner else "operator_reference"
+
+
+def _coverage(reference: OperatorReference) -> str:
+    """Охват (п. 7): полный — ровно когда начало в левом нижнем углу фасада.
+
+    П. 7 сопоставляет началу в опорной точке оператора частичный охват («если угол
+    не в кадре»), а началу в угле фасада — полный. Пара согласована: одно без
+    другого выпустить нельзя (план 3, задача 11).
+    """
+    return "full" if reference.origin_is_facade_corner else "partial"
+
+
+def _span_sigma(reference: OperatorReference, scale_source: str) -> float | None:
+    """Погрешность длины базы — в выход, только когда длина измерена (источник 1)."""
+    return reference.span_sigma_mm if scale_source == "operator_reference" else None
+
+
 def _scale_estimate(source: str, sigma_rel: float,
-                    meets_tolerance=None) -> ScaleEstimate:
+                    meets_tolerance: bool | None = None,
+                    span_sigma_mm: float | None = None) -> ScaleEstimate:
     """Оценка масштаба с происхождением. `meets_tolerance` — сравнение, а не константа.
 
     Сравнение одно на все источники, и таблица п. 6.3 воспроизводится им сама:
@@ -402,7 +442,10 @@ def _scale_estimate(source: str, sigma_rel: float,
     if meets_tolerance is None:
         meets_tolerance = sigma_rel <= SIGMA_REL_TOLERANCE
     return ScaleEstimate(source=source, sigma_rel=sigma_rel,
-                         meets_tolerance=bool(meets_tolerance))
+                         meets_tolerance=bool(meets_tolerance),
+                         span_sigma_mm=(None if span_sigma_mm is None
+                                        else _finite("facade.scale.span_sigma_mm",
+                                                     span_sigma_mm)))
 
 
 @dataclass(frozen=True)
@@ -596,21 +639,22 @@ def _needs_operator_model(path, image_id, meta, K, dist, source, plane, referenc
         homography=None,
     )
     sigma_rel = (_scale_sigma_rel(reference.span_mm, reference.end_sigmas,
-                                  (gsd_along_base, gsd_along_base))
+                                  (gsd_along_base, gsd_along_base), reference.span_sigma_mm)
                  if scale_source == "operator_reference"
                  else SIGMA_REL_ASSUMED_FLOOR_HEIGHT)
     return FacadeModel(
         software_version=SOFTWARE_VERSION,
-        coverage="partial",
+        coverage=_coverage(reference),
         mode="assisted",
         images=[record],
         facade=FacadeRecord(
-            origin="operator_reference",
+            origin=_origin(reference),
             # Габарит охваченной части фасада без гомографии не определён. Пустой
             # список — отсутствие; четыре нуля были бы правдоподобным габаритом.
             bounds_mm=[],
             mm_per_rectified_px=_finite("facade.mm_per_rectified_px", raster_mm_per_px),
-            scale=_scale_estimate(scale_source, sigma_rel, meets_tolerance=False),
+            scale=_scale_estimate(scale_source, sigma_rel, meets_tolerance=False,
+                                  span_sigma_mm=_span_sigma(reference, scale_source)),
             # Не измеряется по той же причине, что и на основном пути (см. там):
             # это отклонение точек фасада от плоскости, а точек в пространстве
             # у ядра нет.
@@ -795,7 +839,8 @@ def scale_stage(fs: FrameStage, operator_reference: OperatorReference, *,
         end_gsds = [_finite("gsd_at_reference", _gsd_at(fields.gsd, image_size, point))
                     for point in operator_reference.span_px]
         sigma_rel = _scale_sigma_rel(operator_reference.span_mm,
-                                     operator_reference.end_sigmas, end_gsds)
+                                     operator_reference.end_sigmas, end_gsds,
+                                     operator_reference.span_sigma_mm)
     else:
         sigma_rel = SIGMA_REL_ASSUMED_FLOOR_HEIGHT
 
@@ -966,14 +1011,15 @@ def elements_stage(fs: FrameStage, ss: ScaleStage, geometry: RasterGeometry,
     )
     return FacadeModel(
         software_version=SOFTWARE_VERSION,
-        coverage="partial",
+        coverage=_coverage(ss.reference),
         mode="assisted",
         images=[record],
         facade=FacadeRecord(
-            origin="operator_reference",
+            origin=_origin(ss.reference),
             bounds_mm=ss.bounds_mm,
             mm_per_rectified_px=_finite("facade.mm_per_rectified_px", geometry.mm_per_px),
-            scale=_scale_estimate(ss.scale_source, ss.sigma_rel),
+            scale=_scale_estimate(ss.scale_source, ss.sigma_rel,
+                                  span_sigma_mm=_span_sigma(ss.reference, ss.scale_source)),
             plane_residual_mm=None,
         ),
         elements=elements,
@@ -1026,12 +1072,11 @@ def process(image_path, *, operator_reference: OperatorReference,
     ветвления (а не отказа по снимку и не отказа от слова «шлюз») обоснован в
     `GATE_REJECT_WITHHOLDS_TOLERANCE`.
 
-    **`coverage` здесь всегда `"partial"`, и это следствие п. 7.** Начало
-    координат — опорная точка оператора (`facade.origin = "operator_reference"`),
-    а п. 7 сопоставляет ей ровно частичный охват; полному охвату соответствует
-    начало в левом нижнем углу фасада, которого конвейер не знает. Пара
-    согласована, и разметка элементов её не меняет: разметив границу фасада,
-    оператор не переносит начало отсчёта в её нижний левый угол.
+    **`coverage` следует из начала координат (п. 7).** Начало в левом нижнем углу
+    фасада (`OperatorReference.origin_is_facade_corner`) даёт `facade.origin =
+    "bottom_left"` и `coverage = "full"`, начало в произвольной точке оператора —
+    `"operator_reference"` и `"partial"`. Пара согласована и выпускается только
+    вместе (план 3, задача 11).
 
     `save_rectified_to` — путь для выровненного растра (`--save-rectified` CLI).
     Сохраняется ТОТ ЖЕ объект `Rectified`, что и породил `homography.H` этой же

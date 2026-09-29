@@ -16,6 +16,7 @@ from facade_digitizer.ui.canvas import FrameCanvas
 from facade_digitizer.ui.panels import SidePanel
 from facade_digitizer.ui.session import ClickedPoint, OperatorSession
 from facade_digitizer.ui.worker import run_in_background
+from facade_digitizer.ui.zoom import RECOMMENDED_MIN_SCALE, click_sigma, sigma_image_px
 
 TITLE = "Оцифровка фасада"
 IMAGE_FILTER = "Снимки (*.jpg *.jpeg *.png *.tif *.tiff);;Все файлы (*)"
@@ -25,6 +26,7 @@ MODES = {
     "navigate": "Навигация",
     "plane": "Углы ручной плоскости",
     "roi": "Область оценки точек схода",
+    "base": "Концы опорной базы",
 }
 
 
@@ -90,6 +92,9 @@ class MainWindow(QMainWindow):
         plane.pickRoi.connect(lambda: self.set_mode("roi"))
         plane.applyRoi.connect(self.apply_roi)
         plane.resetAuto.connect(self.reset_plane)
+        base = self.side.base
+        base.pickEnds.connect(lambda: self.set_mode("base"))
+        base.apply.connect(self.apply_base)
 
     def set_mode(self, mode: str) -> None:
         if mode not in MODES:
@@ -103,6 +108,9 @@ class MainWindow(QMainWindow):
         if mode == "roi":
             self.session.roi_points.clear()
             self.canvas.clear_overlay("roi")
+        if mode == "base":
+            self.session.clear_reference()
+            self._draw_base()
 
     def handle_click(self, x: float, y: float, view_scale: float) -> None:
         """Клик по кадру (координаты конвейера) — в сессию по текущему режиму."""
@@ -115,6 +123,13 @@ class MainWindow(QMainWindow):
                 self.session.add_roi_point(point)
                 self.canvas.set_overlay("roi", [p.xy for p in self.session.roi_points],
                                         closed=True, color="#1e88e5")
+            elif self.mode == "base":
+                if len(self.session.reference.ends) == 2:
+                    self.session.clear_reference()
+                self.session.add_reference_end(point)
+                self._draw_base()
+                if len(self.session.reference.ends) == 2:
+                    self.set_mode_keep("navigate")
         except ValueError as error:
             self.status_label.setText(str(error))
 
@@ -236,6 +251,53 @@ class MainWindow(QMainWindow):
         self.canvas.clear_overlays("roi")
         self._run(lambda: run.replace_plane(fs), self._frame_ready,
                   "точки схода оцениваются по всему кадру…")
+
+    def set_mode_keep(self, mode: str) -> None:
+        """Сменить режим, НЕ сбрасывая сделанного в прежнем (в отличие от `set_mode`)."""
+        self.mode = mode
+        self.mode_actions[mode].setChecked(True)
+        self.mode_label.setText(f"Режим: {MODES[mode]}")
+
+    # --- опорная база (задача 11) --------------------------------------------------
+
+    def _draw_base(self) -> None:
+        ends = self.session.reference.ends
+        self.canvas.set_overlay("base", [p.xy for p in ends], color="#43a047")
+        lines = [f"Концов указано: {len(ends)} из 2"]
+        for i, p in enumerate(ends, 1):
+            note = (f" — масштаб {self._scale_name(p.view_scale)} грубее 1:1; при "
+                    f"{self._scale_name(RECOMMENDED_MIN_SCALE)} было бы "
+                    f"{sigma_image_px(RECOMMENDED_MIN_SCALE):.2f} px"
+                    if p.view_scale < 1.0 else "")
+            lines.append(f"конец {i}: σ клика {click_sigma(p):.2f} px{note}")
+        self.side.base.ends_label.setText("\n".join(lines))
+
+    @staticmethod
+    def _scale_name(scale: float) -> str:
+        return f"{scale:g}:1" if scale >= 1 else f"1:{1 / scale:.3g}"
+
+    def apply_base(self) -> None:
+        """Масштаб — миллисекунды: плоскость не переоценивается (фаза масштаба)."""
+        v = self.side.base.values()
+        self.session.set_span_mm(v["span_mm"] if v["span_mm"] > 0 else None)
+        self.session.set_base_options(span_sigma_mm=v["span_sigma_mm"],
+                                      scale_source=v["scale_source"],
+                                      origin_is_facade_corner=v["origin_is_facade_corner"])
+        ss = self.session.compute_scale(click_sigma)
+        if ss is None:
+            self.side.base.result.setText(f"Масштаб не вычислен: {self.session.error}")
+            return
+        origin = ("левый нижний угол фасада (охват полный)"
+                  if v["origin_is_facade_corner"] else "точка оператора (охват частичный)")
+        tol = "достигает" if ss.sigma_rel <= run.SIGMA_REL_TOLERANCE else "НЕ достигает"
+        self.side.base.result.setText(
+            f"σ масштаба {ss.sigma_rel:.3%} — {tol} допуска п. 6.3; "
+            f"на базе {v['span_mm']:.0f} мм это {ss.sigma_rel * v['span_mm']:.1f} мм. "
+            f"Начало отсчёта — {origin}. Более длинная база даёт меньшую σ.")
+        self.scale_ready(ss)
+
+    def scale_ready(self, ss) -> None:
+        """Точка расширения для задач 12–15: масштаб посчитан."""
 
     def _show_scale(self, *_):
         self.scale_label.setText(self.canvas.scale_text())

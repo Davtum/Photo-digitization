@@ -58,6 +58,10 @@ class ReferenceDraft:
     ends: list[ClickedPoint] = field(default_factory=list)
     span_mm: float | None = None
     scale_source: str = "operator_reference"
+    #: Погрешность самой длины (рулетка, дальномер), мм; `None` — не задана.
+    span_sigma_mm: float | None = None
+    #: Первый конец базы — левый нижний угол фасада (п. 7: начало `bottom_left`).
+    origin_is_facade_corner: bool = False
 
 
 @dataclass
@@ -221,19 +225,34 @@ class OperatorSession:
         self.scale = self.model = None
 
     def clear_reference(self) -> None:
-        self.reference = ReferenceDraft(scale_source=self.reference.scale_source)
+        self.reference = ReferenceDraft(scale_source=self.reference.scale_source,
+                                        span_sigma_mm=self.reference.span_sigma_mm,
+                                        origin_is_facade_corner=
+                                        self.reference.origin_is_facade_corner)
         self.scale = self.model = None
 
     def set_span_mm(self, value: float | None) -> None:
         self.reference.span_mm = value
         self.scale = self.model = None
 
+    def set_base_options(self, *, span_sigma_mm: float | None, scale_source: str,
+                         origin_is_facade_corner: bool) -> None:
+        """Все три значения задаются явно: `span_sigma_mm = None` — погрешность длины
+        не задана (а не «оставить прежнюю»)."""
+        self.reference.span_sigma_mm = span_sigma_mm
+        self.reference.scale_source = scale_source
+        self.reference.origin_is_facade_corner = bool(origin_is_facade_corner)
+        self.scale = self.model = None
+
     def operator_reference(self, sigma_of: SigmaOf) -> run.OperatorReference:
         a, b = self.reference.ends
+        r = self.reference
         return run.OperatorReference(origin_px=a.xy, span_px=(a.xy, b.xy),
-                                     span_mm=float(self.reference.span_mm),
+                                     span_mm=float(r.span_mm),
                                      sigma_px=max(sigma_of(a), sigma_of(b)),
-                                     end_sigma_px=(sigma_of(a), sigma_of(b)))
+                                     end_sigma_px=(sigma_of(a), sigma_of(b)),
+                                     span_sigma_mm=r.span_sigma_mm,
+                                     origin_is_facade_corner=r.origin_is_facade_corner)
 
     def compute_scale(self, sigma_of: SigmaOf):
         """Фаза масштаба (миллисекунды). Оценку плоскости не повторяет."""

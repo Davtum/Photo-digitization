@@ -5,6 +5,8 @@
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QButtonGroup,
+    QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
     QFormLayout,
     QGroupBox,
@@ -125,12 +127,83 @@ class PlanePanel(QGroupBox):
             self.height_mm.setValue(values["size_mm"][1])
 
 
+class BasePanel(QGroupBox):
+    """Опорная база и начало отсчёта. План 3, задача 11; спецификация, п. 6.3 и п. 7.
+
+    σ масштаба показывается СРАЗУ после ввода: фаза масштаба — миллисекунды, и
+    оператор видит, что короткая база даёт худший масштаб, до разметки проёмов.
+    """
+
+    pickEnds = Signal()
+    apply = Signal()
+
+    SOURCES = (("operator_reference", "Длина измерена (рулетка, дальномер)"),
+               ("assumed_floor_height", "Типовая высота этажа (допуск не достигается)"))
+
+    def __init__(self, parent=None):
+        super().__init__("Опорная база", parent)
+        self.pick_ends = QPushButton("Указать два конца базы…")
+        self.pick_ends.setToolTip("Две точки в плоскости стены по острой кромке, как можно "
+                                  "дальше друг от друга: ошибка масштаба общая для всех "
+                                  "проёмов.")
+        self.ends_label = QLabel("Концов указано: 0 из 2")
+        self.ends_label.setWordWrap(True)
+        self.span_mm = _spin(0.0, 0.0, 1e6, 1, " мм")
+        self.span_sigma_mm = _spin(0.0, 0.0, 1e4, 1, " мм")
+        self.span_sigma_mm.setSpecialValueText("не задана")
+        self.span_sigma_mm.setToolTip("Погрешность самой измеренной длины: рулетка, "
+                                      "дальномер. 0 — не задана.")
+        self.source = QComboBox()
+        for key, text in self.SOURCES:
+            self.source.addItem(text, key)
+        self.corner_origin = QCheckBox("Первый конец — левый нижний угол фасада")
+        self.corner_origin.setToolTip("Спецификация, п. 7: тогда начало координат — угол "
+                                      "фасада и охват полный; иначе — точка оператора.")
+        self.apply_button = QPushButton("Применить масштаб")
+        self.result = QLabel("Масштаб не задан")
+        self.result.setWordWrap(True)
+
+        form = QFormLayout()
+        form.addRow("Длина базы", self.span_mm)
+        form.addRow("Погрешность длины", self.span_sigma_mm)
+        form.addRow("Происхождение", self.source)
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.pick_ends)
+        layout.addWidget(self.ends_label)
+        layout.addLayout(form)
+        layout.addWidget(self.corner_origin)
+        layout.addWidget(self.apply_button)
+        layout.addWidget(self.result)
+        self.pick_ends.clicked.connect(self.pickEnds)
+        self.apply_button.clicked.connect(self.apply)
+
+    def values(self) -> dict:
+        sigma = float(self.span_sigma_mm.value())
+        return {"span_mm": float(self.span_mm.value()),
+                "span_sigma_mm": sigma if sigma > 0 else None,
+                "scale_source": self.source.currentData(),
+                "origin_is_facade_corner": self.corner_origin.isChecked()}
+
+    def set_values(self, *, span_mm=None, span_sigma_mm=None, scale_source=None,
+                   origin_is_facade_corner=None) -> None:
+        if span_mm is not None:
+            self.span_mm.setValue(span_mm)
+        if span_sigma_mm is not None:
+            self.span_sigma_mm.setValue(span_sigma_mm)
+        if scale_source is not None:
+            self.source.setCurrentIndex(self.source.findData(scale_source))
+        if origin_is_facade_corner is not None:
+            self.corner_origin.setChecked(origin_is_facade_corner)
+
+
 class SidePanel(QWidget):
     """Правая колонка окна: панели сверху вниз в порядке работы оператора."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.plane = PlanePanel(self)
+        self.base = BasePanel(self)
         self.layout_ = QVBoxLayout(self)
         self.layout_.addWidget(self.plane)
+        self.layout_.addWidget(self.base)
         self.layout_.addStretch(1)
