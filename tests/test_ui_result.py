@@ -82,7 +82,8 @@ def test_no_value_without_sigma_or_named_reason(qapp, scenes):
         text = panel.cell(0, column)
         assert "±" in text, (column, text)
     position = panel.cell(0, "положение X / Y, мм")
-    assert re.search(r"\d", position) and "задача 21" in position
+    assert re.search(r"\d+ / -?\d+ ± \d", position), position
+    assert "соседа нет" in position          # один элемент — взаимного положения нет
     w.close()
 
 

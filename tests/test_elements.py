@@ -178,6 +178,36 @@ def _expected_size_sigma(size_mm, theta_deg, gsd_local, *, sigma_px, sigma_rel,
     )
 
 
+def _expected_assembled_sigma(model, element, reference, gsd_local, *, residual_mm,
+                              focal_rel, flatness_mm=WALL_FLATNESS_DEVIATION_MM,
+                              distortion_mm=RESIDUAL_DISTORTION_MM):
+    """σ габарита, какой её сводит `pipeline.assemble`, — из ЗАПИСАННОГО в файл.
+
+    Гомография `homography.H` ведёт кадр в пиксели растра, `mm_per_rectified_px` —
+    миллиметры на пиксель растра: цепочка та же, что у `assemble`, но входы взяты
+    из выходного файла. Разойдись геометрия, ушедшая в σ, с записанной — σ
+    разошлась бы здесь.
+    """
+    from facade_digitizer.pipeline.assemble import Inputs, propagate
+
+    record = model.images[0]
+    inp = Inputs(H=np.asarray(record.homography["H"], dtype=float),
+                 mm_per_unit=model.facade.mm_per_rectified_px,
+                 origin_px=tuple(reference.origin_px),
+                 origin_sigma_px=reference.end_sigmas[0],
+                 scale_sigma_rel=model.facade.scale.sigma_rel,
+                 corners_px=(np.asarray(element.contour_px[0]["points"], dtype=float),),
+                 corner_sigma_px=(element.contour_px[0]["sigma_px"],))
+    cov = propagate(inp).cov(0, 0)
+    theta = math.radians(element.theta.full_deg)
+    out = []
+    for k, size in enumerate((element.size_mm.width, element.size_mm.height)):
+        out.append(math.hypot(math.sqrt(cov[k, k]), residual_mm, distortion_mm,
+                              focal_rel * size * math.sin(theta) ** 2,
+                              flatness_mm * math.tan(theta)))
+    return out
+
+
 def _gsd_field_of(H, mm_per_unit):
     return local_gsd_field(H, mm_per_unit, SIZE, shape=FIELD_SHAPE).gsd
 
@@ -1275,14 +1305,20 @@ def test_process_feeds_elements_the_geometry_and_the_numbers_it_records(tmp_path
     gsd_local = _gsd_near(field, SIZE, corners_px, label="check")
     focal_rel = 0.0 if record.camera.calibration == "target" else FOCAL_RELATIVE_ERROR
 
-    for size, sigma in ((element.size_mm.width, element.size_mm.sigma_width),
-                        (element.size_mm.height, element.size_mm.sigma_height)):
-        expected = _expected_size_sigma(
+    residual_mm = record.rectification.residual_px * gsd_local
+    expected = _expected_assembled_sigma(model, element, reference, gsd_local,
+                                         residual_mm=residual_mm, focal_rel=focal_rel)
+    for (size, sigma), assembled in zip(
+            ((element.size_mm.width, element.size_mm.sigma_width),
+             (element.size_mm.height, element.size_mm.sigma_height)), expected, strict=True):
+        assert sigma == pytest.approx(assembled, rel=1e-6)
+        # Замкнутый бюджет п. 6.1 остаётся проверкой сверху: он консервативен в √2
+        # по локализации (задача 21 плана 3) и берёт худший узел поля.
+        closed = _expected_size_sigma(
             size, element.theta.full_deg, gsd_local, sigma_px=mark_sigma_px,
-            sigma_rel=model.facade.scale.sigma_rel,
-            residual_mm=record.rectification.residual_px * gsd_local,
+            sigma_rel=model.facade.scale.sigma_rel, residual_mm=residual_mm,
             focal_rel=focal_rel)
-        assert sigma == pytest.approx(expected, rel=1e-9)
+        assert sigma <= closed * 1.05
 
 
 def test_the_quality_gate_acts_on_its_own_verdict(tmp_path, monkeypatch):
@@ -1480,12 +1516,9 @@ def test_process_does_not_let_an_unmeasured_residual_reach_the_budget(monkeypatc
                             shape=FIELD_SHAPE).gsd
     gsd_local = _gsd_near(field, SIZE, corners_px, label="check")
     calibration = model.images[0].camera.calibration
-    assert sigma == pytest.approx(_expected_size_sigma(
-        model.elements[0].size_mm.width, model.elements[0].theta.full_deg, gsd_local,
-        sigma_px=DEFAULT_MARK_SIGMA_PX, sigma_rel=model.facade.scale.sigma_rel,
-        residual_mm=RESIDUAL_REFERENCE_MM,
-        focal_rel=0.0 if calibration == "target" else FOCAL_RELATIVE_ERROR),
-        rel=1e-9)
+    assert sigma == pytest.approx(_expected_assembled_sigma(
+        model, model.elements[0], reference, gsd_local, residual_mm=RESIDUAL_REFERENCE_MM,
+        focal_rel=0.0 if calibration == "target" else FOCAL_RELATIVE_ERROR)[0], rel=1e-6)
 
 
 def test_marks_are_refused_when_the_plane_was_not_recovered(tmp_path):

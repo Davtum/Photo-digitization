@@ -51,6 +51,7 @@ from facade_digitizer.geometry.homography import (
     rectified_to_facade_mm,
 )
 from facade_digitizer.pipeline import quality as quality_gate
+from facade_digitizer.pipeline.assemble import assemble
 from facade_digitizer.pipeline.elements import (
     WALL_FLATNESS_DEVIATION_MM,
     ElementMark,
@@ -965,6 +966,20 @@ def elements_stage(fs: FrameStage, ss: ScaleStage, geometry: RasterGeometry,
             residual_px=_finite_or_none(plane.confidence.residual_px),
             calibration=fs.camera_record.calibration, image_id=image_id,
             wall_flatness_mm=wall_flatness_mm)
+        # Итоговые σ — в одном месте (п. 4.4, план 3, задача 21): замкнутый бюджет
+        # `elements` складывает общую ошибку масштаба как независимую и не отличает
+        # абсолютное положение от взаимного.
+        reference = ss.reference
+        origin_sigma = (reference.end_sigmas[0]
+                        if tuple(reference.origin_px) == tuple(reference.span_px[0])
+                        else reference.sigma_px)
+        elements = assemble(
+            elements, H=plane.H, mm_per_unit=ss.mm_per_unit,
+            origin_px=reference.origin_px, origin_sigma_px=origin_sigma,
+            scale_sigma_rel=ss.sigma_rel, gsd_field=ss.fields.gsd,
+            image_size=fs.image_size,
+            residual_px=_finite_or_none(plane.confidence.residual_px),
+            calibration=fs.camera_record.calibration, wall_flatness_mm=wall_flatness_mm)
 
     # Шлюз качества ветвится на собственный вердикт. Обоснование выбора из трёх
     # возможных ветвлений — в `GATE_REJECT_WITHHOLDS_TOLERANCE`. Причина

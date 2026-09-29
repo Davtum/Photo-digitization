@@ -147,12 +147,12 @@ def test_cli_marks_json_carries_sigma_and_id(scene, tmp_path):
 
 
 def test_new_fields_of_later_tasks_are_null_until_filled(scene):
-    """Поля поздних задач плана существуют и пусты — не выдуманы."""
+    """Поля поздних задач плана существуют; пусты, пока их нечем заполнить."""
     _sc, _path, _ref, corners, fs, ss, geometry = scene
     model = run.elements_stage(fs, ss, geometry, [_mark(corners)])
     element = model.elements[0]
-    assert element.position_sigma_mm is None             # задача 21
-    assert element.relative_position_sigma_mm is None    # задача 21
+    assert element.position_sigma_mm > 0                 # задача 21: сводит assemble
+    assert element.relative_position_sigma_mm is None    # один элемент — соседа нет
     assert element.operator is None                      # задача 22
     assert model.facade.scale.span_sigma_mm is None      # задача 11
 

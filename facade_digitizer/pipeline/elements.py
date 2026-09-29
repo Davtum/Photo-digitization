@@ -527,12 +527,28 @@ def _size_sigma_mm(size_mm: float, theta_deg: float, gsd_local: float, sigma_px:
     корреляции RSS даёт НИЖНЮЮ оценку σ. Строгий бюджет потребовал бы ковариационной
     матрицы позы (та же оговорка, что в п. 6.2).
     """
-    theta_rad = math.radians(theta_deg)
     localisation = math.sqrt(2.0) * sigma_px * gsd_local
     scale = size_mm * sigma_rel
-    focal = focal_rel * size_mm * math.sin(theta_rad) ** 2
+    return math.hypot(localisation, scale,
+                      *size_model_terms_mm(size_mm, theta_deg, residual_mm,
+                                           wall_flatness_mm, distortion_mm, focal_rel))
+
+
+def size_model_terms_mm(length_mm: float, theta_deg: float, residual_mm: float,
+                        wall_flatness_mm: float, distortion_mm: float,
+                        focal_rel: float) -> tuple[float, float, float, float]:
+    """Слагаемые п. 6.1, которые НЕ следуют из кликов и базы, — допущения модели.
+
+    Невязка, остаточная дисторсия, ошибка фокусного (`focal_rel · L · sin²θ`) и
+    неплоскостность стены (`flatness · tg θ`). Их не распространить якобианом:
+    входа, чьё возмущение их порождает, в конвейере нет. Поэтому и замкнутый
+    бюджет (`_size_sigma_mm`), и сведение погрешностей (`pipeline.assemble`) берут
+    их отсюда — одной функцией, а не двумя копиями формул.
+    """
+    theta_rad = math.radians(theta_deg)
+    focal = focal_rel * length_mm * math.sin(theta_rad) ** 2
     flatness = wall_flatness_mm * math.tan(theta_rad)
-    return math.hypot(localisation, scale, residual_mm, distortion_mm, focal, flatness)
+    return (residual_mm, distortion_mm, focal, flatness)
 
 
 def _element_id(class_name: str, index: int) -> str:

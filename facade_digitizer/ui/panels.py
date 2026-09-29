@@ -334,9 +334,11 @@ class MarksPanel(QGroupBox):
         self.list.blockSignals(False)
 
 
-#: Почему у элемента нет σ положения: положение сводится с общей ошибкой масштаба
-#: в одном месте (`assemble`, п. 4.4), и до задачи 21 плана 3 оно не считается.
-POSITION_SIGMA_PENDING = "σ не рассчитывается до сведения погрешностей (задача 21)"
+#: Почему у элемента нет σ положения: она сводится с общей ошибкой масштаба в одном
+#: месте (`pipeline.assemble`, п. 4.4), и у модели, собранной в обход него, её нет.
+POSITION_SIGMA_PENDING = "σ не сведена (pipeline.assemble)"
+#: Одинокий элемент: взаимного положения без соседа нет.
+NO_NEIGHBOUR_TEXT = "соседа нет"
 
 #: Происхождение глубины по схеме → слова для оператора.
 RECESS_ORIGIN_TEXT = {
@@ -375,7 +377,7 @@ class ResultPanel(QGroupBox):
     """Миллиметры с погрешностью. План 3, задача 15.
 
     Правило панели: величины без σ не бывает. Где σ ещё не считается (положение —
-    до задачи 21), ячейка называет причину, а не пустует.
+    вне `assemble`), ячейка называет причину, а не пустует.
     """
 
     COLUMNS = ("id", "ширина, мм", "высота, мм", "положение X / Y, мм", "заглубление, мм",
@@ -405,12 +407,16 @@ class ResultPanel(QGroupBox):
         self.table.setRowCount(len(model.elements))
         for row, e in enumerate(model.elements):
             s = e.size_mm
-            xs = [p[0] for p in e.contour_mm]
-            ys = [p[1] for p in e.contour_mm]
+            # Положение — нижний левый угол контура: именно для него `assemble`
+            # сводит σ абсолютного и взаимного положения.
+            x, y = e.contour_mm[0]
             if e.position_sigma_mm is not None:
-                position = (f"{min(xs):.0f} / {min(ys):.0f} ± {e.position_sigma_mm:.1f}")
+                neighbour = (f"соседи ± {e.relative_position_sigma_mm:.1f}"
+                             if e.relative_position_sigma_mm is not None
+                             else NO_NEIGHBOUR_TEXT)
+                position = f"{x:.0f} / {y:.0f} ± {e.position_sigma_mm:.1f}; {neighbour}"
             else:
-                position = f"{min(xs):.0f} / {min(ys):.0f}; {POSITION_SIGMA_PENDING}"
+                position = f"{x:.0f} / {y:.0f}; {POSITION_SIGMA_PENDING}"
             if e.recess is None:
                 recess = "грань откоса не размечена"
             elif e.recess.value_mm is not None and e.recess.sigma_mm is not None:
