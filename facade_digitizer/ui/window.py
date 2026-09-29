@@ -9,7 +9,7 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction, QActionGroup, QKeySequence
-from PySide6.QtWidgets import QDockWidget, QFileDialog, QLabel, QMainWindow
+from PySide6.QtWidgets import QDockWidget, QFileDialog, QLabel, QMainWindow, QScrollArea
 
 from facade_digitizer.pipeline import quality as quality_gate
 from facade_digitizer.pipeline import run
@@ -17,7 +17,12 @@ from facade_digitizer.ui.canvas import FrameCanvas
 from facade_digitizer.ui.panels import SidePanel
 from facade_digitizer.ui.session import ClickedPoint, OperatorSession
 from facade_digitizer.ui.worker import run_in_background
-from facade_digitizer.ui.zoom import RECOMMENDED_MIN_SCALE, click_sigma, sigma_image_px
+from facade_digitizer.ui.zoom import (
+    RECOMMENDED_MIN_SCALE,
+    click_sigma,
+    localisation_cost_mm,
+    sigma_image_px,
+)
 
 TITLE = "Оцифровка фасада"
 IMAGE_FILTER = "Снимки (*.jpg *.jpeg *.png *.tif *.tiff);;Все файлы (*)"
@@ -28,6 +33,8 @@ MODES = {
     "plane": "Углы ручной плоскости",
     "roi": "Область оценки точек схода",
     "base": "Концы опорной базы",
+    "opening": "Углы проёма",
+    "reveal": "Внутренняя кромка откоса",
 }
 
 
@@ -42,8 +49,15 @@ class MainWindow(QMainWindow):
         self.view, self.scene = self.canvas, self.canvas.scene()
 
         self.side = SidePanel(self)
+        # Прокрутка, а не сжатие: колонка выше экрана ноутбука (около 1180 px), и без
+        # прокрутки на 1366×768 Qt ужимал бы поля ввода до нечитаемых.
+        scroll = QScrollArea(self)
+        scroll.setWidget(self.side)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setMinimumWidth(self.side.sizeHint().width() + 24)
         dock = QDockWidget("Оператор", self)
-        dock.setWidget(self.side)
+        dock.setWidget(scroll)
         dock.setFeatures(QDockWidget.NoDockWidgetFeatures)
         self.addDockWidget(Qt.RightDockWidgetArea, dock)
 
@@ -56,6 +70,7 @@ class MainWindow(QMainWindow):
         self.canvas.scaleChanged.connect(self._show_scale)
         self.canvas.pointClicked.connect(self.handle_click)
         self._job = None
+        self.current_mark: str | None = None
         self.mode = "navigate"
         self._build_actions()
         self._connect_panels()
@@ -96,6 +111,13 @@ class MainWindow(QMainWindow):
         base = self.side.base
         base.pickEnds.connect(lambda: self.set_mode("base"))
         base.apply.connect(self.apply_base)
+        marks = self.side.marks
+        marks.newMark.connect(self.new_mark)
+        marks.pickReveal.connect(self.pick_reveal)
+        marks.undo.connect(self.undo_point)
+        marks.delete.connect(self.delete_mark)
+        marks.selected.connect(self.select_mark)
+        marks.compute.connect(self.compute)
 
     def set_mode(self, mode: str) -> None:
         if mode not in MODES:
@@ -116,6 +138,9 @@ class MainWindow(QMainWindow):
     def handle_click(self, x: float, y: float, view_scale: float) -> None:
         """Клик по кадру (координаты конвейера) — в сессию по текущему режиму."""
         point = ClickedPoint(x, y, view_scale)
+        if self.mode in ("opening", "reveal") and self.current_mark is None:
+            self.status_label.setText("Сначала создайте проём: «Новый проём» на панели.")
+            return
         try:
             if self.mode == "plane":
                 self.session.add_plane_point(point)
@@ -124,6 +149,21 @@ class MainWindow(QMainWindow):
                 self.session.add_roi_point(point)
                 self.canvas.set_overlay("roi", [p.xy for p in self.session.roi_points],
                                         closed=True, color="#1e88e5")
+            elif self.mode == "opening":
+                mark = self.session.mark(self.current_mark)
+                self.session.add_corner(mark, point)
+                self._warn_scale(point)
+                self._draw_marks()
+                if len(mark.corners) == 4:
+                    self.set_mode_keep("navigate")
+                    self._suggest_reveal(mark)
+            elif self.mode == "reveal":
+                mark = self.session.mark(self.current_mark)
+                self.session.add_reveal_point(mark, self.side.marks.side.currentData(), point)
+                self._warn_scale(point)
+                self._draw_marks()
+                if len(mark.reveal_points) == 2:
+                    self.set_mode_keep("navigate")
             elif self.mode == "base":
                 if len(self.session.reference.ends) == 2:
                     self.session.clear_reference()
@@ -301,6 +341,94 @@ class MainWindow(QMainWindow):
             f"на базе {v['span_mm']:.0f} мм это {ss.sigma_rel * v['span_mm']:.1f} мм. "
             f"Начало отсчёта — {origin}. Более длинная база даёт меньшую σ.")
         self.scale_ready(ss)
+
+    # --- разметка проёмов (задача 13) ---------------------------------------------
+
+    def new_mark(self) -> None:
+        attrs = self.side.marks.attributes()
+        mark = self.session.new_mark(attrs["class_"])
+        mark.mounting, mark.edge_type = attrs["mounting"], attrs["edge_type"]
+        self.current_mark = mark.id
+        self.set_mode_keep("opening")
+        self._draw_marks()
+        self.side.marks.warning.setText(
+            f"{mark.id}: укажите четыре угла, порядок не важен. Рекомендуемое увеличение "
+            f"у углов — не менее {RECOMMENDED_MIN_SCALE:g}:1.")
+
+    def select_mark(self, mark_id: str) -> None:
+        self.current_mark = mark_id
+        self._draw_marks()
+
+    def pick_reveal(self) -> None:
+        if self.current_mark is None:
+            self.side.marks.warning.setText("Сначала выберите или создайте проём.")
+            return
+        self.session.mark(self.current_mark).reveal_points.clear()
+        self.set_mode_keep("reveal")
+        self._draw_marks()
+
+    def undo_point(self) -> None:
+        if self.current_mark is not None:
+            self.session.undo_last_point(self.session.mark(self.current_mark))
+            self._draw_marks()
+
+    def delete_mark(self) -> None:
+        if self.current_mark is not None:
+            self.session.delete_mark(self.current_mark)
+            self.current_mark = self.session.marks[-1].id if self.session.marks else None
+            self._draw_marks()
+
+    def _suggest_reveal(self, mark) -> None:
+        sides = self.session.suggested_reveal_sides(mark)
+        label = self.side.marks.suggestion
+        if sides is None:
+            label.setText("Видимую грань откоса подскажет поза камеры — задайте опорную базу.")
+            return
+        vertical, horizontal = sides
+        names = dict(self.side.marks.SIDES)
+        label.setText(f"Камере видны грани: {names[vertical]} и {names[horizontal]}. "
+                      "Ближние закрыты собственной стеной — их не размечают (п. 5.5).")
+        box = self.side.marks.side
+        box.setCurrentIndex(box.findData(vertical))
+
+    def _warn_scale(self, point) -> None:
+        """Цена масштаба клика — числом (σ в px и слагаемое бюджета в мм)."""
+        label = self.side.marks.warning
+        sigma = click_sigma(point)
+        gsd = self.session.local_gsd(point)
+        cost = (f", слагаемое бюджета {localisation_cost_mm(point.view_scale, gsd):.1f} мм "
+                f"при разрешении {gsd:.1f} мм/px" if gsd is not None else "")
+        if point.view_scale < RECOMMENDED_MIN_SCALE:
+            best = sigma_image_px(RECOMMENDED_MIN_SCALE)
+            label.setText(f"Масштаб {self._scale_name(point.view_scale)} грубее "
+                          f"рекомендованного {RECOMMENDED_MIN_SCALE:g}:1: σ клика "
+                          f"{sigma:.2f} px вместо {best:.2f}{cost}.")
+        else:
+            label.setText(f"σ клика {sigma:.2f} px{cost}.")
+
+    def _draw_marks(self) -> None:
+        self.canvas.clear_overlays("mark:")
+        for m in self.session.marks:
+            color = "#ff7043" if m.id == self.current_mark else "#8e24aa"
+            self.canvas.set_overlay(f"mark:{m.id}", [p.xy for p in m.corners],
+                                    closed=len(m.corners) == 4, color=color)
+            if m.reveal_points:
+                self.canvas.set_overlay(f"mark:{m.id}:reveal",
+                                        [p.xy for p in m.reveal_points], color="#00acc1")
+        self.side.marks.set_marks(self.session.marks, self.current_mark)
+
+    def compute(self):
+        """Модель фасада по текущей разметке — через фазу элементов, без переоценки."""
+        model = self.session.compute_elements(click_sigma)
+        if model is None:
+            self.status_label.setText(f"Не посчитано: {self.session.error}")
+            return None
+        self.model_ready(model)
+        return model
+
+    def model_ready(self, model) -> None:
+        """Точка расширения для задачи 15: модель посчитана."""
+        self.status_label.setText(f"Посчитано элементов: {len(model.elements)}")
 
     def scale_ready(self, ss) -> None:
         """Масштаб посчитан: окончательный вердикт — задача 12."""

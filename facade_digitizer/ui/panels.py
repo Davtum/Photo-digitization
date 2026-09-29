@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QListWidget,
     QPushButton,
     QRadioButton,
     QVBoxLayout,
@@ -239,16 +240,114 @@ class QualityPanel(QGroupBox):
                               "меняет его и признак допуска у всех элементов.")
 
 
+class MarksPanel(QGroupBox):
+    """Разметка проёмов и граней откоса. План 3, задача 13.
+
+    Класс, способ установки и тип кромки выбираются из значений схемы, а не
+    вводятся текстом: `mounting` — обязательное поле `ElementMark`, и от него вместе
+    с типом кромки зависит, вправе ли элемент нести признак допуска (п. 5.3, 5.6).
+    """
+
+    newMark = Signal()
+    pickReveal = Signal()
+    undo = Signal()
+    delete = Signal()
+    selected = Signal(str)
+    compute = Signal()
+
+    CLASSES = (("window", "окно"), ("door", "дверь"))
+    MOUNTINGS = (("embedded", "заглублён в проём"), ("flush", "заподлицо"),
+                 ("protruding", "выступает"))
+    EDGES = (("sharp_wall_edge", "острая кромка стены"), ("surround", "обрамление"),
+             ("cladding_edge", "кромка облицовки"), ("unknown", "не известно"))
+    SIDES = (("left", "левая"), ("right", "правая"), ("top", "верхняя"),
+             ("bottom", "нижняя"))
+
+    def __init__(self, parent=None):
+        super().__init__("Проёмы", parent)
+        self.class_ = QComboBox()
+        self.mounting = QComboBox()
+        self.edge = QComboBox()
+        for box, items in ((self.class_, self.CLASSES), (self.mounting, self.MOUNTINGS),
+                           (self.edge, self.EDGES)):
+            for key, text in items:
+                box.addItem(text, key)
+        self.new_mark = QPushButton("Новый проём: указать четыре угла…")
+        self.list = QListWidget()
+        self.list.setMaximumHeight(110)
+        self.side = QComboBox()
+        for key, text in self.SIDES:
+            self.side.addItem(text, key)
+        self.pick_reveal = QPushButton("Указать внутреннюю кромку откоса…")
+        self.suggestion = QLabel("")
+        self.warning = QLabel("")
+        for label in (self.suggestion, self.warning):
+            label.setWordWrap(True)
+        self.undo_button = QPushButton("Отменить точку")
+        self.delete_button = QPushButton("Удалить проём")
+        self.compute_button = QPushButton("Посчитать")
+
+        form = QFormLayout()
+        form.addRow("Класс", self.class_)
+        form.addRow("Установка", self.mounting)
+        form.addRow("Кромка", self.edge)
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(self.new_mark)
+        layout.addWidget(self.list)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Грань откоса"))
+        row.addWidget(self.side)
+        layout.addLayout(row)
+        layout.addWidget(self.pick_reveal)
+        layout.addWidget(self.suggestion)
+        layout.addWidget(self.warning)
+        row2 = QHBoxLayout()
+        row2.addWidget(self.undo_button)
+        row2.addWidget(self.delete_button)
+        layout.addLayout(row2)
+        layout.addWidget(self.compute_button)
+
+        self.new_mark.clicked.connect(self.newMark)
+        self.pick_reveal.clicked.connect(self.pickReveal)
+        self.undo_button.clicked.connect(self.undo)
+        self.delete_button.clicked.connect(self.delete)
+        self.compute_button.clicked.connect(self.compute)
+        self.list.currentTextChanged.connect(
+            lambda text: self.selected.emit(text.split(" ")[0]) if text else None)
+
+    def attributes(self) -> dict:
+        return {"class_": self.class_.currentData(), "mounting": self.mounting.currentData(),
+                "edge_type": self.edge.currentData()}
+
+    def set_marks(self, marks, current: str | None) -> None:
+        self.list.blockSignals(True)
+        self.list.clear()
+        for m in marks:
+            reveal = f", откос {m.reveal_side} {len(m.reveal_points)}/2" if m.reveal_side else ""
+            self.list.addItem(f"{m.id} ({len(m.corners)}/4{reveal})")
+        ids = [m.id for m in marks]
+        if current in ids:
+            self.list.setCurrentRow(ids.index(current))
+        self.list.blockSignals(False)
+
+
 class SidePanel(QWidget):
-    """Правая колонка окна: панели сверху вниз в порядке работы оператора."""
+    """Правая колонка окна: панели сверху вниз в порядке работы оператора.
+
+    Колонка выше типового экрана ноутбука, поэтому окно кладёт её в прокрутку
+    (`MainWindow`): без прокрутки на экране 1366×768 Qt ужимал бы поля ввода.
+    """
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.plane = PlanePanel(self)
         self.base = BasePanel(self)
         self.quality = QualityPanel(self)
+        self.marks = MarksPanel(self)
         self.layout_ = QVBoxLayout(self)
         self.layout_.addWidget(self.plane)
         self.layout_.addWidget(self.quality)
         self.layout_.addWidget(self.base)
+        self.layout_.addWidget(self.marks)
         self.layout_.addStretch(1)

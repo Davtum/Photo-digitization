@@ -309,6 +309,44 @@ class OperatorSession:
         mark.reveal_points.append(point)
         self.model = None
 
+    def undo_last_point(self, mark: MarkDraft) -> None:
+        """Отменить последнюю точку разметки: сперва кромки откоса, затем углов."""
+        if mark.reveal_points:
+            mark.reveal_points.pop()
+            if not mark.reveal_points:
+                mark.reveal_side = None
+        elif mark.corners:
+            mark.corners.pop()
+        self.model = None
+
+    def suggested_reveal_sides(self, mark: MarkDraft) -> tuple[str, str] | None:
+        """Какие грани откоса этого проёма видны камере (п. 5.5) — по позе.
+
+        Ближняя к опорной точке камеры грань закрыта собственной стеной, и разметить
+        её нельзя. Ответ даёт ядро (`parallax.visible_reveal_side`) по контуру в
+        миллиметрах фасада и позе; до масштаба позы нет — `None`.
+        """
+        if self.scale is None or len(mark.corners) != 4:
+            return None
+        from facade_digitizer.geometry.homography import (
+            apply_homography,
+            rectified_to_facade_mm,
+        )
+        from facade_digitizer.geometry.parallax import visible_reveal_side
+
+        rect = apply_homography(self.frame.plane.H, [c.xy for c in mark.corners])
+        mm = rectified_to_facade_mm(rect, self.scale.origin_rect, self.scale.mm_per_unit)
+        return visible_reveal_side(self.scale.camera, float(mm[:, 0].min()),
+                                   float(mm[:, 0].max()), float(mm[:, 1].min()),
+                                   float(mm[:, 1].max()))
+
+    def local_gsd(self, point: ClickedPoint) -> float | None:
+        """Локальное разрешение (мм/px) у точки — по полю фазы масштаба; до масштаба —
+        `None`: разрешение без длины базы не определено."""
+        if self.scale is None:
+            return None
+        return float(run._gsd_at(self.scale.fields.gsd, self.frame.image_size, point.xy))
+
     def element_marks(self, sigma_of: SigmaOf) -> list[ElementMark]:
         """Черновики → `ElementMark` через ЕГО проверку, а не свою.
 
