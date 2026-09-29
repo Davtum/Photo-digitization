@@ -70,6 +70,9 @@ class MainWindow(QMainWindow):
         self.splitter.addWidget(self.canvas)
         self.splitter.addWidget(right)
         self.splitter.setSizes([700, 500])
+        # Кадр — рабочее поле оператора: при растяжении окна он получает больше места.
+        self.splitter.setStretchFactor(0, 3)
+        self.splitter.setStretchFactor(1, 2)
         self.setCentralWidget(self.splitter)
         self.rect_view.frameTarget.connect(self.center_frame_on)
         self._raster_job = None

@@ -1,0 +1,16 @@
+# Интерфейс оператора в браузере: docker compose up --build → http://localhost:6080
+services:
+  facade-ui:
+    build: .
+    image: facade-digitizer-ui
+    ports:
+      # Только с этого компьютера: у VNC нет пароля.
+      - "127.0.0.1:6080:6080"
+    volumes:
+      # Снимки кладутся сюда, экспорт JSON/DXF и сессии появляются здесь же.
+      - ./data:/data
+    environment:
+      RESOLUTION: "1600x950x24"      # размер экрана в браузере
+      DEMO: "0"                      # 1 — при запуске показать автоматический сценарий
+      OPERATOR: ""                   # метка оператора op-xxxxxxxx (необязательно)
+    shm_size: "512m"

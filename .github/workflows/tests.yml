@@ -33,3 +33,26 @@ jobs:
         run: python -m ruff check facade_digitizer tests scripts
       - name: pytest
         run: python -m pytest -q
+
+  docker:
+    # Образ интерфейса в браузере (docs/docker.md) собирается и запускается:
+    # noVNC отвечает, окно программы поднялось.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Сборка образа
+        run: docker build -t facade-digitizer-ui .
+      - name: Запуск и проверка
+        run: |
+          mkdir data && sudo chown 1000:1000 data
+          docker run -d --name ui -p 127.0.0.1:6080:6080 -v "$PWD/data:/data" facade-digitizer-ui
+          for i in $(seq 1 90); do
+            curl -sf http://127.0.0.1:6080/vnc.html >/dev/null && docker logs ui 2>&1 | grep -q "откройте" && break
+            sleep 2
+          done
+          docker logs ui
+          curl -sf http://127.0.0.1:6080/vnc.html >/dev/null
+          sleep 5
+          docker exec ui pgrep -f facade-digitize-ui
+          test -f data/примеры/01_фасад.jpg
