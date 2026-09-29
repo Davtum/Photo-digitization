@@ -27,9 +27,19 @@ class _Runnable(QRunnable):
         try:
             result = self.fn()
         except Exception as error:  # noqa: BLE001 — доходит до окна текстом
-            self.signals.failed.emit(str(error))
+            self._emit(self.signals.failed, str(error))
         else:
-            self.signals.done.emit(result)
+            self._emit(self.signals.done, result)
+
+    @staticmethod
+    def _emit(signal, value) -> None:
+        # Окно могло быть закрыто, пока шёл расчёт (растр — до 4 с): тогда объект
+        # сигналов уже удалён, и доставлять результат некому. Прежде это печатало
+        # трассировку из фонового потока («Signal source has been deleted»).
+        try:
+            signal.emit(value)
+        except RuntimeError:
+            pass
 
 
 #: Задачи, результат которых ещё не доставлен. Модуль держит на них ссылку сам:

@@ -15,6 +15,8 @@ from PySide6.QtWidgets import (
     QListWidget,
     QPushButton,
     QRadioButton,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -332,6 +334,103 @@ class MarksPanel(QGroupBox):
         self.list.blockSignals(False)
 
 
+#: Почему у элемента нет σ положения: положение сводится с общей ошибкой масштаба
+#: в одном месте (`assemble`, п. 4.4), и до задачи 21 плана 3 оно не считается.
+POSITION_SIGMA_PENDING = "σ не рассчитывается до сведения погрешностей (задача 21)"
+
+#: Происхождение глубины по схеме → слова для оператора.
+RECESS_ORIGIN_TEXT = {
+    "unavailable": ("не измерена: грань откоса не видна камере, размечена не та сторона, "
+                    "угол визирования на грань ниже порога либо кромка вне плоскости стены"),
+    "assumed_class_default": "принята типовой для класса — не измерение",
+    "operator": "введена оператором — не измерение",
+}
+
+CALIBRATION_TEXT = {
+    "target": "калибровка по мишени — условие п. 2.2 выполнено",
+    "exif": "K из EXIF — условие п. 2.2 «камера откалибрована» не выполнено",
+    "database": "K из таблицы моделей — условие п. 2.2 «камера откалибрована» не выполнено",
+}
+
+
+def tolerance_text(element, verdict: str) -> str:
+    """Признак соответствия допуску — словами, и при `null` — С ПРИЧИНОЙ.
+
+    `null` значит «утверждать нечем», а пустая ячейка выдала бы отсутствие
+    утверждения за его отсутствие в интерфейсе, а не в измерении.
+    """
+    if element.meets_tolerance is True:
+        return "соответствует допуску п. 2.2"
+    if element.meets_tolerance is False:
+        return "не соответствует: σ габарита больше допуска 10 мм"
+    if element.edge_reference != "wall_plane":
+        return ("не выпущено: кромка вне плоскости стены или не известна "
+                "(п. 5.3, 5.6), вынос не измерен")
+    if verdict == "reject":
+        return "не выпущено: кадр отбракован по разрешению (п. 2.2)"
+    return "не выпущено"
+
+
+class ResultPanel(QGroupBox):
+    """Миллиметры с погрешностью. План 3, задача 15.
+
+    Правило панели: величины без σ не бывает. Где σ ещё не считается (положение —
+    до задачи 21), ячейка называет причину, а не пустует.
+    """
+
+    COLUMNS = ("id", "ширина, мм", "высота, мм", "положение X / Y, мм", "заглубление, мм",
+               "θ", "допуск")
+
+    def __init__(self, parent=None):
+        super().__init__("Результат", parent)
+        self.header = QLabel("Не посчитано")
+        self.header.setWordWrap(True)
+        self.table = QTableWidget(0, len(self.COLUMNS))
+        self.table.setHorizontalHeaderLabels(self.COLUMNS)
+        self.table.setMinimumHeight(140)
+        self.table.verticalHeader().setVisible(False)
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.header)
+        layout.addWidget(self.table)
+
+    def show_model(self, model) -> None:
+        image = model.images[0]
+        verdict = image.quality.verdict
+        origin = ("от левого нижнего угла фасада" if model.facade.origin == "bottom_left"
+                  else "от точки оператора (первый конец базы), не от угла здания")
+        self.header.setText(
+            f"Координаты — {origin}. Камера: "
+            f"{CALIBRATION_TEXT.get(image.camera.calibration, image.camera.calibration)}. "
+            f"Вердикт качества «{verdict}» зависит от введённой длины опорной базы.")
+        self.table.setRowCount(len(model.elements))
+        for row, e in enumerate(model.elements):
+            s = e.size_mm
+            xs = [p[0] for p in e.contour_mm]
+            ys = [p[1] for p in e.contour_mm]
+            if e.position_sigma_mm is not None:
+                position = (f"{min(xs):.0f} / {min(ys):.0f} ± {e.position_sigma_mm:.1f}")
+            else:
+                position = f"{min(xs):.0f} / {min(ys):.0f}; {POSITION_SIGMA_PENDING}"
+            if e.recess is None:
+                recess = "грань откоса не размечена"
+            elif e.recess.value_mm is not None and e.recess.sigma_mm is not None:
+                recess = f"{e.recess.value_mm:.1f} ± {e.recess.sigma_mm:.1f}"
+            else:
+                recess = RECESS_ORIGIN_TEXT.get(e.recess.origin, e.recess.origin)
+            theta = f"{e.theta.full_deg:.1f}°" if e.theta is not None else "—"
+            cells = (e.id, f"{s.width:.1f} ± {s.sigma_width:.1f}",
+                     f"{s.height:.1f} ± {s.sigma_height:.1f}", position, recess, theta,
+                     tolerance_text(e, verdict))
+            for col, text in enumerate(cells):
+                item = QTableWidgetItem(text)
+                item.setToolTip(text)
+                self.table.setItem(row, col, item)
+        self.table.resizeColumnsToContents()
+
+    def cell(self, row: int, column: str) -> str:
+        return self.table.item(row, self.COLUMNS.index(column)).text()
+
+
 class SidePanel(QWidget):
     """Правая колонка окна: панели сверху вниз в порядке работы оператора.
 
@@ -345,9 +444,11 @@ class SidePanel(QWidget):
         self.base = BasePanel(self)
         self.quality = QualityPanel(self)
         self.marks = MarksPanel(self)
+        self.result = ResultPanel(self)
         self.layout_ = QVBoxLayout(self)
         self.layout_.addWidget(self.plane)
         self.layout_.addWidget(self.quality)
         self.layout_.addWidget(self.base)
         self.layout_.addWidget(self.marks)
+        self.layout_.addWidget(self.result)
         self.layout_.addStretch(1)

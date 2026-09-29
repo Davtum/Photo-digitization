@@ -463,7 +463,8 @@ class MainWindow(QMainWindow):
         return model
 
     def model_ready(self, model) -> None:
-        """Точка расширения для задачи 15: модель посчитана."""
+        """Модель посчитана: панель результата (задача 15)."""
+        self.side.result.show_model(model)
         self.status_label.setText(f"Посчитано элементов: {len(model.elements)}")
 
     def scale_ready(self, ss) -> None:
@@ -496,6 +497,13 @@ class MainWindow(QMainWindow):
 
     def center_frame_on(self, x: float, y: float) -> None:
         self.canvas.centerOn(x + 0.5, y + 0.5)
+
+    def closeEvent(self, event):
+        """Закрытие окна отменяет фоновые задачи: их результат доставлять некуда."""
+        for job in (self._job, self._raster_job):
+            if job is not None:
+                job.cancel()
+        super().closeEvent(event)
 
     def _show_scale(self, *_):
         self.scale_label.setText(self.canvas.scale_text())
