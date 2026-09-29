@@ -9,12 +9,22 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction, QActionGroup, QKeySequence
-from PySide6.QtWidgets import QDockWidget, QFileDialog, QLabel, QMainWindow, QScrollArea
+from PySide6.QtWidgets import (
+    QDockWidget,
+    QFileDialog,
+    QLabel,
+    QMainWindow,
+    QScrollArea,
+    QSplitter,
+    QVBoxLayout,
+    QWidget,
+)
 
 from facade_digitizer.pipeline import quality as quality_gate
 from facade_digitizer.pipeline import run
 from facade_digitizer.ui.canvas import FrameCanvas
 from facade_digitizer.ui.panels import SidePanel
+from facade_digitizer.ui.rectified import RectifiedView
 from facade_digitizer.ui.session import ClickedPoint, OperatorSession
 from facade_digitizer.ui.worker import run_in_background
 from facade_digitizer.ui.zoom import (
@@ -44,7 +54,23 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(TITLE)
         self.session = OperatorSession()
         self.canvas = FrameCanvas(self)
-        self.setCentralWidget(self.canvas)
+        # Выровненный вид — рядом с кадром (задача 14): только просмотр и навигация.
+        self.rect_view = RectifiedView(self)
+        self.rect_label = QLabel("Выровненный вид появится после опорной базы")
+        self.rect_label.setWordWrap(True)
+        right = QWidget(self)
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.addWidget(self.rect_label)
+        right_layout.addWidget(self.rect_view, 1)
+        self.splitter = QSplitter(Qt.Horizontal, self)
+        self.splitter.addWidget(self.canvas)
+        self.splitter.addWidget(right)
+        self.splitter.setSizes([700, 500])
+        self.setCentralWidget(self.splitter)
+        self.rect_view.frameTarget.connect(self.center_frame_on)
+        self._raster_job = None
+        self.rectified = None
         # Прежние имена каркаса задачи 1.
         self.view, self.scene = self.canvas, self.canvas.scene()
 
@@ -201,6 +227,12 @@ class MainWindow(QMainWindow):
         self.canvas.scene().clear()
         self.canvas.frame_item = self.canvas.usable_item = None
         self.canvas.overlays = {}
+        if self._raster_job is not None:
+            self._raster_job.cancel()
+        self.rect_view.scene().clear()
+        self.rect_view.to_raster = self.rect_view.H = None
+        self.rectified = None
+        self.rect_label.setText("Выровненный вид появится после опорной базы")
         self.side.plane.set_frame_loaded(False)
         session = self.session
         self._run(lambda: run.frame_stage(session.image_path,
@@ -416,6 +448,10 @@ class MainWindow(QMainWindow):
                 self.canvas.set_overlay(f"mark:{m.id}:reveal",
                                         [p.xy for p in m.reveal_points], color="#00acc1")
         self.side.marks.set_marks(self.session.marks, self.current_mark)
+        self.rect_view.set_polygons({
+            m.id: ([p.xy for p in m.corners], len(m.corners) == 4,
+                   "#ff7043" if m.id == self.current_mark else "#8e24aa")
+            for m in self.session.marks})
 
     def compute(self):
         """Модель фасада по текущей разметке — через фазу элементов, без переоценки."""
@@ -431,8 +467,35 @@ class MainWindow(QMainWindow):
         self.status_label.setText(f"Посчитано элементов: {len(model.elements)}")
 
     def scale_ready(self, ss) -> None:
-        """Масштаб посчитан: окончательный вердикт — задача 12."""
+        """Масштаб посчитан: окончательный вердикт (задача 12), растр (задача 14)."""
         self.side.quality.show_final(ss.quality.verdict, ss.quality.reasons)
+        self._start_raster(ss)
+
+    # --- выровненный вид (задача 14) ------------------------------------------------
+
+    def _start_raster(self, ss) -> None:
+        """Пиксели растра — в фоне (до 4 с на наибольшем разрешении); геометрия та же,
+        что уйдёт в выходной файл (`run.raster_geometry_for`)."""
+        fs = self.session.frame
+        if self._raster_job is not None:
+            self._raster_job.cancel()
+        self.rect_label.setText("Выровненный вид строится…")
+        self._raster_job = run_in_background(
+            lambda: run.raster_stage(fs, run.raster_geometry_for(fs, ss), color=True),
+            on_done=self._raster_ready,
+            on_error=lambda m: self.rect_label.setText(f"Выровненный вид не построен: {m}"))
+
+    def _raster_ready(self, rectified) -> None:
+        self.rectified = rectified
+        self.rect_view.set_raster(rectified)
+        self.rect_label.setText(
+            f"Выровненный вид, {rectified.mm_per_px:.1f} мм/px; охват растра "
+            f"{self.rect_view.coverage:.0%} (штриховка — вне снимка). Только для просмотра: "
+            "клик центрирует кадр, измерение — в кадре (п. 6.5).")
+        self._draw_marks()
+
+    def center_frame_on(self, x: float, y: float) -> None:
+        self.canvas.centerOn(x + 0.5, y + 0.5)
 
     def _show_scale(self, *_):
         self.scale_label.setText(self.canvas.scale_text())
