@@ -121,6 +121,11 @@ class MainWindow(QMainWindow):
                 (menu, "Профиль калибровки…", "Ctrl+K", self._ask_profile),
                 (menu, "Снять профиль калибровки", "", self._ask_clear_profile),
                 (view, "Масштаб 1:1", "Ctrl+1", self.canvas.one_to_one),
+                # Фиксированные масштабы — для работы у углов (2:1–4:1) и для
+                # протокола замера σ клика (задача 25): масштаб задаётся точно.
+                (view, "Масштаб 2:1", "Ctrl+2", lambda: self.canvas.set_view_scale(2.0)),
+                (view, "Масштаб 4:1", "Ctrl+4", lambda: self.canvas.set_view_scale(4.0)),
+                (view, "Масштаб 1:2", "Ctrl+5", lambda: self.canvas.set_view_scale(0.5)),
                 (view, "Вписать в окно", "Ctrl+0", self.canvas.fit_to_window)):
             action = QAction(text, self)
             action.setShortcut(keys)

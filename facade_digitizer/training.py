@@ -99,10 +99,12 @@ def make_block(block: int, seed: int = 0) -> list[SceneSpec]:
     return specs
 
 
-def render(spec: SceneSpec, seed: int = 0) -> np.ndarray:
+def render(spec: SceneSpec, seed: int = 0, *, blur_sigma_px: float = BLUR_SIGMA_PX,
+           noise_sigma: float = NOISE_SIGMA) -> np.ndarray:
     img = spec.scene().render().astype(np.float32)
-    img = cv2.GaussianBlur(img, (0, 0), BLUR_SIGMA_PX)
-    img += np.random.default_rng(seed).normal(0.0, NOISE_SIGMA, img.shape)
+    if blur_sigma_px > 0:
+        img = cv2.GaussianBlur(img, (0, 0), blur_sigma_px)
+    img += np.random.default_rng(seed).normal(0.0, noise_sigma, img.shape)
     return np.clip(img, 0, 255).astype(np.uint8)
 
 
@@ -187,17 +189,19 @@ def converged(stats: list[BlockStats]) -> tuple[bool, str]:
     return ok_t and ok_e, why
 
 
-def write_block(out_dir, block: int, seed: int = 0) -> list[Path]:
+def write_block(out_dir, block: int, seed: int = 0, *,
+                blur_sigma_px: float = BLUR_SIGMA_PX, prefix: str = "блок") -> list[Path]:
     """Снимки и `истина.json` блока — для оператора и для оценки."""
     from facade_digitizer.pipeline.io import save_image
 
-    out = Path(out_dir) / f"блок{block:02d}"
+    out = Path(out_dir) / f"{prefix}{block:02d}"
     out.mkdir(parents=True, exist_ok=True)
     specs = make_block(block, seed)
     paths = []
     for i, spec in enumerate(specs):
         path = out / f"{spec.name}.png"
-        save_image(path, render(spec, seed=seed * 1000 + block * 10 + i))
+        save_image(path, render(spec, seed=seed * 1000 + block * 10 + i,
+                                blur_sigma_px=blur_sigma_px))
         paths.append(path)
     (out / "истина.json").write_text(
         json.dumps([truth_record(s) for s in specs], ensure_ascii=False, indent=2),
