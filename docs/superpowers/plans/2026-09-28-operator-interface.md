@@ -662,13 +662,13 @@ SIGMA_EDGE_PX = 1.0
   команды CLI. Пути приводятся `resolve()` (`images[].path` записывается как задан, и
   относительный путь в CLI против абсолютного из диалога давал бы разный JSON).
 
-- [ ] **Шаг 1: Падающие тесты**
+- [x] **Шаг 1: Падающие тесты**
   1. `test_session_round_trip_preserves_clicks_scales_and_plane`
   2. `test_session_with_other_image_or_profile_is_refused_by_name`
   3. `test_export_is_a_valid_schema_1_2_model`
   4. `test_export_and_cli_produce_the_same_json` — CLI получает экспортированные `marks.json` и
      строку; теперь выполнимо, потому что σ и id едут в `marks.json` (задача 6)
-- [ ] **Шаг 2–5:** падают → реализация → проходят → коммит
+- [x] **Шаг 2–5:** падают → реализация → проходят → коммит
 
 ---
 

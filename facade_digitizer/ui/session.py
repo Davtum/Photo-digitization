@@ -128,6 +128,8 @@ class OperatorSession:
         self.scale = None            # run.ScaleStage
         self.model: FacadeModel | None = None
         self.error: str | None = None
+        #: Хронометраж работы оператора (заполняется задачей 22), хранится в сессии.
+        self.timing: dict = {}
 
     # --- снимок и профиль -------------------------------------------------------
 
@@ -138,7 +140,9 @@ class OperatorSession:
 
     def open_image(self, path) -> None:
         """Новый снимок — новая сессия: клики по прежнему снимку к нему не относятся."""
-        path = Path(path)
+        # `resolve()`: путь уходит в `images[].path` выхода, и относительный путь
+        # против абсолютного дал бы разный файл при той же разметке (задача 17).
+        path = Path(path).resolve()
         self.__init__()
         self.image_path = path
         self.image_hash = _file_hash(path)
@@ -162,7 +166,7 @@ class OperatorSession:
         self.plane_override, self.roi = None, None
         self.frame = self.scale = self.model = None
         self.error = None
-        self.profile_path = Path(path) if path is not None else None
+        self.profile_path = Path(path).resolve() if path is not None else None
         self.profile_hash = _file_hash(path) if path is not None else None
 
     def set_plane_override(self, override: ManualPlane | None, roi=None) -> None:

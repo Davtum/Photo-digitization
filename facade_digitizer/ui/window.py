@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 
 from facade_digitizer.pipeline import quality as quality_gate
 from facade_digitizer.pipeline import run
+from facade_digitizer.ui import session_file
 from facade_digitizer.ui.canvas import FrameCanvas
 from facade_digitizer.ui.panels import SidePanel
 from facade_digitizer.ui.rectified import RectifiedView
@@ -36,6 +37,7 @@ from facade_digitizer.ui.zoom import (
 
 TITLE = "Оцифровка фасада"
 IMAGE_FILTER = "Снимки (*.jpg *.jpeg *.png *.tif *.tiff);;Все файлы (*)"
+SESSION_FILTER = "Сессия оператора (*.session.json);;Все файлы (*)"
 
 #: Режимы инструмента: что значит клик по холсту.
 MODES = {
@@ -112,6 +114,9 @@ class MainWindow(QMainWindow):
         view = self.menuBar().addMenu("Вид")
         for parent, text, keys, slot in (
                 (menu, "Открыть снимок…", QKeySequence.Open, self._ask_open),
+                (menu, "Открыть сессию…", "Ctrl+Shift+O", self._ask_open_session),
+                (menu, "Сохранить сессию…", QKeySequence.Save, self._ask_save_session),
+                (menu, "Экспорт JSON…", "Ctrl+E", self._ask_export),
                 (view, "Масштаб 1:1", "Ctrl+1", self.canvas.one_to_one),
                 (view, "Вписать в окно", "Ctrl+0", self.canvas.fit_to_window)):
             action = QAction(text, self)
@@ -221,12 +226,20 @@ class MainWindow(QMainWindow):
         self.status_label.setText(message)
         self._job = run_in_background(fn, on_done=on_done, on_error=self._frame_failed)
 
-    def open_image(self, path) -> None:
-        """Открыть снимок: фаза кадра (секунды) — в фоне, прежняя задача отменяется."""
+    def open_image(self, path, *, restore: OperatorSession | None = None) -> None:
+        """Открыть снимок: фаза кадра (секунды) — в фоне, прежняя задача отменяется.
+
+        `restore` — сессия из файла (задача 17): кадр считается с её плоскостью и
+        областью оценки, а после него восстанавливаются база и разметка.
+        """
         path = Path(path)
         if self._job is not None:
             self._job.cancel()
-        self.session.open_image(path)
+        if restore is not None:
+            self.session = restore
+        else:
+            self.session.open_image(path)
+        self.current_mark = None
         self.canvas.scene().clear()
         self.canvas.frame_item = self.canvas.usable_item = None
         self.canvas.overlays = {}
@@ -238,11 +251,79 @@ class MainWindow(QMainWindow):
         self.rect_label.setText("Выровненный вид появится после опорной базы")
         self.side.plane.set_frame_loaded(False)
         session = self.session
+        plane, roi = session.plane_override, session.roi
+
+        def done(fs):
+            self._frame_ready(fs, plane_override=plane, roi=roi)
+            if restore is not None:
+                self._restored()
+
         self._run(lambda: run.frame_stage(session.image_path,
                                           profile_path=session.profile_path,
-                                          with_color=True),
-                  self._frame_ready,
-                  f"{path.name}: обрабатывается — кадр, калибровка, плоскость…")
+                                          with_color=True, plane_override=plane, roi=roi),
+                  done, f"{path.name}: обрабатывается — кадр, калибровка, плоскость…")
+
+    # --- сессия и экспорт (задача 17) ---------------------------------------------
+
+    def save_session(self, path) -> Path:
+        return session_file.save_session(self.session, path)
+
+    def open_session(self, path) -> None:
+        """Сессия из файла; чужой снимок или профиль — отказ с именем файла."""
+        try:
+            restored = session_file.load_session(path)
+        except (ValueError, FileNotFoundError, KeyError) as error:
+            self.status_label.setText(f"Сессия не открыта: {error}")
+            return
+        self.open_image(restored.image_path, restore=restored)
+
+    def _restored(self) -> None:
+        r = self.session.reference
+        self.side.base.set_values(span_mm=r.span_mm, span_sigma_mm=r.span_sigma_mm or 0.0,
+                                  scale_source=r.scale_source,
+                                  origin_is_facade_corner=r.origin_is_facade_corner)
+        self._draw_plane_points()
+        self._draw_base()
+        self.current_mark = self.session.marks[-1].id if self.session.marks else None
+        self._draw_marks()
+        if len(r.ends) == 2 and self._compute_base() is not None \
+                and self.session.ready_to_measure()[0]:
+            self.compute()
+
+    def export(self, out_dir):
+        """Выходной JSON, `marks.json` и строка CLI — одной функцией ядра интерфейса."""
+        try:
+            out = session_file.export(self.session, out_dir, click_sigma)
+        except ValueError as error:
+            self.status_label.setText(f"Экспорт не выполнен: {error}")
+            return None
+        if self.session.model is not None:
+            self.model_ready(self.session.model)
+        self.status_label.setText(f"Экспорт: {out.json_path}; команда CLI — "
+                                  f"{out.json_path.with_suffix('.command.txt').name}")
+        return out
+
+    def _ask_save_session(self) -> None:
+        if self.session.image_path is None:
+            return
+        default = str(self.session.image_path.with_suffix(".session.json"))
+        path, _ = QFileDialog.getSaveFileName(self, "Сохранить сессию", default, SESSION_FILTER)
+        if path:
+            self.save_session(path)
+            self.status_label.setText(f"Сессия сохранена: {path}")
+
+    def _ask_open_session(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Открыть сессию", "", SESSION_FILTER)
+        if path:
+            self.open_session(path)
+
+    def _ask_export(self) -> None:
+        if self.session.image_path is None:
+            return
+        path = QFileDialog.getExistingDirectory(self, "Каталог экспорта",
+                                                str(self.session.image_path.parent))
+        if path:
+            self.export(path)
 
     def _frame_ready(self, fs, *, plane_override=None, roi=None) -> None:
         first = self.session.frame is None or self.session.frame.frame is not fs.frame
@@ -364,18 +445,24 @@ class MainWindow(QMainWindow):
         self.session.set_base_options(span_sigma_mm=v["span_sigma_mm"],
                                       scale_source=v["scale_source"],
                                       origin_is_facade_corner=v["origin_is_facade_corner"])
+        self._compute_base()
+
+    def _compute_base(self):
+        """Фаза масштаба по значениям СЕССИИ (панель их только показывает)."""
         ss = self.session.compute_scale(click_sigma)
         if ss is None:
             self.side.base.result.setText(f"Масштаб не вычислен: {self.session.error}")
-            return
+            return None
+        r = self.session.reference
         origin = ("левый нижний угол фасада (охват полный)"
-                  if v["origin_is_facade_corner"] else "точка оператора (охват частичный)")
+                  if r.origin_is_facade_corner else "точка оператора (охват частичный)")
         tol = "достигает" if ss.sigma_rel <= run.SIGMA_REL_TOLERANCE else "НЕ достигает"
         self.side.base.result.setText(
             f"σ масштаба {ss.sigma_rel:.3%} — {tol} допуска п. 6.3; "
-            f"на базе {v['span_mm']:.0f} мм это {ss.sigma_rel * v['span_mm']:.1f} мм. "
+            f"на базе {r.span_mm:.0f} мм это {ss.sigma_rel * r.span_mm:.1f} мм. "
             f"Начало отсчёта — {origin}. Более длинная база даёт меньшую σ.")
         self.scale_ready(ss)
+        return ss
 
     # --- разметка проёмов (задача 13) ---------------------------------------------
 

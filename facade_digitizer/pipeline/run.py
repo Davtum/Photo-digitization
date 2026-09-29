@@ -1120,7 +1120,7 @@ def process(image_path, *, operator_reference: OperatorReference,
 def _parse_args(argv):
     parser = argparse.ArgumentParser(
         prog="facade-digitize",
-        description="Снимок фасада -> модель фасада (JSON схемы 1.1).")
+        description="Снимок фасада -> модель фасада (JSON схемы 1.2).")
     parser.add_argument("images", nargs="+", help="снимки фасада")
     parser.add_argument("--raster-mm-per-px", type=float, required=True,
                         help="разрешение выходного растра, мм на пиксель")
@@ -1135,6 +1135,16 @@ def _parse_args(argv):
     parser.add_argument("--sigma-px", type=float, default=DEFAULT_OPERATOR_SIGMA_PX,
                         help="точность указания КОНЦОВ ОПОРНОЙ БАЗЫ масштаба, "
                              "пикселей снимка (клик по кадру целиком)")
+    parser.add_argument("--end-sigma-px", type=float, nargs=2, default=None,
+                        metavar=("S1", "S2"),
+                        help="точность указания КАЖДОГО конца базы порознь, пикселей "
+                             "снимка (план 3, задача 6): концы указываются при разном "
+                             "увеличении; без ключа оба конца — с --sigma-px")
+    parser.add_argument("--span-sigma-mm", type=float, default=None,
+                        help="погрешность самой длины базы (рулетка, дальномер), мм")
+    parser.add_argument("--origin-is-facade-corner", action="store_true",
+                        help="первая точка --span-px — левый нижний угол фасада "
+                             "(п. 7): начало bottom_left и охват full")
     parser.add_argument("--mark-sigma-px", type=float, default=DEFAULT_MARK_SIGMA_PX,
                         help="точность указания УГЛА ПРОЁМА оператором, пикселей "
                              "снимка (клик с увеличением). Отдельная от --sigma-px "
@@ -1214,7 +1224,11 @@ def main(argv=None) -> int:
     x1, y1, x2, y2 = args.span_px
     reference = OperatorReference(origin_px=tuple(args.origin_px),
                                   span_px=((x1, y1), (x2, y2)),
-                                  span_mm=args.span_mm, sigma_px=args.sigma_px)
+                                  span_mm=args.span_mm, sigma_px=args.sigma_px,
+                                  end_sigma_px=(tuple(args.end_sigma_px)
+                                                if args.end_sigma_px else None),
+                                  span_sigma_mm=args.span_sigma_mm,
+                                  origin_is_facade_corner=args.origin_is_facade_corner)
     # `--marks` задаётся в пикселях ОДНОГО снимка, поэтому пакет с разметкой
     # отвергается целиком и до всякой обработки. Прежде файл читался один раз и
     # подавался на каждый снимок пакета без сверки чего бы то ни было — даже
