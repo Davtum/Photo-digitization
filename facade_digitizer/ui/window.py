@@ -650,7 +650,7 @@ class MainWindow(QMainWindow):
 
     def drag_point(self, key: str, x: float, y: float, view_scale: float) -> None:
         """Во время перетаскивания двигается только рисунок; пересчёт — при отпускании."""
-        self.session.move_point(key, ClickedPoint(x, y, view_scale))
+        self.session.move_point(key, ClickedPoint(x, y, view_scale), final=False)
         self._draw_marks()
 
     def drop_point(self, key: str, x: float, y: float, view_scale: float) -> None:

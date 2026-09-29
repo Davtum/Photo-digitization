@@ -66,7 +66,6 @@ def _session(scene, *, manual=False):
     second.mounting, second.edge_type = "flush", "surround"
     for x, y in corners:
         s.add_corner(second, ClickedPoint(x + 25.0, y - 10.0, 2.0))
-    s.timing = {"marking_s": 42.5}
     return s
 
 
@@ -81,7 +80,7 @@ def test_session_round_trip_preserves_clicks_scales_and_plane(tmp_path, scene):
     assert loaded.plane_points == s.plane_points
     assert np.array_equal(loaded.plane_override.image_pts, s.plane_override.image_pts)
     assert loaded.plane_override.aspect_ratio == s.plane_override.aspect_ratio
-    assert loaded.timing == {"marking_s": 42.5}
+    assert loaded.labour.summary() == s.labour.summary()      # хронометраж и правки
     # И считается загруженная сессия в ту же модель.
     assert loaded.compute_frame() is not None
     assert loaded.compute_elements(_sigma) == s.compute_elements(_sigma)

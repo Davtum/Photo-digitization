@@ -26,6 +26,7 @@ from facade_digitizer.pipeline import run
 from facade_digitizer.pipeline.elements import ElementMark
 from facade_digitizer.pipeline.plane import ManualPlane
 from facade_digitizer.schema import FacadeModel
+from facade_digitizer.ui.labour import LabourLog
 
 #: Префикс идентификатора разметки по классу — тот же, что у `elements._element_id`.
 _ID_PREFIX = {"window": "w", "door": "d"}
@@ -128,8 +129,8 @@ class OperatorSession:
         self.scale = None            # run.ScaleStage
         self.model: FacadeModel | None = None
         self.error: str | None = None
-        #: Хронометраж работы оператора (заполняется задачей 22), хранится в сессии.
-        self.timing: dict = {}
+        #: Хронометраж и правки оператора (задача 22); метка оператора — непрозрачная.
+        self.labour = LabourLog()
 
     # --- снимок и профиль -------------------------------------------------------
 
@@ -143,7 +144,11 @@ class OperatorSession:
         # `resolve()`: путь уходит в `images[].path` выхода, и относительный путь
         # против абсолютного дал бы разный файл при той же разметке (задача 17).
         path = Path(path).resolve()
+        operator, clock = self.labour.operator, self.labour.clock
         self.__init__()
+        # Метка оператора и часы — свойства работающего, а не снимка.
+        self.labour = LabourLog(operator=operator, clock=clock)
+        self.labour.start()
         self.image_path = path
         self.image_hash = _file_hash(path)
 
@@ -286,6 +291,7 @@ class OperatorSession:
         self._next_mark += 1
         self.marks.append(mark)
         self.model = None
+        self._log("new_mark", mark.id)
         return mark
 
     def mark(self, mark_id: str) -> MarkDraft:
@@ -297,12 +303,19 @@ class OperatorSession:
     def delete_mark(self, mark_id: str) -> None:
         self.marks.remove(self.mark(mark_id))
         self.model = None
+        self._log("delete", mark_id)
+
+    def _log(self, kind: str, mark_id, point: ClickedPoint | None = None) -> None:
+        reject = self.scale is not None and self.scale.quality.verdict == "reject"
+        self.labour.event(kind, mark_id, reject=reject,
+                          view_scale=point.view_scale if point is not None else None)
 
     def add_corner(self, mark: MarkDraft, point: ClickedPoint) -> None:
         if len(mark.corners) >= 4:
             raise ValueError(f"{mark.id}: у проёма четыре угла, все уже указаны")
         mark.corners.append(point)
         self.model = None
+        self._log("click", mark.id, point)
 
     def add_reveal_point(self, mark: MarkDraft, side: str, point: ClickedPoint) -> None:
         if mark.reveal_side not in (None, side):
@@ -312,6 +325,7 @@ class OperatorSession:
             raise ValueError(f"{mark.id}: у внутренней кромки грани откоса две точки")
         mark.reveal_points.append(point)
         self.model = None
+        self._log("click", mark.id, point)
 
     def editable_points(self) -> list[tuple[str, float, float]]:
         """Точки разметки, которые можно перетаскивать: (ключ, x, y кадра).
@@ -325,14 +339,18 @@ class OperatorSession:
             out += [(f"{m.id}:reveal:{i}", *p.xy) for i, p in enumerate(m.reveal_points)]
         return out
 
-    def move_point(self, key: str, point: ClickedPoint) -> None:
+    def move_point(self, key: str, point: ClickedPoint, *, final: bool = True) -> None:
         """Перенести точку разметки. Масштаб — тот, при котором её поставили заново:
-        σ точки следует за последним действием оператора над ней."""
+        σ точки следует за последним действием оператора над ней.
+
+        Правкой считается перенос целиком (`final`), а не каждое движение мыши."""
         mark_id, kind, index = key.rsplit(":", 2)
         mark = self.mark(mark_id)
         points = mark.corners if kind == "corner" else mark.reveal_points
         points[int(index)] = point
         self.model = None
+        if final:
+            self._log("edit", mark_id, point)
 
     def undo_last_point(self, mark: MarkDraft) -> None:
         """Отменить последнюю точку разметки: сперва кромки откоса, затем углов."""
@@ -343,6 +361,7 @@ class OperatorSession:
         elif mark.corners:
             mark.corners.pop()
         self.model = None
+        self._log("undo", mark.id)
 
     def suggested_reveal_sides(self, mark: MarkDraft) -> tuple[str, str] | None:
         """Какие грани откоса этого проёма видны камере (п. 5.5) — по позе.
@@ -386,6 +405,7 @@ class OperatorSession:
                 "corners_px": [list(map(float, p))
                                for p in order_corners([c.xy for c in mark.corners])],
                 "sigma_px": max(sigma_of(c) for c in mark.corners),
+                "operator": self.labour.operator_record(mark.id),
             }
             if mark.reveal_side is not None and mark.reveal_points:
                 payload["reveal"] = {

@@ -23,6 +23,7 @@ import numpy as np
 
 from facade_digitizer.pipeline import run
 from facade_digitizer.pipeline.plane import ManualPlane
+from facade_digitizer.ui.labour import LabourLog
 from facade_digitizer.ui.session import (
     ClickedPoint,
     MarkDraft,
@@ -77,7 +78,7 @@ def session_to_dict(session: OperatorSession) -> dict:
                    "edge_type": m.edge_type, "corners": _points(m.corners),
                    "reveal_side": m.reveal_side, "reveal_points": _points(m.reveal_points)}
                   for m in session.marks],
-        "timing": session.timing,
+        "timing": session.labour.summary(),
     }
 
 
@@ -139,7 +140,10 @@ def load_session(path) -> OperatorSession:
                                reveal_points=_clicked(m["reveal_points"]))
                      for m in raw["marks"]]
     session._next_mark = int(raw["next_mark"])
-    session.timing = dict(raw.get("timing") or {})
+    if raw.get("timing"):
+        # Сохранённые счётчики продолжаются; часы — текущего процесса.
+        session.labour = LabourLog.from_summary(raw["timing"])
+        session.labour.start()
     return session
 
 

@@ -84,7 +84,15 @@ from facade_digitizer.geometry.parallax import (
     signed_reveal_width_mm,
     visible_reveal_side,
 )
-from facade_digitizer.schema import Element, Point, Recess, SizeMM, Strict, ThetaDeg
+from facade_digitizer.schema import (
+    Element,
+    OperatorLog,
+    Point,
+    Recess,
+    SizeMM,
+    Strict,
+    ThetaDeg,
+)
 
 #: Цель п. 2.2 для режима `assisted`: 1σ ≤ 10 мм на габарит по наружному контуру.
 #: `meets_tolerance` сравнивает с этим значением ПОСЧИТАННУЮ σ (RSS слагаемых
@@ -302,6 +310,10 @@ class ElementMark(Strict):
     #: что разные проёмы размечаются при разном увеличении, и один размеченный
     #: грубо не должен портить σ остальных.
     sigma_px: float | None = None
+    #: Трудозатраты оператора на этот элемент (план 3, задача 22): едут в
+    #: `Element.operator` как есть. Через разметку, а не отдельным файлом, — чтобы
+    #: CLI по `marks.json` воспроизводил выход окна байт в байт.
+    operator: OperatorLog | None = None
 
     @model_validator(mode="after")
     def _sigma_and_id(self):
@@ -816,6 +828,7 @@ def _digitize_one(mark: ElementMark, index: int, *, H, camera: CameraOnPlane,
         origin="operator",
         recess=recess,
         meets_tolerance=meets_tolerance,
+        operator=mark.operator,
     )
 
 
