@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QLabel,
     QMainWindow,
+    QMessageBox,
     QScrollArea,
     QSplitter,
     QVBoxLayout,
@@ -117,6 +118,8 @@ class MainWindow(QMainWindow):
                 (menu, "Открыть сессию…", "Ctrl+Shift+O", self._ask_open_session),
                 (menu, "Сохранить сессию…", QKeySequence.Save, self._ask_save_session),
                 (menu, "Экспорт JSON и DXF…", "Ctrl+E", self._ask_export),
+                (menu, "Профиль калибровки…", "Ctrl+K", self._ask_profile),
+                (menu, "Снять профиль калибровки", "", self._ask_clear_profile),
                 (view, "Масштаб 1:1", "Ctrl+1", self.canvas.one_to_one),
                 (view, "Вписать в окно", "Ctrl+0", self.canvas.fit_to_window)):
             action = QAction(text, self)
@@ -243,12 +246,7 @@ class MainWindow(QMainWindow):
         self.canvas.scene().clear()
         self.canvas.frame_item = self.canvas.usable_item = None
         self.canvas.overlays = {}
-        if self._raster_job is not None:
-            self._raster_job.cancel()
-        self.rect_view.scene().clear()
-        self.rect_view.to_raster = self.rect_view.H = None
-        self.rectified = None
-        self.rect_label.setText("Выровненный вид появится после опорной базы")
+        self._reset_rectified()
         self.side.plane.set_frame_loaded(False)
         session = self.session
         plane, roi = session.plane_override, session.roi
@@ -262,6 +260,14 @@ class MainWindow(QMainWindow):
                                           profile_path=session.profile_path,
                                           with_color=True, plane_override=plane, roi=roi),
                   done, f"{path.name}: обрабатывается — кадр, калибровка, плоскость…")
+
+    def _reset_rectified(self) -> None:
+        if self._raster_job is not None:
+            self._raster_job.cancel()
+        self.rect_view.scene().clear()
+        self.rect_view.to_raster = self.rect_view.H = None
+        self.rectified = None
+        self.rect_label.setText("Выровненный вид появится после опорной базы")
 
     # --- сессия и экспорт (задача 17) ---------------------------------------------
 
@@ -303,6 +309,54 @@ class MainWindow(QMainWindow):
             f"Экспорт: {out.json_path}, {out.dxf_path.name}; команда CLI — "
             f"{out.json_path.with_suffix('.command.txt').name}")
         return out
+
+    def set_profile(self, path, *, discard_clicks: bool = False) -> bool:
+        """Подключить (`None` — снять) профиль калибровки и пересчитать кадр.
+
+        Профиль сдвигает кадр (снятие дисторсии): точки, указанные по прежнему
+        кадру, теряют смысл. Без `discard_clicks` при наличии точек — отказ с
+        причиной; диалог подтверждения — в `_ask_profile`.
+        """
+        if self.session.image_path is None:
+            self.status_label.setText("Сначала откройте снимок, затем профиль его камеры.")
+            return False
+        try:
+            self.session.set_profile(path, discard_clicks=discard_clicks)
+        except ValueError as error:
+            self.status_label.setText(str(error))
+            return False
+        self.current_mark = None
+        for key in ("plane", "roi", "base"):
+            self.canvas.clear_overlay(key)
+        self.canvas.clear_overlays("mark:")
+        self.side.marks.set_marks([], None)
+        self._reset_rectified()
+        session = self.session
+        name = Path(path).name if path is not None else "без профиля"
+        self._run(lambda: run.frame_stage(session.image_path,
+                                          profile_path=session.profile_path,
+                                          with_color=True),
+                  self._frame_ready, f"Профиль {name}: кадр пересчитывается…")
+        return True
+
+    def _confirm_discard(self) -> bool:
+        if not self.session.has_clicks():
+            return True
+        answer = QMessageBox.question(
+            self, "Смена профиля калибровки",
+            "Профиль сдвигает кадр (снятие дисторсии), и указанные точки к нему не "
+            "относятся. Сбросить разметку и продолжить?")
+        return answer == QMessageBox.Yes
+
+    def _ask_profile(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Профиль калибровки камеры", "",
+                                              "Профиль (*.json);;Все файлы (*)")
+        if path and self._confirm_discard():
+            self.set_profile(path, discard_clicks=True)
+
+    def _ask_clear_profile(self) -> None:
+        if self.session.profile_path is not None and self._confirm_discard():
+            self.set_profile(None, discard_clicks=True)
 
     def _ask_save_session(self) -> None:
         if self.session.image_path is None:
