@@ -171,11 +171,12 @@ class Desk:
             self._saved_snapshot = snapshot
 
     def _snapshot(self) -> str | None:
-        """Сессия без хронометража — для «изменилось ли» (сохранение, выгрузка)."""
+        """Сессия без хронометража (но с меткой оператора) — для «изменилось ли»
+        (сохранение, выгрузка): секунды меняются сами, метка — решение оператора."""
         if self.session.image_path is None:
             return None
         raw = session_file.session_to_dict(self.session)
-        raw.pop("timing", None)
+        raw["operator"] = raw.pop("timing", {}).get("operator")
         return json.dumps(raw, sort_keys=True, ensure_ascii=False)
 
     # --- кадр ---------------------------------------------------------------------
