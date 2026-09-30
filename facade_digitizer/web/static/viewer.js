@@ -144,12 +144,17 @@ export class Viewer {
     }
   }
 
-  setOverlays(overlays, draggable, grabEnabled, highlight = null) {
+  // rev — ревизия состояния, из которого наложения: отпущенная точка остаётся на новом
+  // месте, пока не придёт состояние новее отпускания (опрос без изменений её не сбросит).
+  setOverlays(overlays, draggable, grabEnabled, highlight = null, rev = null) {
     this.overlays = overlays || [];
     this.draggable = draggable || [];
     this.grabEnabled = Boolean(grabEnabled);
     this.highlight = highlight;
-    this.pending = null;
+    this.rev = rev;
+    if (this.pending && (rev == null || this.pending.rev == null || rev > this.pending.rev)) {
+      this.pending = null;
+    }
     this.draw();
   }
 
@@ -271,7 +276,7 @@ export class Viewer {
       const d = this.drag;
       this.drag = null;
       if (d && ptr.moved) {
-        this.pending = d;
+        this.pending = { ...d, rev: this.rev };
         this.options.onDrop?.(d.key, d.x, d.y, this.physical, true);
       }
       this.draw();

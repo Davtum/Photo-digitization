@@ -484,7 +484,7 @@ function renderStage() {
       ? `Снимок не обработан: ${frame.error}` : 'Снимок ещё не обработан.';
   }
   const grab = S.draggable.length > 0 && !S.placing;
-  viewer.setOverlays(S.overlays, S.draggable, grab, highlight);
+  viewer.setOverlays(S.overlays, S.draggable, grab, highlight, S.rev);
 
   const rect = S.rectified;
   desk.tabRect.disabled = rect.status !== 'ready';
@@ -656,6 +656,7 @@ function profileBlock(frame) {
       if (!file) return;
       try {
         const result = await upload('/api/profile/upload', file);
+        profilesCache = null;
         act('set_profile', { path: result.path, discard: false });
       } catch (error) {
         showError(error);
@@ -674,15 +675,19 @@ function profileBlock(frame) {
       + 'до разметки, иначе точки придётся сбросить.'));
 }
 
+// Список профилей — один раз на открытый снимок (и после загрузки нового), а не при
+// каждой перерисовке панели: библиотека обходит всю рабочую папку.
 let profilesCache = null;
 async function loadProfiles(select, current) {
-  try {
-    profilesCache = (await get('/api/library')).profiles;
-  } catch {
-    profilesCache = profilesCache || [];
+  if (profilesCache?.desk !== S.desk) {
+    try {
+      profilesCache = { desk: S.desk, list: (await get('/api/library')).profiles };
+    } catch {
+      profilesCache = { desk: null, list: [] };
+    }
   }
   const known = new Set();
-  for (const profile of profilesCache) {
+  for (const profile of profilesCache.list) {
     known.add(profile.path);
     select.append(h('option', { value: profile.path }, profile.name));
   }
