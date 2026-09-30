@@ -293,3 +293,18 @@ def test_state_marks_carry_choices_and_sigma_params(desk):
     assert [k for k, _ in state["choices"]["edges"]] == [
         "sharp_wall_edge", "surround", "cladding_edge", "unknown"]
     json.dumps(state)
+
+
+def test_overlay_points_carry_their_drag_keys(desk, near):
+    """Контур рисуется в обходе `ElementMark`, а точки перетаскиваются по ключу клика:
+    у каждой точки наложения — её ключ, чтобы страница двигала при переносе именно её."""
+    mark_id = ws.add_opening(desk, near, order=(2, 0, 3, 1))
+    overlays = {o["key"]: o for o in desk.state()["overlays"]}
+    mark = desk.session.mark(mark_id)
+    contour = overlays[f"mark:{mark_id}"]
+    for key, (x, y) in zip(contour["keys"], contour["points"]):
+        index = int(key.rsplit(":", 1)[1])
+        assert key.startswith(f"{mark_id}:corner:") and mark.corners[index].xy == (x, y)
+    assert overlays[f"reveal:{mark_id}"]["keys"] == [f"{mark_id}:reveal:0",
+                                                     f"{mark_id}:reveal:1"]
+    assert overlays["base"]["keys"] == ["base:0", "base:1"]

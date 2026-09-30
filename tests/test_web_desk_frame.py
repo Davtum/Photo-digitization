@@ -70,6 +70,7 @@ def test_open_runs_frame_phase_and_encodes_lossless_png(far):
     assert state["frame"]["height"] == fs.image_size[1]
     assert state["frame"]["version"] == desk.frame_version >= 1
     assert desk.usable_png is not None
+    assert state["frame"]["usable_version"] == desk.usable_version >= 1
 
 
 def test_state_is_json_serialisable(far):

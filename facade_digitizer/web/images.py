@@ -33,9 +33,28 @@ def jpeg(image: np.ndarray, quality: int = 90) -> bytes:
     return _encode(".jpg", image, (cv2.IMWRITE_JPEG_QUALITY, quality))
 
 
-def usable_png(mask: np.ndarray) -> bytes:
-    """Маска пригодности (сетка узлов) → RGBA: непригодное затемнено, пригодное прозрачно.
-    Страница растягивает её на кадр со сглаживанием: граница зоны — не ступеньки."""
+#: Наибольшая сторона маски пригодности на странице: достаточно для плавной границы.
+USABLE_MAX_SIDE = 1024
+
+
+def usable_png(mask: np.ndarray, *, theta_deg=None, visible=None, limit_deg=None,
+               frame_size=None) -> bytes:
+    """Маска пригодности → RGBA: непригодное затемнено, пригодное прозрачно.
+
+    С полем углов (`theta_deg`, `visible` — на той же сетке узлов, что и `mask`)
+    граница строится по растянутому ПОЛЮ, а не по растянутой маске: угол непрерывен,
+    и порог по бикубически растянутому полю даёт плавную границу, а растянутая маска
+    узлов 64×64 — лесенку из клеток, которой в поле нет. В узлах сетки обе совпадают.
+    """
+    if theta_deg is not None and frame_size is not None:
+        fw, fh = frame_size
+        k = USABLE_MAX_SIDE / max(fw, fh)
+        size = (max(1, round(fw * k)), max(1, round(fh * k)))
+        seen = np.asarray(visible, dtype=bool)
+        theta = np.where(seen, np.asarray(theta_deg, dtype=float), 180.0).astype(np.float32)
+        up = cv2.resize(theta, size, interpolation=cv2.INTER_CUBIC)
+        seen_up = cv2.resize(seen.astype(np.float32), size, interpolation=cv2.INTER_LINEAR)
+        mask = (up <= limit_deg) & (seen_up >= 0.5)
     m = np.asarray(mask, dtype=bool)
     rgba = np.zeros(m.shape + (4,), np.uint8)
     rgba[~m] = (0, 0, 0, UNUSABLE_ALPHA)

@@ -109,6 +109,8 @@ class Desk:
         self.frame_version = 0
         self.frame_png: bytes | None = None
         self.usable_png: bytes | None = None
+        #: РњР°СЃРєР° РїСЂРёРіРѕРґРЅРѕСЃС‚Рё РјРµРЅСЏРµС‚СЃСЏ СЃ РїР»РѕСЃРєРѕСЃС‚СЊСЋ, РґР°Р¶Рµ РєРѕРіРґР° РєР°РґСЂ С‚РѕС‚ Р¶Рµ.
+        self.usable_version = 0
         self.preview = None
         self.frame_error: str | None = None
         self.scale_error: str | None = None
@@ -222,7 +224,14 @@ class Desk:
         if fs.plane.needs_operator:
             return None, None
         preview = run.theta_preview(fs)
-        return preview, images.usable_png(preview.usable_mask)
+        theta = np.asarray(preview.theta_deg, dtype=float)
+        limit = quality_gate.THETA_MAX_DEG
+        # Узел с углом не больше порога, но непригодный, лежит за линией схода —
+        # он невидим; остальные непригодны по углу.
+        usable = np.asarray(preview.usable_mask, dtype=bool)
+        visible = np.isfinite(theta) & (usable | (theta > limit))
+        return preview, images.usable_png(usable, theta_deg=theta, visible=visible,
+                                          limit_deg=limit, frame_size=fs.image_size)
 
     def _frame_ready(self, fs, png, preview, usable, *, plane_override=None, roi=None) -> None:
         s = self.session
@@ -231,6 +240,7 @@ class Desk:
             self.frame_png = png
             self.frame_version += 1
         self.preview, self.usable_png = preview, usable
+        self.usable_version += 1
         self.busy = None
         self.frame_error = None
         if fs.plane.needs_operator:
@@ -776,7 +786,8 @@ class Desk:
         return {
             "ready": True, "version": self.frame_version, "width": w, "height": h,
             "name": fs.path.name, "info": info, "profile": profile,
-            "usable": self.usable_png is not None, "error": None,
+            "usable": self.usable_png is not None, "usable_version": self.usable_version,
+            "error": None,
             "plane": {"needs_operator": bool(plane.needs_operator), "manual": manual,
                       "confidence": (None if plane.needs_operator or manual
                                      else _num(plane.confidence.value)),
@@ -815,25 +826,34 @@ class Desk:
         s = self.session
         out = []
 
-        def add(key, points, color, closed=False, kind="line"):
+        def add(key, points, color, closed=False, keys=None):
             if points:
                 out.append({"key": key, "points": [[float(x), float(y)] for x, y in points],
-                            "closed": bool(closed), "color": color, "kind": kind})
+                            "closed": bool(closed), "color": color, "keys": keys})
 
         if self.step == "frame":
             pts = [p.xy for p in s.plane_points]
             add("plane", pts, COLORS["plane"], closed=len(pts) == 4)
             add("roi", [p.xy for p in s.roi_points], COLORS["roi"], closed=True)
         if self.step in ("scale", "marks", "result"):
-            add("base", [p.xy for p in s.reference.ends], COLORS["base"])
+            add("base", [p.xy for p in s.reference.ends], COLORS["base"],
+                keys=[f"base:{i}" for i in range(len(s.reference.ends))])
         if self.step in ("marks", "result"):
             for m in s.marks:
                 color = COLORS["selected"] if m.id == self.current_mark else COLORS["mark"]
                 pts = [c.xy for c in m.corners]
+                keys = [f"{m.id}:corner:{i}" for i in range(len(pts))]
                 if len(pts) == 4:
-                    pts = [tuple(p) for p in order_corners(pts)]
-                add(f"mark:{m.id}", pts, color, closed=len(pts) == 4)
-                add(f"reveal:{m.id}", [p.xy for p in m.reveal_points], COLORS["reveal"])
+                    # РљРѕРЅС‚СѓСЂ вЂ” РІ РѕР±С…РѕРґРµ `ElementMark` (РєР»РёРєРё РјРѕРіР»Рё РёРґС‚Рё РІ Р»СЋР±РѕРј РїРѕСЂСЏРґРєРµ, Рё
+                    # Р»РѕРјР°РЅР°СЏ РїРѕ РїРѕСЂСЏРґРєСѓ РєР»РёРєРѕРІ РїРµСЂРµСЃРµРєР°Р»Р° Р±С‹ СЃРµР±СЏ); РєР»СЋС‡ Сѓ С‚РѕС‡РєРё вЂ” СЃРІРѕР№.
+                    order = []
+                    for q in order_corners(pts):
+                        order.append(next(i for i, p in enumerate(pts)
+                                          if i not in order and np.allclose(p, q)))
+                    pts, keys = [pts[i] for i in order], [keys[i] for i in order]
+                add(f"mark:{m.id}", pts, color, closed=len(pts) == 4, keys=keys)
+                add(f"reveal:{m.id}", [p.xy for p in m.reveal_points], COLORS["reveal"],
+                    keys=[f"{m.id}:reveal:{i}" for i in range(len(m.reveal_points))])
         return out
 
     def _draggable(self) -> list[dict]:

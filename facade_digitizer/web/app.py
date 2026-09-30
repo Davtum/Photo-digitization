@@ -75,7 +75,10 @@ def create_app(workbench: Workbench, *, token: str, port: int | None) -> FastAPI
         if request.method not in ("GET", "HEAD") and \
                 not secrets.compare_digest(request.headers.get("x-facade-token", ""), token):
             return _error(403, "нет токена страницы: обновите страницу")
-        return await call_next(request)
+        response = await call_next(request)
+        if request.url.path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-cache"
+        return response
 
     def state_response(extra: dict | None = None) -> JSONResponse:
         return JSONResponse({"state": wb.state(), **(extra or {})}, headers=NO_STORE)

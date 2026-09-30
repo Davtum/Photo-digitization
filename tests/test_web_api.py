@@ -168,3 +168,10 @@ def test_restart_and_save_copy_and_close(client, near):
     state = client.post("/api/restart").json()["state"]
     assert state["scale"]["ends"] == 0
     assert client.post("/api/close").json()["state"]["desk"] is None
+
+
+def test_static_files_are_revalidated(client):
+    """Модули страницы перепроверяются при каждом открытии: после обновления
+    программы браузер не держит старый `app.js` рядом с новым сервером."""
+    r = client.get("/static/app.js")
+    assert r.status_code == 200 and "no-cache" in r.headers["cache-control"]

@@ -88,3 +88,23 @@ def test_thumbnail_is_small_jpeg(tmp_path):
     thumb = cv2.imdecode(np.frombuffer(images.thumbnail(path, width=320), np.uint8),
                          cv2.IMREAD_COLOR)
     assert thumb.shape[1] == 320 and thumb.shape[0] == 240
+
+
+def test_usable_png_from_theta_has_a_smooth_border():
+    """Граница пригодной зоны — по растянутому ПОЛЮ углов, а не по растянутой маске
+    узлов: иначе на кадре лесенка из клеток 64×64, которой в поле углов нет."""
+    gy, gx = np.mgrid[0:64, 0:64].astype(float)
+    theta = np.hypot(gx - 32.0, gy - 30.0) * 1.2            # 0° у опорной точки
+    visible = np.ones_like(theta, bool)
+    grid_usable = theta <= 30.0
+    png = images.usable_png(grid_usable, theta_deg=theta, visible=visible, limit_deg=30.0,
+                            frame_size=(4000, 3000))
+    rgba = cv2.imdecode(np.frombuffer(png, np.uint8), cv2.IMREAD_UNCHANGED)
+    assert rgba.shape[:2] == (768, 1024)                    # пропорции кадра, не сетки
+    usable = rgba[:, :, 3] == 0
+    assert abs(usable.mean() - grid_usable.mean()) < 0.03
+    # Лесенка давала бы границу, идущую строго по клеткам: сменов пригодности в одном
+    # ряду растра не больше двух, а переходы — не на кратных клетке столбцах.
+    row = usable[384]
+    edges = np.flatnonzero(np.diff(row.astype(int)))
+    assert len(edges) == 2 and any((e + 1) % 16 for e in edges)
