@@ -165,6 +165,10 @@ class OperatorSession:
             raise ValueError(
                 f"смена профиля калибровки сдвигает кадр и сбросит указанные точки "
                 f"({clicks}): подтвердите сброс")
+        # Файл профиля читается ДО сброса: удалённый профиль не должен стирать разметку.
+        if path is not None and not Path(path).is_file():
+            raise FileNotFoundError(f"профиль калибровки не найден: {Path(path).name}")
+        profile_hash = _file_hash(path) if path is not None else None
         self.reference = ReferenceDraft()
         self.marks = []
         self.plane_points, self.roi_points = [], []
@@ -172,7 +176,7 @@ class OperatorSession:
         self.frame = self.scale = self.model = None
         self.error = None
         self.profile_path = Path(path).resolve() if path is not None else None
-        self.profile_hash = _file_hash(path) if path is not None else None
+        self.profile_hash = profile_hash
 
     def set_plane_override(self, override: ManualPlane | None, roi=None) -> None:
         self.plane_override, self.roi = override, roi

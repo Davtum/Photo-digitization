@@ -187,3 +187,30 @@ def test_unreadable_body_is_400_not_500(client):
         r = client.post("/api/open", content=body, headers={"Content-Type": "application/json"})
         assert r.status_code == 400, body
         assert "JSON" in r.json()["error"]
+
+
+def test_bad_action_arguments_are_400_not_500(client, tmp_path):
+    state = client.post("/api/open", json={"path": "примеры/фасад.png"}).json()["state"]
+    r = client.post("/api/action", json={"desk": state["desk"], "rev": "abc",
+                                         "name": "set_step", "args": {"step": "scale"}})
+    assert r.status_code == 400
+    r = client.post("/api/action", json={"desk": state["desk"], "rev": state["rev"],
+                                         "name": "set_profile",
+                                         "args": {"path": "../../x.json", "discard": True}})
+    assert r.status_code == 400 and "вне рабочей папки" in r.json()["error"]
+
+
+def test_locked_session_file_is_400_not_500(client, monkeypatch):
+    from facade_digitizer.ui import session_file
+
+    client.post("/api/open", json={"path": "примеры/фасад.png"})
+    client.post("/api/close")
+    (client.workbench.data_dir / "примеры" / "фасад.session.json").write_text("{}",
+                                                                              encoding="utf-8")
+
+    def locked(*_a, **_k):
+        raise PermissionError("файл занят другой программой")
+
+    monkeypatch.setattr(session_file, "load_session", locked)
+    r = client.post("/api/open", json={"path": "примеры/фасад.png"})
+    assert r.status_code == 400 and "занят" in r.json()["error"]

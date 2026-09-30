@@ -245,6 +245,12 @@ class Workbench:
                     notice = {"kind": "error", "text": (
                         f"Прежняя сессия не открылась ({error}) и сохранена как {bak.name}; "
                         "начата новая.")}
+                except OSError as error:
+                    # Файл есть, но недоступен (занят OneDrive, антивирусом): не
+                    # начинать новую сессию поверх работы, а сказать, что мешает.
+                    raise ValueError(f"файл сессии {session_path.name} недоступен ({error}): "
+                                     "закройте программу, которая его держит, и "
+                                     "откройте снимок снова") from error
             if session is not None and self.explicit_operator \
                     and session.labour.operator != self.operator:
                 self._pending = (rel, session)
@@ -360,7 +366,7 @@ class Workbench:
             desk = self.desk
             if desk is None or desk.desk_id != desk_id:
                 raise Stale("открыт другой снимок")
-            if int(rev) != desk.rev:
+            if not desk.invalidated_at <= int(rev) <= desk.rev:
                 raise Stale("состояние изменилось")
             args = dict(args or {})
             if name == "set_profile" and args.get("path"):

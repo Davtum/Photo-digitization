@@ -66,7 +66,9 @@ ACTIONS = frozenset({
 #: Пока идёт фаза кадра, кадр на странице устарел: разрешён только переход по шагам.
 ALLOWED_WHILE_BUSY = frozenset({"set_step"})
 
-_ERRORS = (ValueError, KeyError, IndexError, FileNotFoundError)
+#: Ошибки, которые становятся сообщением оператору, а не падением: в том числе ОС —
+#: папка только для чтения, файл, занятый OneDrive или антивирусом.
+_ERRORS = (ValueError, KeyError, IndexError, OSError)
 
 
 class DeskBusy(Exception):
@@ -98,6 +100,12 @@ class Desk:
         self.lock = lock or threading.RLock()
         self.desk_id = desk_id
         self.rev = 0
+        #: Ревизия, с которой действия страницы снова в силе: её поднимают действие
+        #: оператора и новый кадр, но не фоновые события вроде готового растра —
+        #: иначе клик, решённый по состоянию до растра, отвергался бы и терялся.
+        self.invalidated_at = 0
+        self._notice_obj = None
+        self._notice_seq = 0
         self.step = "frame"
         #: Постановка по шагам: незавершённая сохраняется при переходе и продолжается.
         self.placings: dict[str, str | None] = {"frame": None, "scale": None, "marks": None}
@@ -109,7 +117,7 @@ class Desk:
         self.frame_version = 0
         self.frame_png: bytes | None = None
         self.usable_png: bytes | None = None
-        #: РњР°СЃРєР° РїСЂРёРіРѕРґРЅРѕСЃС‚Рё РјРµРЅСЏРµС‚СЃСЏ СЃ РїР»РѕСЃРєРѕСЃС‚СЊСЋ, РґР°Р¶Рµ РєРѕРіРґР° РєР°РґСЂ С‚РѕС‚ Р¶Рµ.
+        #: Маска пригодности меняется с плоскостью, даже когда кадр тот же.
         self.usable_version = 0
         self.preview = None
         self.frame_error: str | None = None
@@ -161,6 +169,7 @@ class Desk:
     def _touch(self) -> None:
         """После действия: новая ревизия и автосохранение, если сессия изменилась."""
         self._bump()
+        self.invalidated_at = self.rev
         snapshot = self._snapshot()
         if snapshot == self._saved_snapshot or self._save is None:
             return
@@ -216,6 +225,7 @@ class Desk:
                 self.session.error = message_text
                 self.notice = {"kind": "error", "text": f"Кадр не обработан: {message_text}"}
                 self._bump()
+                self.invalidated_at = self.rev
 
         self.runner.submit("frame", job, done, failed)
 
@@ -258,6 +268,7 @@ class Desk:
                 self.placings["scale"] = "base"
         self._recompute_scale()
         self._bump()
+        self.invalidated_at = self.rev
 
     # --- шаги и постановки -----------------------------------------------------------
 
@@ -645,7 +656,7 @@ class Desk:
         out_dir = s.image_path.parent / "экспорт"
         try:
             out = session_file.export(s, out_dir, click_sigma)
-        except ValueError as error:
+        except (ValueError, OSError) as error:
             raise ValueError(f"Экспорт не выполнен: {error}") from error
         files = [p for p in (out.json_path, out.dxf_path, out.marks_path,
                              out.json_path.with_suffix(".command.txt")) if p is not None]
@@ -691,9 +702,19 @@ class Desk:
             "choices": {"classes": texts.CLASSES, "mountings": texts.MOUNTINGS,
                         "edges": texts.EDGES, "sides": texts.SIDES,
                         "scale_sources": texts.SCALE_SOURCES, "constraints": CONSTRAINTS},
-            "notice": self.notice,
+            "notice": self._numbered_notice(),
             "save": dict(self.save_status),
         }
+
+    def _numbered_notice(self) -> dict | None:
+        """Уведомление с номером: страница показывает его один раз. Новое уведомление —
+        новый словарь, поэтому номер растёт по смене объекта; фоновое поднятие ревизии
+        уведомление не меняет, и диалог после «Отмена» не всплывает снова."""
+        if self.notice is not self._notice_obj:
+            self._notice_obj = self.notice
+            if self.notice is not None:
+                self._notice_seq += 1
+        return None if self.notice is None else {**self.notice, "id": self._notice_seq}
 
     def _steps(self) -> list[dict]:
         s = self.session
@@ -847,8 +868,8 @@ class Desk:
                 pts = [c.xy for c in m.corners]
                 keys = [f"{m.id}:corner:{i}" for i in range(len(pts))]
                 if len(pts) == 4:
-                    # РљРѕРЅС‚СѓСЂ вЂ” РІ РѕР±С…РѕРґРµ `ElementMark` (РєР»РёРєРё РјРѕРіР»Рё РёРґС‚Рё РІ Р»СЋР±РѕРј РїРѕСЂСЏРґРєРµ, Рё
-                    # Р»РѕРјР°РЅР°СЏ РїРѕ РїРѕСЂСЏРґРєСѓ РєР»РёРєРѕРІ РїРµСЂРµСЃРµРєР°Р»Р° Р±С‹ СЃРµР±СЏ); РєР»СЋС‡ Сѓ С‚РѕС‡РєРё вЂ” СЃРІРѕР№.
+                    # Контур — в обходе `ElementMark` (клики могли идти в любом порядке, и
+                    # ломаная по порядку кликов пересекала бы себя); ключ у точки — свой.
                     order = []
                     for q in order_corners(pts):
                         order.append(next(i for i, p in enumerate(pts)

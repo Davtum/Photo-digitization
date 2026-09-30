@@ -230,3 +230,15 @@ def test_move_reference_end_replaces_and_invalidates(scene, processed):
     assert s.reference.ends[0].xy == tuple(map(float, base[0]))
     with pytest.raises(IndexError):
         s.move_reference_end(2, ClickedPoint(0.0, 0.0, 1.0))
+
+
+def test_missing_profile_file_does_not_discard_the_clicks(scene, tmp_path):
+    """Рецензия ветки: прежде сброс шёл до чтения файла профиля, и удалённый профиль
+    стирал разметку (а автосохранение — и сессию на диске)."""
+    _sc, path, base, _corners = scene
+    s = OperatorSession()
+    s.open_image(path)
+    s.add_reference_end(ClickedPoint(*base[0], view_scale=1.0))
+    with pytest.raises(FileNotFoundError):
+        s.set_profile(tmp_path / "нет.json", discard_clicks=True)
+    assert len(s.reference.ends) == 1

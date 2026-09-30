@@ -442,7 +442,7 @@ function renderSave() {
   desk.save.className = `save ${save.ok ? '' : 'bad'}`;
   desk.save.title = save.ok ? 'Сессия сохраняется сама после каждого действия' : save.error;
   fill(desk.save, h('span', { class: 'dot' }),
-    h('span', { class: 'label' }, save.ok ? 'Сохранено' : 'Сессия не сохраняется'),
+    h('span', { class: 'label' }, save.ok ? 'Сохранено' : `Сессия не сохраняется: ${save.error}`),
     save.ok ? null : h('a', { href: '/api/session/download', style: 'margin-left:6px' }, 'скачать'));
 }
 
@@ -548,7 +548,9 @@ function renderStatus() {
 
 function renderNotice() {
   const notice = S.notice;
-  const key = notice ? `${S.desk}|${S.rev}|${JSON.stringify(notice)}` : null;
+  // Номер уведомления — с сервера: фоновое поднятие ревизии его не меняет, и диалог
+  // после «Отмена» не всплывает снова.
+  const key = notice ? `${S.desk}|${notice.id}` : null;
   if (!notice || key === lastNotice) return;
   lastNotice = key;
   if (notice.kind === 'confirm') {

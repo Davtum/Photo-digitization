@@ -164,7 +164,7 @@ def create_app(workbench: Workbench, *, token: str) -> FastAPI:
         body = await _body(request)
         try:
             wb.answer_operator(str(body.get("choice", "")))
-        except ValueError as error:
+        except (ValueError, OSError) as error:
             return _error(400, str(error))
         return state_response()
 
@@ -177,7 +177,7 @@ def create_app(workbench: Workbench, *, token: str) -> FastAPI:
     def restart():
         try:
             wb.restart()
-        except ValueError as error:
+        except (ValueError, OSError) as error:
             return _error(400, str(error))
         return state_response()
 
@@ -203,14 +203,19 @@ def create_app(workbench: Workbench, *, token: str) -> FastAPI:
     async def action(request: Request):
         body = await _body(request)
         try:
-            wb.act(body.get("desk"), int(body.get("rev", -1)), str(body.get("name", "")),
-                   body.get("args") or {})
+            rev = int(body.get("rev", -1))
+        except (TypeError, ValueError):
+            return _error(400, "ревизия состояния должна быть целым числом", wb.state())
+        try:
+            wb.act(body.get("desk"), rev, str(body.get("name", "")), body.get("args") or {})
         except Stale as error:
             return _error(409, str(error), wb.state())
         except DeskBusy as error:
             return _error(409, str(error), wb.state())
         except (KeyError, TypeError) as error:
             return _error(400, f"недопустимое действие: {error}", wb.state())
+        except ValueError as error:
+            return _error(400, str(error), wb.state())
         return state_response()
 
     # --- изображения и файлы --------------------------------------------------------

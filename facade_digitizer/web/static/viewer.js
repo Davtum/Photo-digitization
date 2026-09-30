@@ -97,12 +97,14 @@ export class Viewer {
       this.view.ox += (rect.width - this.cw) / 2;
       this.view.oy += (rect.height - this.ch) / 2;
     }
-    this.cw = rect.width;
-    this.ch = rect.height;
+    // CSS-размер холста — ровно буфер / DPR: иначе при дробной ширине и DPR ≠ 1
+    // браузер растянул бы буфер на доли процента, и «1:1» не было бы пиксель в пиксель.
     this.canvas.width = Math.round(rect.width * this.dpr);
     this.canvas.height = Math.round(rect.height * this.dpr);
-    this.canvas.style.width = `${rect.width}px`;
-    this.canvas.style.height = `${rect.height}px`;
+    this.cw = this.canvas.width / this.dpr;
+    this.ch = this.canvas.height / this.dpr;
+    this.canvas.style.width = `${this.cw}px`;
+    this.canvas.style.height = `${this.ch}px`;
     if (this.img && !this.fitted) this.fit();
     this.draw();
   }

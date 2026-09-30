@@ -267,3 +267,74 @@ def test_state_carries_image_path_and_operator(data):
     assert state["image"]["path"] == "примеры/01_фасад.png"
     assert state["operator"] == LABEL_A
     assert os.path.isabs(str(wb.data_dir))
+
+
+# --- рецензия ветки: фоновые события не обесценивают действия оператора -----------
+
+def test_background_bump_does_not_reject_the_next_click(data, near):
+    """Готовый растр поднимает ревизию состояния, но клик, решённый по состоянию до
+    него, остаётся в силе: растр к клику отношения не имеет (прежде — 409 и потеря)."""
+    wb = _bench(data)
+    wb.open("примеры/01_фасад.png")
+    state = wb.state()
+    wb.act(state["desk"], state["rev"], "set_step", {"step": "scale"})
+    rev = wb.state()["rev"]
+    wb.desk._bump()                                  # как `done` фоновой задачи растра
+    x, y = near.base_px[0]
+    wb.act(state["desk"], rev, "click", {"x": float(x), "y": float(y), "view_scale": 1.0})
+    assert len(wb.desk.session.reference.ends) == 1
+
+
+def test_new_frame_still_rejects_an_older_click(data, near):
+    """А новый кадр (профиль, плоскость) клик по прежнему состоянию обесценивает."""
+    from facade_digitizer.web.workbench import Stale
+
+    wb = _bench(data)
+    wb.open("примеры/01_фасад.png")
+    state = wb.state()
+    wb.act(state["desk"], state["rev"], "set_step", {"step": "scale"})
+    rev = wb.state()["rev"]
+    wb.act(wb.state()["desk"], rev, "reset_plane", {})        # новая фаза кадра
+    x, y = near.base_px[0]
+    with pytest.raises(Stale):
+        wb.act(state["desk"], rev, "click", {"x": float(x), "y": float(y), "view_scale": 1.0})
+
+
+def test_notice_keeps_its_id_across_background_bumps(data, near, tmp_path):
+    """Диалог подтверждения не всплывает снова после «Отмена»: у уведомления свой
+    номер, и фоновое поднятие ревизии его не меняет."""
+    wb = _bench(data)
+    wb.open("примеры/01_фасад.png")
+    desk = wb.desk
+    desk.act("set_step", step="scale")
+    desk.act("click", x=float(near.base_px[0][0]), y=float(near.base_px[0][1]), view_scale=1.0)
+    profile = ws.profile_for(tmp_path, near.sc)
+    desk.act("set_profile", path=str(profile), discard=False)
+    first = desk.state()["notice"]
+    desk._bump()
+    assert desk.state()["notice"]["id"] == first["id"]
+    desk.act("set_profile", path=str(profile), discard=False)
+    assert desk.state()["notice"]["id"] > first["id"]
+
+
+def test_export_into_an_unwritable_place_is_a_notice(data, near):
+    wb = _bench(data)
+    wb.open("примеры/01_фасад.png")
+    _work(wb, near)
+    (data / "примеры" / "экспорт").write_text("не папка", encoding="utf-8")
+    wb.desk.act("export")
+    notice = wb.desk.state()["notice"]
+    assert notice["kind"] == "error" and "Экспорт не выполнен" in notice["text"]
+
+
+def test_profile_that_vanished_keeps_the_marking(data, near):
+    """Профиль удалили, пока он был в списке: разметка остаётся, кадр — тоже."""
+    wb = _bench(data)
+    wb.open("примеры/01_фасад.png")
+    desk = _work(wb, near)
+    marks = len(desk.session.marks)
+    state = wb.state()
+    gone = data / "профили" / "нет.json"
+    wb.act(state["desk"], state["rev"], "set_profile", {"path": str(gone), "discard": True})
+    assert "не найден" in wb.state()["notice"]["text"]
+    assert len(desk.session.marks) == marks and desk.session.frame is not None
