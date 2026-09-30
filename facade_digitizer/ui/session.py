@@ -233,6 +233,15 @@ class OperatorSession:
         self.reference.ends.append(point)
         self.scale = self.model = None
 
+    def move_reference_end(self, index: int, point: ClickedPoint) -> None:
+        """Перенести конец базы (веб-интерфейс): масштаб, посчитанный по прежнему
+        положению, недействителен. Масштаб просмотра — тот, при котором конец
+        поставлен заново: σ конца следует за последним действием оператора."""
+        if not 0 <= index < len(self.reference.ends):
+            raise IndexError(f"у опорной базы нет конца {index + 1}")
+        self.reference.ends[index] = point
+        self.scale = self.model = None
+
     def clear_reference(self) -> None:
         self.reference = ReferenceDraft(scale_source=self.reference.scale_source,
                                         span_sigma_mm=self.reference.span_sigma_mm,

@@ -213,3 +213,20 @@ def test_reference_uses_per_end_sigma(processed, scene):
     assert ref.end_sigma_px == (1.0, 2.0)
     assert ref.origin_px == ref.span_px[0]
     s.clear_reference()
+
+
+def test_move_reference_end_replaces_and_invalidates(scene, processed):
+    """Веб-интерфейс, задача 1: конец базы переносится, масштаб считается заново."""
+    _sc, _path, base, _corners = scene
+    s = processed
+    s.clear_reference()
+    s.add_reference_end(ClickedPoint(*base[0], view_scale=1.0))
+    s.add_reference_end(ClickedPoint(*base[1], view_scale=1.0))
+    s.set_span_mm(FACADE_W)
+    assert s.compute_scale(_sigma_one) is not None
+    s.move_reference_end(1, ClickedPoint(base[1][0] - 5.0, base[1][1], view_scale=2.0))
+    assert s.scale is None and s.model is None
+    assert s.reference.ends[1] == ClickedPoint(base[1][0] - 5.0, base[1][1], 2.0)
+    assert s.reference.ends[0].xy == tuple(map(float, base[0]))
+    with pytest.raises(IndexError):
+        s.move_reference_end(2, ClickedPoint(0.0, 0.0, 1.0))

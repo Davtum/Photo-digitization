@@ -15,7 +15,9 @@
 диалога дал бы разный файл при одной и той же разметке.
 """
 import json
+import os
 import shlex
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -82,19 +84,45 @@ def session_to_dict(session: OperatorSession) -> dict:
     }
 
 
+#: Повторы записи при `PermissionError`: антивирус или OneDrive на мгновение держат
+#: файл, и отказ с первой попытки оставил бы сессию несохранённой.
+_SAVE_ATTEMPTS, _SAVE_PAUSE_S = 5, 0.1
+
+
 def save_session(session: OperatorSession, path) -> Path:
+    """Запись АТОМАРНА: временный файл рядом и `os.replace`. Веб-интерфейс сохраняет
+    сессию после каждого действия, и падение посреди записи иначе оставило бы
+    обрезанный файл вместо прежней целой сессии."""
     path = Path(path)
-    path.write_text(json.dumps(session_to_dict(session), ensure_ascii=False, indent=2),
-                    encoding="utf-8")
+    text = json.dumps(session_to_dict(session), ensure_ascii=False, indent=2)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        for attempt in range(_SAVE_ATTEMPTS):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                if attempt == _SAVE_ATTEMPTS - 1:
+                    raise
+                time.sleep(_SAVE_PAUSE_S)
+    finally:
+        tmp.unlink(missing_ok=True)
     return path
 
 
-def _checked_file(label: str, raw: dict) -> Path:
+def _checked_file(label: str, raw: dict, candidates=()) -> Path:
     """Файл, на который ссылается сессия, обязан быть ТЕМ ЖЕ: клики привязаны к
-    пикселям именно этого снимка, а кадр — к именно этому профилю."""
-    path = Path(raw["path"])
-    if not path.is_file():
-        raise FileNotFoundError(f"{label} сессии не найден: {path}")
+    пикселям именно этого снимка, а кадр — к именно этому профилю.
+
+    Ищется по сохранённому пути, затем под тем же именем в `candidates`: сессия,
+    записанная в контейнере (`/data/…`), на другом компьютере или до переноса
+    папки, иначе не открылась бы. Защита — хэш, а не путь."""
+    stored = Path(raw["path"])
+    found = [stored, *(Path(d) / stored.name for d in candidates)]
+    path = next((p for p in found if p.is_file()), None)
+    if path is None:
+        raise FileNotFoundError(f"{label} сессии не найден: {stored}")
     actual = _file_hash(path)
     if actual != raw["sha256"]:
         raise ValueError(
@@ -104,16 +132,20 @@ def _checked_file(label: str, raw: dict) -> Path:
     return path
 
 
-def load_session(path) -> OperatorSession:
-    """Сессия из файла. Чужой снимок или профиль — отказ с именем файла."""
+def load_session(path, *, search_dirs=()) -> OperatorSession:
+    """Сессия из файла. Чужой снимок или профиль — отказ с именем файла.
+
+    Снимок ищется по сохранённому пути, затем рядом с файлом сессии; профиль — по
+    пути, рядом с сессией и в `search_dirs` (папка профилей рабочей папки)."""
+    here = Path(path).resolve().parent
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
     if raw.get("format") != SESSION_FORMAT:
         raise ValueError(f"{Path(path).name}: не файл сессии оператора")
     if raw.get("version") != SESSION_VERSION:
         raise ValueError(f"{Path(path).name}: версия сессии {raw.get('version')}, "
                          f"поддерживается {SESSION_VERSION}")
-    image = _checked_file("снимок", raw["image"])
-    profile = (_checked_file("профиль калибровки", raw["profile"])
+    image = _checked_file("снимок", raw["image"], [here])
+    profile = (_checked_file("профиль калибровки", raw["profile"], [here, *search_dirs])
                if raw["profile"] is not None else None)
     session = OperatorSession()
     session.open_image(image)

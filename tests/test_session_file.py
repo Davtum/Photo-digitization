@@ -164,3 +164,58 @@ def test_relative_image_path_is_resolved(tmp_path, scene, monkeypatch):
     s = OperatorSession()
     s.open_image(path.name)
     assert s.image_path == path.resolve()
+
+
+# --- веб-интерфейс, задача 1: атомарная запись и поиск файлов ---------------------
+
+def test_save_session_is_atomic_and_leaves_no_temp(tmp_path, scene):
+    from facade_digitizer.ui.session_file import save_session
+
+    s = _session(scene)
+    target = tmp_path / "сессии" / "a.session.json"
+    target.parent.mkdir()
+    save_session(s, target)
+    save_session(s, target)                      # перезапись поверх существующего
+    assert [p.name for p in target.parent.iterdir()] == ["a.session.json"]
+    assert json.loads(target.read_text(encoding="utf-8"))["format"]
+
+
+def test_load_session_finds_image_next_to_the_session(tmp_path, scene):
+    from facade_digitizer.ui.session_file import load_session, save_session
+
+    _sc, path, *_ = scene
+    moved = tmp_path / "перенесено"
+    moved.mkdir()
+    shutil.copy(path, moved / path.name)
+    s = _session(scene)
+    saved = save_session(s, moved / "фасад.session.json")
+    raw = json.loads(saved.read_text(encoding="utf-8"))
+    raw["image"]["path"] = str(tmp_path / "нет_такой_папки" / path.name)
+    saved.write_text(json.dumps(raw), encoding="utf-8")
+    loaded = load_session(saved)
+    assert loaded.image_path == (moved / path.name).resolve()
+    assert loaded.marks == s.marks
+
+    (moved / path.name).write_bytes(b"not the same image")
+    with pytest.raises(ValueError, match="не тот"):
+        load_session(saved)
+
+
+def test_load_session_finds_profile_in_search_dirs(tmp_path, scene):
+    from facade_digitizer.ui.session import _file_hash
+    from facade_digitizer.ui.session_file import load_session, save_session
+
+    profiles = tmp_path / "профили"
+    profiles.mkdir()
+    profile = profiles / "камера.json"
+    profile.write_text('{"model": "X"}', encoding="utf-8")
+    s = _session(scene)
+    saved = save_session(s, tmp_path / "a.session.json")
+    raw = json.loads(saved.read_text(encoding="utf-8"))
+    raw["profile"] = {"path": str(tmp_path / "где-то" / "камера.json"),
+                      "sha256": _file_hash(profile)}
+    saved.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(FileNotFoundError, match="профиль калибровки"):
+        load_session(saved)
+    loaded = load_session(saved, search_dirs=[profiles])
+    assert loaded.profile_path == profile.resolve()
