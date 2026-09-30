@@ -57,6 +57,13 @@ def test_in_test_skip_of_ui_tests_fails_with_the_flag(pytester, monkeypatch):
     result.assert_outcomes(failed=1)
 
 
+def test_web_interface_tests_are_guarded_too(pytester, monkeypatch):
+    """Веб-интерфейс: пропуск `test_web_*` (нет FastAPI, нет Node) в CI — падение."""
+    result = _run(pytester, monkeypatch, {"test_web_fake": _SKIPPED_UI_MODULE}, require=True)
+    assert result.ret != 0
+    result.stdout.fnmatch_lines(["*REQUIRE_UI_TESTS*"])
+
+
 def test_skips_outside_ui_tests_are_untouched_by_the_flag(pytester, monkeypatch):
     result = _run(pytester, monkeypatch, {"test_core_fake": _SKIPPED_CORE_TEST}, require=True)
     result.assert_outcomes(skipped=1)

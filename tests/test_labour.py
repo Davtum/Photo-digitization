@@ -140,7 +140,7 @@ def test_operator_record_reaches_the_output_and_the_cli(scene, tmp_path):
 
 
 def test_ui_entry_refuses_a_name_as_operator_label(capsys):
-    from facade_digitizer.ui.__main__ import main
+    from facade_digitizer.web.__main__ import main
 
     assert main(["--operator", "Petrov"]) == 2
     assert "непрозрачна" in capsys.readouterr().err

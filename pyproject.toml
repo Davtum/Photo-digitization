@@ -12,8 +12,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "ruff>=0.4"]
-ui = ["PySide6>=6.6"]
+dev = ["pytest>=8.0", "ruff>=0.4", "httpx>=0.27"]
+# Интерфейс оператора в браузере: сервер на этом компьютере.
+ui = ["fastapi>=0.110", "uvicorn>=0.29", "python-multipart>=0.0.9"]
 
 [build-system]
 requires = ["setuptools>=69"]
@@ -22,14 +23,19 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["facade_digitizer*"]
 
+[tool.setuptools.package-data]
+"facade_digitizer.web" = ["static/*"]
+
 [project.scripts]
 facade-digitize = "facade_digitizer.pipeline.run:main"
-facade-digitize-ui = "facade_digitizer.ui.__main__:main"
+facade-digitize-ui = "facade_digitizer.web.__main__:main"
 facade-calibrate = "facade_digitizer.pipeline.calibrate:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-p pytester"
+# Предупреждение starlette об httpx относится к тестовому клиенту, не к серверу.
+filterwarnings = ["ignore:Using .httpx. with .starlette.testclient"]
 
 [tool.ruff]
 line-length = 100

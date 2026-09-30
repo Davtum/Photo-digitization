@@ -7,7 +7,7 @@ import sys
 import numpy as np
 import pytest
 
-from tests.test_ui_marks import VIEW
+from tests.web_scenes import NEAR as VIEW
 
 
 @pytest.fixture(scope="module")

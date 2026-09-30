@@ -1,6 +1,7 @@
 """Охрана от пропуска тестов интерфейса. План 3, задача 1.
 
-При `REQUIRE_UI_TESTS=1` (ставится в CI) любой пропуск в модуле `test_ui_*` —
+При `REQUIRE_UI_TESTS=1` (ставится в CI) любой пропуск в модуле `test_ui_*` или
+`test_web_*` —
 пропуск всего модуля через `importorskip` или пропуск изнутри теста — становится
 падением. Без переменной поведение прежнее: на машине без PySide6 тесты
 интерфейса честно пропускаются.
@@ -14,7 +15,8 @@ import os
 import pytest
 
 ENV_FLAG = "REQUIRE_UI_TESTS"
-UI_MODULE_PREFIX = "test_ui_"
+#: Модули тестов интерфейса: ядро интерфейса (`test_ui_*`) и веб-интерфейс (`test_web_*`).
+UI_MODULE_PREFIXES = ("test_ui_", "test_web_")
 
 
 def _required() -> bool:
@@ -23,7 +25,7 @@ def _required() -> bool:
 
 def _is_ui_node(nodeid: str) -> bool:
     module = nodeid.split("::", 1)[0].replace("\\", "/").rsplit("/", 1)[-1]
-    return module.startswith(UI_MODULE_PREFIX)
+    return module.startswith(UI_MODULE_PREFIXES)
 
 
 def _reason(nodeid: str) -> str:

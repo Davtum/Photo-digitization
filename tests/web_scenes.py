@@ -67,7 +67,9 @@ def profile_for(directory: Path, sc, model: str = "unknown") -> Path:
     return path
 
 
+#: Кэш фаз кадра — последние несколько: кадр 20 Мп в цвете и в сером — около 85 МБ.
 _FRAMES: dict = {}
+_FRAMES_KEPT = 4
 _REAL_FRAME_STAGE = run.frame_stage
 
 
@@ -80,6 +82,8 @@ def cached_frame_stage(image_path, *, profile_path=None, with_color=False,
     key = (str(Path(image_path).resolve()), Path(image_path).stat().st_mtime_ns,
            str(profile_path), with_color)
     if key not in _FRAMES:
+        while len(_FRAMES) >= _FRAMES_KEPT:
+            _FRAMES.pop(next(iter(_FRAMES)))
         _FRAMES[key] = _REAL_FRAME_STAGE(image_path, profile_path=profile_path,
                                          with_color=with_color)
     return _FRAMES[key]
