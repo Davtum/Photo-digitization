@@ -45,7 +45,7 @@ def client(tmp_path, near):
     (data / "примеры").mkdir(parents=True)
     shutil.copy(near.path, data / "примеры" / "фасад.png")
     wb = Workbench(data, runner=ws.test_runner())
-    app = create_app(wb, token=TOKEN, port=PORT)
+    app = create_app(wb, token=TOKEN)
     with TestClient(app, base_url=BASE, headers={"X-Facade-Token": TOKEN}) as c:
         c.workbench = wb
         yield c
@@ -61,8 +61,11 @@ def _act(client, state, name, **args):
 def test_foreign_host_is_421(client):
     r = client.get("/api/ping", headers={"Host": "evil.example:8765"})
     assert r.status_code == 421
-    r = client.get("/api/ping", headers={"Host": "127.0.0.1:9999"})
-    assert r.status_code == 421
+    # Порт не проверяется: контейнер могут опубликовать на другом порту хоста, а от
+    # DNS rebinding защищает имя (у чужой страницы в Host — её домен).
+    assert client.get("/api/ping", headers={"Host": "127.0.0.1:9999"}).status_code == 200
+    assert client.get("/api/ping", headers={"Host": "[::1]:8765"}).status_code == 200
+    assert client.get("/api/ping", headers={"Host": "localhost.evil.example"}).status_code == 421
     assert client.get("/api/ping", headers={"Host": f"localhost:{PORT}"}).status_code == 200
 
 
@@ -175,3 +178,12 @@ def test_static_files_are_revalidated(client):
     программы браузер не держит старый `app.js` рядом с новым сервером."""
     r = client.get("/static/app.js")
     assert r.status_code == 200 and "no-cache" in r.headers["cache-control"]
+
+
+def test_unreadable_body_is_400_not_500(client):
+    """Тело не в UTF-8 или не JSON (curl из консоли Windows отправляет кириллицу в
+    ANSI) — ошибка запроса с объяснением, а не падение сервера."""
+    for body in (b'{"path": "\xef\xf0\xe8"}', b"not json", b"[1, 2]"):
+        r = client.post("/api/open", content=body, headers={"Content-Type": "application/json"})
+        assert r.status_code == 400, body
+        assert "JSON" in r.json()["error"]

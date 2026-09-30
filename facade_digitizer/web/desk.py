@@ -407,10 +407,13 @@ class Desk:
         s = self.session
         try:
             s.set_profile(path, discard_clicks=bool(discard))
-        except ValueError as error:
+        except ValueError:
+            clicks = (len(s.reference.ends) + len(s.plane_points) + len(s.roi_points)
+                      + sum(len(m.corners) + len(m.reveal_points) for m in s.marks))
             self.notice = {"kind": "confirm", "text": (
-                f"Профиль сдвигает кадр (снятие дисторсии), и указанные точки к нему не "
-                f"относятся: {error}. Сбросить разметку и продолжить?"),
+                f"Смена профиля сдвигает кадр (снятие дисторсии) и сбросит указанные точки "
+                f"({clicks}): к новому кадру они не относятся. Сбросить разметку и "
+                "продолжить?"),
                 "confirm": {"name": "set_profile", "args": {"path": path, "discard": True}}}
             return
         self.current_mark = None

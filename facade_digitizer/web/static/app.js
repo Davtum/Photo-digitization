@@ -608,14 +608,16 @@ function panelFrame() {
     h('p', { class: 'lede' }, 'Проверьте, что снимок распознан и плоскость фасада найдена. '
       + 'Если есть профиль калибровки камеры — подключите его до разметки.'),
   ];
+  const facts = [];
   if (!frame.ready) {
     body.push(h('div', { class: `callout ${frame.error ? 'bad' : ''}` },
       frame.error ? `Снимок не обработан: ${frame.error}` : S.busy || 'Снимок обрабатывается…'));
   } else {
-    body.push(h('section', { class: 'block' }, h('h3', {}, 'Сведения'),
+    facts.push(h('section', { class: 'block' }, h('h3', {}, 'Сведения'),
       h('ul', { class: 'facts' }, frame.info.map((line) => h('li', {}, line)))));
   }
-  body.push(profileBlock(frame));
+  facts.push(profileBlock(frame));
+  let planeBlock = null;
   if (plane) {
     const status = plane.needs_operator ? chip('не найдена', 'bad')
       : plane.manual ? chip('задана вручную', 'accent') : chip('найдена', 'ok');
@@ -640,8 +642,11 @@ function panelFrame() {
           ? h('button', { class: 'btn small quiet', onclick: () => act('reset_plane') }, 'Вернуть автоматическую')
           : null));
     }
-    body.push(block);
+    planeBlock = block;
   }
+  // Плоскость требует действия — её блок первым: форма не прячется под сведениями.
+  const planeFirst = plane && (plane.needs_operator || placing === 'plane' || placing === 'roi');
+  body.push(...(planeFirst ? [planeBlock, ...facts] : [...facts, planeBlock]));
   body.push(qualityBlock(S.quality?.stage === 'preliminary' ? S.quality : null, 'Качество снимка'));
   const ready = frame.ready && plane && !plane.needs_operator;
   return [body, nextButton('Далее: масштаб →', 'scale', ready)];

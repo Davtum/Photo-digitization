@@ -115,7 +115,7 @@ def main(argv=None, *, serve=None, open_browser=webbrowser.open) -> int:
     workbench = Workbench(data_dir, operator=args.operator)
     if args.open:
         workbench.open(args.open)
-    app = create_app(workbench, token=new_token(), port=port)
+    app = create_app(workbench, token=new_token())
     lock = data_dir / LOCK_NAME
     lock.write_text(json.dumps({"pid": os.getpid(), "port": port, "data_dir": str(data_dir)}),
                     encoding="utf-8")

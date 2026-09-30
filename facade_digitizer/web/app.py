@@ -7,13 +7,15 @@
 сайт, открытый в браузере оператора: форма чужой страницы может отправить `POST`
 на 127.0.0.1, а через DNS rebinding чужая страница может и читать ответы. Поэтому:
 
-1. заголовок `Host` — только `localhost`, `127.0.0.1` или `[::1]` с портом сервера,
-   иначе `421` (закрывает rebinding: у чужого имени другой `Host`);
+1. заголовок `Host` — только `localhost`, `127.0.0.1` или `[::1]`, иначе `421`
+   (закрывает rebinding: у чужой страницы в `Host` её домен). Порт не сверяется:
+   контейнер могут опубликовать на другом порту хоста;
 2. изменяющие запросы — только с заголовком `X-Facade-Token` (случайный на запуск,
    вписывается в страницу при её отдаче), иначе `403`: форма чужого сайта заголовок
    не поставит, а `fetch` с ним упрётся в CORS-preflight, которого сервер не
    разрешает.
 """
+import json
 import secrets
 from pathlib import Path
 from typing import Annotated
@@ -36,17 +38,12 @@ def new_token() -> str:
     return secrets.token_urlsafe(24)
 
 
-def _host_ok(host: str, port: int | None) -> bool:
-    if not host:
-        return False
+def _host_ok(host: str) -> bool:
     if host.startswith("["):
-        name, _, rest = host.partition("]")
-        name, port_text = name + "]", rest.lstrip(":")
+        name = host.partition("]")[0] + "]"
     else:
-        name, _, port_text = host.partition(":")
-    if name.lower() not in LOOPBACK:
-        return False
-    return port is None or port_text == str(port)
+        name = host.partition(":")[0]
+    return name.lower() in LOOPBACK
 
 
 def _error(status: int, text: str, state: dict | None = None) -> JSONResponse:
@@ -56,6 +53,20 @@ def _error(status: int, text: str, state: dict | None = None) -> JSONResponse:
     return JSONResponse(body, status_code=status, headers=NO_STORE)
 
 
+class BadBody(Exception):
+    """Тело запроса — не объект JSON в UTF-8."""
+
+
+async def _body(request: Request) -> dict:
+    try:
+        body = json.loads((await request.body()).decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as error:
+        raise BadBody(str(error)) from error
+    if not isinstance(body, dict):
+        raise BadBody("ожидался объект")
+    return body
+
+
 def _image(data: bytes | None, media: str, request: Request) -> Response:
     if data is None:
         return _error(404, "изображения нет")
@@ -63,14 +74,18 @@ def _image(data: bytes | None, media: str, request: Request) -> Response:
     return Response(data, media_type=media, headers=headers)
 
 
-def create_app(workbench: Workbench, *, token: str, port: int | None) -> FastAPI:
+def create_app(workbench: Workbench, *, token: str) -> FastAPI:
     app = FastAPI(title="Оцифровка фасада", docs_url=None, redoc_url=None,
                   openapi_url=None)
     wb = workbench
 
+    @app.exception_handler(BadBody)
+    async def bad_body(_request: Request, error: BadBody):
+        return _error(400, f"тело запроса — не объект JSON в UTF-8: {error}")
+
     @app.middleware("http")
     async def guard(request: Request, call_next):
-        if not _host_ok(request.headers.get("host", ""), port):
+        if not _host_ok(request.headers.get("host", "")):
             return _error(421, "сервер принимает запросы только с этого компьютера")
         if request.method not in ("GET", "HEAD") and \
                 not secrets.compare_digest(request.headers.get("x-facade-token", ""), token):
@@ -135,7 +150,7 @@ def create_app(workbench: Workbench, *, token: str, port: int | None) -> FastAPI
 
     @app.post("/api/open")
     async def open_image(request: Request):
-        body = await request.json()
+        body = await _body(request)
         try:
             wb.open(str(body.get("path", "")))
         except FileNotFoundError as error:
@@ -146,7 +161,7 @@ def create_app(workbench: Workbench, *, token: str, port: int | None) -> FastAPI
 
     @app.post("/api/operator")
     async def answer_operator(request: Request):
-        body = await request.json()
+        body = await _body(request)
         try:
             wb.answer_operator(str(body.get("choice", "")))
         except ValueError as error:
@@ -168,7 +183,7 @@ def create_app(workbench: Workbench, *, token: str, port: int | None) -> FastAPI
 
     @app.post("/api/session/copy")
     async def save_copy(request: Request):
-        body = await request.json()
+        body = await _body(request)
         try:
             path = wb.save_copy(body.get("folder") or None)
         except (ValueError, OSError) as error:
@@ -186,7 +201,7 @@ def create_app(workbench: Workbench, *, token: str, port: int | None) -> FastAPI
 
     @app.post("/api/action")
     async def action(request: Request):
-        body = await request.json()
+        body = await _body(request)
         try:
             wb.act(body.get("desk"), int(body.get("rev", -1)), str(body.get("name", "")),
                    body.get("args") or {})
